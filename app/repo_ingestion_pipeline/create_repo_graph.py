@@ -41,6 +41,7 @@ class ASTProcessorStage(PipelineStage):
         """
         try:
             s3_info: S3StorageInfo = input_data["s3_info"]
+            # s3_info: S3StorageInfo = input_data
             reference_results: ReferenceResolutionResult = input_data["reference_results"]
             # print(f"Job {self.job_id}: Resolved references: {reference_results.references}")
             repo_path = s3_info.local_path
@@ -92,7 +93,8 @@ class ASTProcessorStage(PipelineStage):
                 success=True,
                 data={
                     "s3_info": s3_info,
-                    "reference_results": reference_results,
+                    # "reference_results": reference_results,
+                    "reference_results": [],
                     "repo_name": repo_id,
                 },
                 metadata={
@@ -137,7 +139,11 @@ class ASTProcessorStage(PipelineStage):
             language = lang_map[suffix]
             if language not in self.supported_languages:
                 continue
-            
+
+            # Check if the file is in a test directory
+            if "tests" in file_path.parts:
+                continue
+
             try:
                 # Check file size
                 if file_path.stat().st_size > self.max_file_size:
@@ -282,13 +288,13 @@ class ASTProcessorStage(PipelineStage):
                 # Find reference node
                 ref_node_id = self._find_node_at_location(ref_file, ref_line, ref_col, global_leaf_lookup)
                 if not ref_node_id:
-                    print(f"Job {self.job_id}: Could not find reference node at {ref_location}")
+                    # print(f"Job {self.job_id}: Could not find reference node at {ref_location}")
                     continue
                 
                 # Find definition node
                 def_node_id = self._find_node_at_location(def_file, def_line, def_col, global_leaf_lookup)
                 if not def_node_id:
-                    print(f"Job {self.job_id}: Could not find definition node at {def_location}")
+                    # print(f"Job {self.job_id}: Could not find definition node at {def_location}")
                     continue
                 
                 # Create reference edge

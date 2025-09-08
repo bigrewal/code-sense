@@ -16,50 +16,50 @@ class QueryPlanner:
             "fetch_entry_point_files"
         ]
 
-    async def plan(self, question: str, mental_model: Dict[str, str]) -> any:
+    async def plan(self, question: str, mental_model: str) -> any:
         """Generate a plan to answer the question using the mental model."""
         # system_prompt = PLANNER_SYSTEM_PROMPT
 
         planner_prompt = f"""
-Mental model overview: {mental_model['overview']}
+            Mental model overview: {mental_model}
 
-Question: {question}
+            Question: {question}
 
-Generate a JSON plan to answer the question. Only output a valid JSON array of objects, where each object has the keys "tool", "params", and "reason". Here's an example of a valid output:
-```json
-[
-    {{
-        "tool": "fetch_code_for_def",
-        "params": {{"def_name": "my_function"}},
-        "reason": "To analyze the implementation of my_function."
-    }},
-    {{
-        "tool": "fetch_code_file",
-        "params": {{"file_path": "src/my_file.py"}},
-        "reason": "To get the full context of the file where my_function is defined."
-    }}
-]
+            Generate a JSON plan to answer the question. Only output a valid JSON array of objects, where each object has the keys "tool", "params", and "reason". Here's an example of a valid output:
+            ```json
+            [
+                {{
+                    "tool": "fetch_code_for_def",
+                    "params": {{"def_name": "my_function"}},
+                    "reason": "To analyze the implementation of my_function."
+                }},
+                {{
+                    "tool": "fetch_code_file",
+                    "params": {{"file_path": "src/my_file.py"}},
+                    "reason": "To get the full context of the file where my_function is defined."
+                }}
+            ]
 
-Ensure that the output is syntactically correct JSON and adheres to the same format.
+            Ensure that the output is syntactically correct JSON and adheres to the same format.
 
-Instructions:
-Only output a valid JSON string.
+            Instructions:
+            Only output a valid JSON string.
 
-Use the same structure as the example above: an array of objects, each with tool, params, and reason fields.
+            Use the same structure as the example above: an array of objects, each with tool, params, and reason fields.
 
-Correct syntax errors (e.g. unmatched braces, incorrect quoting).
+            Correct syntax errors (e.g. unmatched braces, incorrect quoting).
 
-Do not add any explanations or extra text—only the final valid JSON string.
-"""
+            Do not add any explanations or extra text—only the final valid JSON string.
+            """
 
         # Summarise the mental model to extract information necessary to answer the question
         summariser_prompt = f"""
-Mental model overview: {mental_model['overview']}
+            Mental model overview: {mental_model}
 
-Question: {question}
+            Question: {question}
 
-Generate a summary of the mental model that includes key components, relationships, and context relevant to the question.
-"""
+            Generate a summary of the mental model that includes key components, relationships, and context relevant to the question.
+            """
 
         try:
             # Make both llm.generate at the same time and wait for the responses

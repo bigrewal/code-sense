@@ -2,7 +2,7 @@ import os
 from typing import Any, Dict
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(".env.local")
 
 class Config:
     GROQ_API_KEY = os.getenv("GROQ_API_KEY")

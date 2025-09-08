@@ -1,4 +1,5 @@
 import logging
+from .attention_integration import AttentionDBRuntime
 from neo4j import GraphDatabase
 from pymongo import MongoClient
 from .config import Config
@@ -256,6 +257,7 @@ class MyMongoClient:
     def get_database(self, name: str):
         return self._client[name]
 
+attention_db_runtime = AttentionDBRuntime(data_root="data")
 
 # Global shared client
 neo4j_client: Neo4jClient = None
@@ -277,5 +279,5 @@ def get_neo4j_client() -> Neo4jClient:
 
 def get_mongo_client() -> MyMongoClient:
     if mongo_client is None:
-        raise RuntimeError("MongoDB client not initialized")
+        init_mongo_client()
     return mongo_client

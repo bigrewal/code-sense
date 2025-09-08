@@ -10,6 +10,7 @@ from datetime import datetime
 
 from .base import PipelineStage, StageResult
 from app.db import get_mongo_client
+from app.config import Config
 
 
 @dataclass
@@ -38,7 +39,7 @@ class Pipeline:
     def __init__(self, config: PipelineConfig):
         self.config = config
         self.mongo_db = get_mongo_client()
-        self.job_status_collection = self.mongo_db["job_status"]
+        self.job_status_collection = self.mongo_db[Config.JOB_STATUS_COLLECTION]
         self.job_status_collection.create_index([("job_id", 1), ("stage_name", 1)], unique=True)
         self.stages: List[PipelineStage] = []
         

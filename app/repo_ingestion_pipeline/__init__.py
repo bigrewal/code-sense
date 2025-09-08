@@ -35,7 +35,7 @@ async def start_ingestion_pipeline(local_repo_path: Path, job_id: str = None) ->
     
     # Create pipeline with only resolver and AST stages
     config = PipelineConfig(
-        pipeline_id=job_id,
+        pipeline_id=str(local_repo_path.name),
         stages_config={
             "resolver": Config.RESOLVER_CONFIG,
             "ast": Config.AST_CONFIG
@@ -47,11 +47,11 @@ async def start_ingestion_pipeline(local_repo_path: Path, job_id: str = None) ->
     config = Config()
     resolver_stage = ReferenceResolverStage({"job_id": job_id, **config.RESOLVER_CONFIG})
     ast_stage = ASTProcessorStage({"job_id": job_id, **config.AST_CONFIG})
-    llm_stage = ChunkLLMProcessorStage({"job_id": job_id})
+    # llm_stage = ChunkLLMProcessorStage({"job_id": job_id})
     mental_model_stage = MentalModelStage({"job_id": job_id})  # Reuse LLM config or add specific
 
-    pipeline.add_stages([resolver_stage, ast_stage, llm_stage, mental_model_stage])
-    
+    pipeline.add_stages([resolver_stage, ast_stage, mental_model_stage])
+
     print(f"Job {job_id}: Starting pipeline execution...")
     
     # Run the pipeline

@@ -2,9 +2,8 @@ from typing import List
 
 from ..db import get_neo4j_client
 
-def lookup_refs_for_def(def_name: str) -> List[str]:
+def lookup_refs_for_def(def_name: str, repo_id: str = "data/xai-sdk-python") -> List[str]:
     neo4j_client = get_neo4j_client()
-    repo_id: str = "dictquery"
     query = """
         MATCH (def:ASTNode {name: $def_name, repo_id: $repo_id, is_definition: true})
         MATCH (def)-[:CONTAINS {sequence:1}]->(ident:ASTNode)
@@ -18,4 +17,4 @@ def lookup_refs_for_def(def_name: str) -> List[str]:
             f"{record['def_name']} ({record['node_type']})"
             for record in result
         ]
-        return refs
+        return "\n".join(refs)

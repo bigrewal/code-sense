@@ -3,8 +3,9 @@ name = "code-repo-agent"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.9.13"
+requires-python = ">=3.11.0"
 dependencies = [
+    "attentiondb",
     "fastapi>=0.116.1",
     "groq>=0.30.0",
     "loguru>=0.7.3",
@@ -16,3 +17,6 @@ dependencies = [
     "tree-sitter-languages==1.10.2",
     "uvicorn>=0.35.0",
 ]
+
+[tool.uv.sources]
+attentiondb = { path = "../attentiondb", editable = true }

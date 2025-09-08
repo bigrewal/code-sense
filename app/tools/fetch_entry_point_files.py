@@ -1,21 +1,36 @@
 from typing import List
+from ..db import get_mongo_client
 
-from ..db import get_neo4j_client
+def fetch_entry_point_files(repo_id: str) -> str:
+    print(f"TOOL INVOKED: Fetching entry point files for repo_id: {repo_id}")
 
-def fetch_entry_point_files() -> List[str]:
-    # Stub
-    # return ["main.py", "app.py"]
-    neo4j_client = get_neo4j_client()
-    repo_id: str = "dictquery"
-    
-    query = """
-        MATCH (n:ASTNode)
-        WHERE n.repo_id = $repo_id
-        WITH n.file_path AS file_path, COLLECT(n) AS nodes
-        WHERE NONE(node IN nodes WHERE SIZE([(other:ASTNode)-[:REFERENCES]->(node) WHERE other.file_path <> file_path | other]) > 0)
-        RETURN DISTINCT file_path
-    """
-    with neo4j_client.driver.session() as session:
-        result = session.run(query, repo_id=repo_id)
-        file_paths = [record['file_path'] for record in result]
-        return {"file_paths": file_paths}
+    mongo_client = get_mongo_client()
+    mental_model_collection = mongo_client["mental_model"]
+
+    # Get list of all file_paths that have BRIEF_FILE_OVERVIEW
+    entry_points_cursor = mental_model_collection.find({
+        "repo_id": repo_id,
+        "document_type": "POTENTIAL_ENTRY_POINTS"
+    })
+    entry_points = list(entry_points_cursor)
+    entry_point_files = {ep['file_path'] for ep in entry_points}
+
+    # Format for LLM
+    formatted_files = '\n'.join(f'- {file_path}' for file_path in entry_point_files)
+    return f"Here's the list of potential entry point files:\n{formatted_files}"
+
+
+def fetch_entry_point_files_as_list(repo_id: str) -> List[str]:
+    mongo_client = get_mongo_client()
+    mental_model_collection = mongo_client["mental_model"]
+
+    # Get list of all file_paths that have BRIEF_FILE_OVERVIEW
+    entry_points_cursor = mental_model_collection.find({
+        "repo_id": repo_id,
+        "document_type": "POTENTIAL_ENTRY_POINTS"
+    })
+    entry_points = list(entry_points_cursor)
+    entry_point_files = {ep['file_path'] for ep in entry_points}
+
+    print(f"Fetched entry point files for repo_id: {repo_id}")
+    return list(entry_point_files)
