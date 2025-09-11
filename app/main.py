@@ -59,7 +59,8 @@ async def query_repo(request: QueryRequest):
         mental_model = mental_model_fetcher.seed_prompt(request.repo_id)
         # print("Mental model fetched and prompt seeded. \n ", mental_model)
         # mental_model = mental_model_fetcher.fetch()
-        # pack_md, pack_items = await attention_db_runtime.pack(request.repo_id, request.question)
+        pack_md, pack_items = await attention_db_runtime.pack(request.repo_id, request.question)
+        print("Packed items:", pack_items)
 
         # plan, mental_model_summary = await planner.plan(request.question, mental_model)
         # execution_results = await executor.execute(plan, request.question, mental_model, request.repo_id, parallel=True)
@@ -67,12 +68,12 @@ async def query_repo(request: QueryRequest):
         router: Router = Router(llm)
         route: RoutePlan = router.route(user_question=request.question, seed_prompt=mental_model, repo_name=request.repo_id)
 
-        walkthrough_gen = walkthrough_generator_for_fastapi(
-                llm=llm,  # your injected client
-                repo_name=request.repo_id,
-                seed_prompt=mental_model,
-                user_question=request.question,
-            )
+        # walkthrough_gen = walkthrough_generator_for_fastapi(
+        #         llm=llm,  # your injected client
+        #         repo_name=request.repo_id,
+        #         seed_prompt=mental_model,
+        #         user_question=request.question,
+        #     )
 
         # async for chunk in synthesizer.synthesize(request.question, mental_model_summary, execution_results):
         #     print(chunk, end="")
@@ -81,19 +82,22 @@ async def query_repo(request: QueryRequest):
         #     "response": "Check the console for the streamed response."
         # }
 
+        return {
+            "response": "Check the console for the streamed response."
+        }
         # for chunk in walkthrough_gen:
         #     print(chunk, end="")
 
-        return StreamingResponse(
-            walkthrough_gen,
-            media_type="text/markdown",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                # Optional but often useful:
-                "X-Accel-Buffering": "no",
-            },
-        )
+        # return StreamingResponse(
+        #     walkthrough_gen,
+        #     media_type="text/markdown",
+        #     headers={
+        #         "Cache-Control": "no-cache",
+        #         "Connection": "keep-alive",
+        #         # Optional but often useful:
+        #         "X-Accel-Buffering": "no",
+        #     },
+        # )
         # return StreamingResponse(
         #     stream_response(
         #         request.question,

@@ -24,8 +24,8 @@ class AttentionDBRuntime:
     """
 
     # Fixed packer knobs (your chosen defaults)
-    BUDGET_TOKENS = 5000
-    CANDIDATE_TOPK = 100
+    BUDGET_TOKENS = 1000
+    CANDIDATE_TOPK = 10
     TOP_P = 0.85
     TEMP = 0.05
     MIN_ITEMS = 5
@@ -51,7 +51,7 @@ class AttentionDBRuntime:
         self,
         repo_id: str,
         *,
-        facets: tuple[str, ...] = ("name","summary","signature","deps","symbols","path"),
+        facets: tuple[str, ...] = ("file_path","summary","cross_file_deps"),
         max_keys_per_record: int = 999_999,  # unlimited (we chunk summaries fully)
         model: str = "voyage-3-large",
         batch_size: int = 128,

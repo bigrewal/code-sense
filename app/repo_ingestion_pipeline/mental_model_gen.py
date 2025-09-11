@@ -78,8 +78,9 @@ class MentalModelStage(PipelineStage):
 
             self._write_to_md(insights, [], repo_id, dir_tree)
             # self._write_to_jsonl(insights, file_summaries, repo_id, dir_tree)
+            self._write_to_jsonl_v2(insights, repo_id)
 
-            # await attention_db_runtime.build_keybank(repo_id)
+            await attention_db_runtime.build_keybank(repo_id)
 
             print(f"Job {self.job_id}: Mental model generated and written to MD file")
             
@@ -577,5 +578,66 @@ class MentalModelStage(PipelineStage):
         write_jsonl(records_all, out_path)
         print(f"Job {self.job_id}: Wrote attentionDB JSONL ({len(records_all)} records) to {out_path}")
 
+    def _write_to_jsonl_v2(self, insights: List[Dict[str, Any]], repo_id: str) -> None:
+        """
+        Write one JSONL record per insight.
+
+        Expected inputs:
+        - insights: [
+            {
+            "file_path": "<file_path>",
+            "summary": "<summary>",
+            "cross_file_paths": ["<file_path>", ...]
+            },
+            ...
+        ]
+        - repo_id: string
+
+        Output (mental_model/mental_model.jsonl):
+        Each line is:
+        {
+        "id": "<file_path>",
+        "file_path": "<file_path>",
+        "summary": "<summary>",
+        "cross_file_deps": "<stringified cross_file_paths paths>"
+        }
+        """
+
+        def norm_path(p: str) -> str:
+            return (p or "").replace("\\", "/")
+
+        output_dir = Path(f"{repo_id}/mental_model")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        out_path = output_dir / "mental_model.jsonl"
+
+        records: List[Dict[str, Any]] = []
+
+        for item in insights or []:
+            raw_path = item.get("file_path", "")
+            path = norm_path(raw_path)
+            if not path:
+                # Skip malformed entries with no path
+                continue
+
+            summary = (item.get("summary") or "").strip()
+
+            cross = item.get("cross_file_paths") or []
+            # Ensure list-of-strings, normalize, then stringify as a single comma-separated string
+            cross_norm = [norm_path(str(p)) for p in cross if p]
+            cross_str = ", ".join(cross_norm)
+
+            records.append({
+                "id": path,
+                "file_path": path,
+                "summary": summary,
+                "cross_file_deps": cross_str,
+            })
+
+        with out_path.open("w", encoding="utf-8") as f:
+            for r in records:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+        print(f"Job {self.job_id}: Wrote {len(records)} JSONL records to {out_path}")
+    
     def validate_config(self) -> bool:
         return True

@@ -20,6 +20,7 @@ Extensibility:
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
+import traceback
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Callable
 import json
 import re
@@ -44,6 +45,8 @@ try:
 except Exception:
     list_files_in_dir = None  # type: ignore
 
+from .tools.fetch_code_file import fetch_code_file as fetch_code_file_tool # type: ignore
+
 MODEL_NAME = "openai/gpt-oss-20b"
 TOP_K_SEED = 20
 
@@ -52,14 +55,15 @@ TOP_K_SEED = 20
 # ------------------------------
 
 ROUTE_VALUES = {
-    "REPO_WALKTHROUGH",
-    "DIR_WALKTHROUGH",
-    "FILE_WALKTHROUGH",
-    "SYMBOL_EXPLAIN",
-    "SYMBOL_USAGES",
-    "FREEFORM_QA",
+    "REPO_WALKTHROUGH": "User asks for an overall architecture or 'end-to-end' / 'overview' of the repo.",
+    "DIR_WALKTHROUGH": "Question targets a directory/module or feature area that maps to a directory; include sub-directories (recursive=true).",
+    "FILE_WALKTHROUGH": "Question names a specific file; resolve short names (e.g., 'main.py') to the canonical path using tools before returning.",
+    "SYMBOL_EXPLAIN": "Question asks how a function/class/constant works (e.g., 'How does schedule_jobs() work?').",
+    "SYMBOL_USAGES": "Question asks who/where a symbol is used (callers/call sites).",
+    "FREEFORM_QA": "Topical or cross-cutting questions (e.g., 'How does auth work?') or when scope is unclear; return 3–7 seed-matched files as the initial focus."
 }
 
+ROUTE_HINTS = "\n".join(f"- {k}: {v}" for k, v in ROUTE_VALUES.items())
 
 @dataclass
 class RouteTargets:
@@ -190,16 +194,6 @@ DECISION_TOOLS: List[Dict[str, Any]] = [
         {"type": "object", "properties": {}, "additionalProperties": False},
     ),
     _fn(
-        "search_seed_paths",
-        "Search seed-listed file paths by substring.",
-        {
-            "type": "object",
-            "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "default": 10}},
-            "required": ["query"],
-            "additionalProperties": False,
-        },
-    ),
-    _fn(
         "list_dir",
         "List files inside a directory. If recursive=true, include sub-directories (best-effort).",
         {
@@ -242,6 +236,16 @@ DECISION_TOOLS: List[Dict[str, Any]] = [
             "additionalProperties": False,
         },
     ),
+    _fn(
+        "fetch_code_file",
+        "Fetch the full content of a code file by its path.",
+        {
+            "type": "object",
+            "properties": {"file_path": {"type": "string"}},
+            "required": ["file_path"],
+            "additionalProperties": False,
+        },
+    ),
 ]
 
 
@@ -250,11 +254,23 @@ DECISION_TOOLS: List[Dict[str, Any]] = [
 # ------------------------------
 
 SYSTEM_PROMPT = (
-    "You are a precise router for a code comprehension system. "
-    "Use the available tools to ground your decision (e.g., resolve paths/symbols). "
-    "When done, output a final assistant message whose CONTENT is a compact JSON object with fields: "
-    "route, targets{dirs,files,symbols}, workflow_limits{max_files,max_depth}, assumptions[], confidence, notes_for_workflow. "
-    "Do not ask the user to clarify. Do not emit prose—only the JSON in your final message."
+    "You are a precise router for a code comprehension system.\n"
+    "Use the available tools to ground your decision (e.g., normalize paths, list entry points/dirs, cross-refs, symbol lookups).\n"
+    "\n"
+    f"VALID ROUTES (choose exactly one): {list(ROUTE_VALUES.keys())}\n"
+    "WHEN TO USE EACH ROUTE:\n"
+    f"{ROUTE_HINTS}\n"
+    "\n"
+    "OUTPUT REQUIREMENTS:\n"
+    "- Return a SINGLE JSON object with EXACT keys: route, targets{dirs,files,symbols}, workflow_limits{max_files,max_depth}, assumptions[], confidence, notes_for_workflow.\n"
+    "- route MUST be one of the VALID ROUTES above (do NOT invent new routes like 'inspect').\n"
+    "- targets.dirs/files/symbols MUST reference existing entities grounded in the seed digest or tool outputs. If the user provides a short file name (e.g., 'main.py'), use tools to resolve it to the canonical path BEFORE returning.\n"
+    "- For DIR_WALKTHROUGH set recursive=true conceptually (include sub-dirs in your selection logic). For FREEFORM_QA, provide 3–7 seed-matched files with a brief rationale.\n"
+    "- confidence MUST be a number between 0 and 1 (float), not a string.\n"
+    "- If none of FILE/DIR/SYMBOL routes can be confidently chosen, prefer FREEFORM_QA.\n"
+    "- Do NOT emit any prose outside the JSON.\n"
+    "\n"
+    f"TOOLS YOU MAY CALL (and ONLY these): {[tool['function']['name'] for tool in DECISION_TOOLS]}"
 )
 
 
@@ -270,7 +286,7 @@ def _router_user_prompt(repo_name: str, user_question: str, digest: SeedDigest) 
     )
 
 
-def _router_user_prompt(repo_name: str, user_question: str, seed_prompt: str) ->
+def _router_user_prompt(repo_name: str, user_question: str, seed_prompt: str) -> str:
     return (
         f"[REPO]\n{repo_name}\n\n"
         f"[QUESTION]\n{user_question}\n\n"
@@ -341,15 +357,23 @@ class _ToolRuntime:
         except Exception:
             refs = []
         return {"refs": refs}
+    
+    def fetch_code_file(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        path = args.get("file_path") or ""
+        try:
+            code = fetch_code_file_tool(path)
+            return {"path": path, "code": code}
+        except Exception as e:
+            return {"path": path, "error": str(e), "code": ""}
 
 
 _TOOL_DISPATCH: Dict[str, Callable[["_ToolRuntime", Dict[str, Any]], Dict[str, Any]]] = {
     "list_entry_points": _ToolRuntime.list_entry_points,
-    "search_seed_paths": _ToolRuntime.search_seed_paths,
     "list_dir": _ToolRuntime.list_dir,
     "get_cross_refs": _ToolRuntime.get_cross_refs,
     "lookup_symbol_usages": _ToolRuntime.lookup_symbol_usages,
     "lookup_symbol_refs": _ToolRuntime.lookup_symbol_refs,
+    "fetch_code_file": _ToolRuntime.fetch_code_file,
 }
 
 
@@ -358,60 +382,82 @@ _TOOL_DISPATCH: Dict[str, Callable[["_ToolRuntime", Dict[str, Any]], Dict[str, A
 # ------------------------------
 
 class Router:
-    def __init__(self, groq_client: Any, *, temperature: float = 0.1):
+    def __init__(self, groq_client: Any, *, temperature: float = 0.0):
         self.client = groq_client
         self.temperature = temperature
 
     def route(self, *, user_question: str, repo_name: str, seed_prompt: str) -> RoutePlan:
+        print(f"Routing question: {user_question} in repo {repo_name}")
         # digest = build_seed_digest(seed_prompt)
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": _router_user_prompt(repo_name, user_question, seed_prompt)},
         ]
 
-        tools = DECISION_TOOLS
         run = _ToolRuntime(repo_name)
 
         # Tool-calling loop
-        for _ in range(8):  # safety cap
-            resp = self.client.generate(
-                messages=messages,
-                reasoning_effort="medium",
-                tools=tools,
-                tool_choice="auto",
-                temperature=self.temperature,
-                return_raw=True,
-                stream=False,
-            )
-            choice = resp.choices[0]
-            msg = choice.message
-            tool_calls = getattr(msg, "tool_calls", None) or msg.get("tool_calls")
-            if tool_calls:
-                for tc in tool_calls:
-                    name = tc.function.name
-                    raw = tc.function.arguments
-                    args = json.loads(raw) if isinstance(raw, str) else (raw or {})
-                    handler = _TOOL_DISPATCH.get(name)
-                    if handler is None:
-                        result = {"error": f"unknown tool: {name}"}
-                    else:
-                        result = handler(run, args)
-                    # Respond with tool result
-                    tool_msg = {
-                        "role": "tool",
-                        "tool_call_id": getattr(tc, "id", name),
-                        "name": name,
-                        "content": json.dumps(result, ensure_ascii=False),
-                    }
-                    messages.append({"role": "assistant", "tool_calls": [tc], "content": None})
-                    messages.append(tool_msg)
-                continue  # ask model again with new tool results
+        for _ in range(5):  # safety cap
+            try:
+                resp = self.client.generate(
+                    messages=messages,
+                    reasoning_effort="medium",
+                    tools=DECISION_TOOLS,
+                    tool_choice="auto",
+                    temperature=self.temperature,
+                    return_raw=True,
+                    stream=False,
+                )
+                choice = resp.choices[0]
+                msg = choice.message
+                # tool_calls = getattr(msg, "tool_calls", None) or msg.get("tool_calls")
+                tool_calls = msg.tool_calls
+                if tool_calls:
+                    for tc in tool_calls:
+                        name = tc.function.name
+                        raw = tc.function.arguments
+                        args = json.loads(raw) if isinstance(raw, str) else (raw or {})
+                        print(f"Invoking tool: {name} with args {args}")
+                        handler = _TOOL_DISPATCH.get(name)
+                        if handler is None:
+                            result = {"error": f"unknown tool: {name}"}
+                        else:
+                            result = handler(run, args)
+                        # Respond with tool result
+                        # print(f"Tool result for {name}: {result}")
+                        print(f"Reasoning behind tool use: {msg.reasoning}")
+                        tool_msg = {
+                            "role": "tool",
+                            "tool_call_id": getattr(tc, "id", name),
+                            "name": name,
+                            "content": json.dumps(result, ensure_ascii=False),
+                        }
+                        # messages.append(
+                        #     {
+                        #         "role": "assistant", 
+                        #         "tool_calls": [tc], 
+                        #         "content": None
+                        #     }
+                        # )
+                        messages.append(
+                            {
+                                "role": "assistant", 
+                                "content": f"Called Tool: {name} with args {args} and here are the results: {result}. \n\n Don't use the same tool again"
+                            }
+                        )
+                        # messages.append(tool_msg)
+                    continue  # ask model again with new tool results
+            
+            except Exception as ex:
+                traceback.print_exc()
+                raise RuntimeError(f"Routing error: {str(ex)}")
 
             # No tool calls → expect final JSON content with RoutePlan
-            content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+            content = msg.content.strip()
             data = {}
             try:
                 data = json.loads(content or "{}")
+                print(f"====== Parsed routing JSON ===== :\n {data}")
             except Exception:
                 # If the model didn't output JSON, fallback to FREEFORM_QA
                 return RoutePlan(
