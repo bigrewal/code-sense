@@ -18,7 +18,7 @@ def fetch_code_file(file_path: str) -> str:
                 print(f"File not found: {full_path}")
                 return {"error": f"File not found: {full_path}"}
             code = full_path.read_text(encoding="utf-8")
-            print(f"Fetched code from {full_path}")
+            # print(f"Fetched code from {full_path}")
             return code
         except Exception as e:
             traceback.print_exc()

@@ -11,7 +11,7 @@ from .llm import GroqLLM
 from .config import Config
 from .mental_model import MentalModelFetcher
 from .planner import QueryPlanner
-from .planner_two import walkthrough_generator_for_fastapi
+from .planner_two import execute_route
 from .router import RoutePlan, Router
 from .executor import PlanExecutor
 from .synthesizer import ResponseSynthesizer
@@ -59,15 +59,22 @@ async def query_repo(request: QueryRequest):
         mental_model = mental_model_fetcher.seed_prompt(request.repo_id)
         # print("Mental model fetched and prompt seeded. \n ", mental_model)
         # mental_model = mental_model_fetcher.fetch()
-        pack_md, pack_items = await attention_db_runtime.pack(request.repo_id, request.question)
-        print("Packed items:", pack_items)
+        # pack_md, pack_items = await attention_db_runtime.pack(request.repo_id, request.question)
+        # print("Packed items:", pack_items)
 
         # plan, mental_model_summary = await planner.plan(request.question, mental_model)
         # execution_results = await executor.execute(plan, request.question, mental_model, request.repo_id, parallel=True)
 
         router: Router = Router(llm)
         route: RoutePlan = router.route(user_question=request.question, seed_prompt=mental_model, repo_name=request.repo_id)
-
+        gen = execute_route(
+            route_plan=route,
+            llm=llm,
+            repo_name=request.repo_id,
+            seed_prompt=mental_model,
+            user_question=request.question,
+        )
+        return StreamingResponse(gen, media_type="text/markdown")
         # walkthrough_gen = walkthrough_generator_for_fastapi(
         #         llm=llm,  # your injected client
         #         repo_name=request.repo_id,
@@ -82,9 +89,9 @@ async def query_repo(request: QueryRequest):
         #     "response": "Check the console for the streamed response."
         # }
 
-        return {
-            "response": "Check the console for the streamed response."
-        }
+        # return {
+        #     "response": "Check the console for the streamed response."
+        # }
         # for chunk in walkthrough_gen:
         #     print(chunk, end="")
 

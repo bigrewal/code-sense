@@ -45,7 +45,8 @@ try:
 except Exception:
     list_files_in_dir = None  # type: ignore
 
-from .tools.fetch_code_file import fetch_code_file as fetch_code_file_tool # type: ignore
+from .tools.fetch_code_file import fetch_code_file as fetch_code_file_tool
+from .db import attention_db_runtime
 
 MODEL_NAME = "openai/gpt-oss-20b"
 TOP_K_SEED = 20
@@ -58,8 +59,8 @@ ROUTE_VALUES = {
     "REPO_WALKTHROUGH": "User asks for an overall architecture or 'end-to-end' / 'overview' of the repo.",
     "DIR_WALKTHROUGH": "Question targets a directory/module or feature area that maps to a directory; include sub-directories (recursive=true).",
     "FILE_WALKTHROUGH": "Question names a specific file; resolve short names (e.g., 'main.py') to the canonical path using tools before returning.",
-    "SYMBOL_EXPLAIN": "Question asks how a function/class/constant works (e.g., 'How does schedule_jobs() work?').",
-    "SYMBOL_USAGES": "Question asks who/where a symbol is used (callers/call sites).",
+    # "SYMBOL_EXPLAIN": "Question asks how a function/class/constant works (e.g., 'How does schedule_jobs() work?').",
+    # "SYMBOL_USAGES": "Question asks who/where a symbol is used (callers/call sites).",
     "FREEFORM_QA": "Topical or cross-cutting questions (e.g., 'How does auth work?') or when scope is unclear; return 3–7 seed-matched files as the initial focus."
 }
 
@@ -246,6 +247,16 @@ DECISION_TOOLS: List[Dict[str, Any]] = [
             "additionalProperties": False,
         },
     ),
+    _fn(
+        "search_repo_vectordb",
+        "Search the code file summaries in the Vector DB.",
+        {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    ),
 ]
 
 
@@ -366,6 +377,22 @@ class _ToolRuntime:
         except Exception as e:
             return {"path": path, "error": str(e), "code": ""}
 
+    def search_repo_vectordb(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        query = args.get("query") or ""
+        try:
+            _, pack_items = attention_db_runtime._pack_blocking(self.repo_name, query)
+        except Exception:
+            pack_items = []
+
+        response = []
+        for record in pack_items:
+            response.append({
+                "file_path": record.get("file_path"),
+                "summary": record.get("summary"),
+            })
+
+        return {"results": response}
+
 
 _TOOL_DISPATCH: Dict[str, Callable[["_ToolRuntime", Dict[str, Any]], Dict[str, Any]]] = {
     "list_entry_points": _ToolRuntime.list_entry_points,
@@ -374,6 +401,7 @@ _TOOL_DISPATCH: Dict[str, Callable[["_ToolRuntime", Dict[str, Any]], Dict[str, A
     "lookup_symbol_usages": _ToolRuntime.lookup_symbol_usages,
     "lookup_symbol_refs": _ToolRuntime.lookup_symbol_refs,
     "fetch_code_file": _ToolRuntime.fetch_code_file,
+    "search_repo_vectordb": _ToolRuntime.search_repo_vectordb,
 }
 
 

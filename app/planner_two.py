@@ -28,6 +28,8 @@ from .tools.fetch_entry_point_files import fetch_entry_point_files_as_list
 from .tools.fetch_cross_file_refs_for_file import fetch_cross_file_refs_for_file_as_list
 from .tools.fetch_code_file import fetch_code_file
 
+from .router import RoutePlan
+
 from .db import get_mongo_client
 
 # Optional import for dir listing (ask the user to provide if unavailable)
@@ -334,42 +336,46 @@ class RepoWalkthroughWorkflow(_BaseWalkthrough):
 
 @dataclass
 class DirWalkthroughWorkflow(_BaseWalkthrough):
-    directory: str = ""
+    directory: List[str] = field(default_factory=list)
 
     def stream_iter(self) -> Iterator[str]:
         if list_files_in_dir is None:
             raise RuntimeError(
                 "list_files_in_dir tool is not available. Please provide .tools.list_files_in_dir.list_files_in_dir."
             )
-        try:
-            files = list(list_files_in_dir(self.directory))  # type: ignore[misc]
-        except Exception as e:
-            yield f"**Failed to list files for directory `{self.directory}`: {e}**\n"
-            return
-        # Filter to code files
-        initial = [p for p in files if looks_like_code_path(p)]
-        if not initial:
-            yield f"**No code files found in directory `{self.directory}`.**\n"
-            return
-        yield from self._walk(initial)
+
+        for dir_path in self.directory:
+            try:
+                files = list(list_files_in_dir(dir_path))  # type: ignore[misc]
+            except Exception as e:
+                yield f"**Failed to list files for directory `{dir_path}`: {e}**\n"
+                return
+
+            initial = [p for p in files if looks_like_code_path(p)]
+            if not initial:
+                yield f"**No code files found in directory `{dir_path}`.**\n"
+                return
+            yield from self._walk(initial)
 
 
 @dataclass
 class FileWalkthroughWorkflow(_BaseWalkthrough):
-    file_path: str = ""
+    file_paths: List[str] = field(default_factory=list)
 
     def stream_iter(self) -> Iterator[str]:
-        if not looks_like_code_path(self.file_path):
-            yield f"**Not a recognized code file:** {self.file_path}\n"
-            return
-        yield from self._walk([self.file_path])
+        for file_path in self.file_paths:
+            if not looks_like_code_path(file_path):
+                yield f"**Not a recognized code file:** {file_path}\n"
+                continue
+        yield from self._walk(self.file_paths)
+
 
 
 # ------------------------------
 # FastAPI wiring helpers (optional)
 # ------------------------------
 
-def walkthrough_generator_for_fastapi(*, llm: Any, repo_name: str, seed_prompt: str, user_question: str, config: WalkConfig | None = None) -> Iterator[str]:
+def repo_walkthrough_generator_for_fastapi(*, llm: Any, repo_name: str, seed_prompt: str, user_question: str, config: WalkConfig | None = None) -> Iterator[str]:
     wf = RepoWalkthroughWorkflow(
         llm=llm,
         repo_name=repo_name,
@@ -380,7 +386,7 @@ def walkthrough_generator_for_fastapi(*, llm: Any, repo_name: str, seed_prompt: 
     return wf.stream_iter()
 
 
-def dir_walkthrough_generator_for_fastapi(*, llm: Any, repo_name: str, directory: str, seed_prompt: str, user_question: str, config: WalkConfig | None = None) -> Iterator[str]:
+def dir_walkthrough_generator_for_fastapi(*, llm: Any, repo_name: str, directory: List[str], seed_prompt: str, user_question: str, config: WalkConfig | None = None) -> Iterator[str]:
     wf = DirWalkthroughWorkflow(
         llm=llm,
         repo_name=repo_name,
@@ -392,17 +398,51 @@ def dir_walkthrough_generator_for_fastapi(*, llm: Any, repo_name: str, directory
     return wf.stream_iter()
 
 
-def file_walkthrough_generator_for_fastapi(*, llm: Any, repo_name: str, file_path: str, seed_prompt: str, user_question: str, config: WalkConfig | None = None) -> Iterator[str]:
+def file_walkthrough_generator_for_fastapi(*, llm: Any, repo_name: str, file_paths: List[str], seed_prompt: str, user_question: str, config: WalkConfig | None = None) -> Iterator[str]:
     wf = FileWalkthroughWorkflow(
         llm=llm,
         repo_name=repo_name,
         seed_prompt=seed_prompt,
         user_question=user_question,
-        file_path=file_path,
+        file_paths=file_paths,
         config=config or WalkConfig(),
     )
     return wf.stream_iter()
 
+
+def execute_route(
+    *,
+    route_plan: RoutePlan,               # RoutePlan
+    llm,                      # your GroqLLM
+    repo_name: str,
+    seed_prompt: str,
+    user_question: str,
+) -> Iterator[str]:
+    cfg = WalkConfig(
+        max_depth=route_plan.workflow_limits.max_depth,
+        max_files=route_plan.workflow_limits.max_files,
+    )
+
+    r = route_plan.route
+    T = route_plan.targets
+
+    if r == "REPO_WALKTHROUGH":
+        yield from repo_walkthrough_generator_for_fastapi(
+            llm=llm, repo_name=repo_name, seed_prompt=seed_prompt, user_question=user_question, config=cfg
+        )
+        return
+    elif r == "DIR_WALKTHROUGH":
+        yield from dir_walkthrough_generator_for_fastapi(
+            llm=llm, repo_name=repo_name, seed_prompt=seed_prompt, user_question=user_question, directory=T.dirs, config=cfg
+        )
+        return
+    elif r == "FILE_WALKTHROUGH":
+        yield from file_walkthrough_generator_for_fastapi(
+            llm=llm, repo_name=repo_name, seed_prompt=seed_prompt, user_question=user_question, file_paths=T.files, config=cfg
+        )
+        return
+    else:
+        yield "<Unknown route>"
 
 # ------------------------------
 # Example usage + lightweight self-tests (pseudo; wire your real `llm`)

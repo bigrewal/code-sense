@@ -62,7 +62,7 @@ def fetch_cross_file_refs_for_file_as_list(file_path: str, repo_id: str = "data/
     
     Returns a formatted string for LLM, listing references to definitions in other files.
     """
-    print(f"Fetching cross-file references for: {file_path} in repo: {repo_id}")
+    # print(f"Fetching cross-file references for: {file_path} in repo: {repo_id}")
     # Fetch important files from MongoDB
     mongo_client = get_mongo_client()
     mental_model_collection = mongo_client["mental_model"]
@@ -117,5 +117,5 @@ def fetch_cross_file_refs_for_file_as_list(file_path: str, repo_id: str = "data/
             record['def_file_path'] for record in records if record['def_file_path'] in brief_file_paths
         ]
 
-        print(f"Cross-file references fetched for: {file_path} in repo: {repo_id}")
+        # print(f"Cross-file references fetched for: {file_path} in repo: {repo_id}")
         return llm_output, important_file_paths

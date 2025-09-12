@@ -25,7 +25,7 @@ class AttentionDBRuntime:
 
     # Fixed packer knobs (your chosen defaults)
     BUDGET_TOKENS = 1000
-    CANDIDATE_TOPK = 10
+    CANDIDATE_TOPK = 2
     TOP_P = 0.85
     TEMP = 0.05
     MIN_ITEMS = 5
