@@ -18,6 +18,10 @@ Now supports:
 """
 from __future__ import annotations
 
+import re
+from typing import Dict, Any, Iterator, Sequence, Callable
+import json
+
 from dataclasses import dataclass, field
 from collections import deque
 from typing import Callable, Sequence, Set, List, Any, Iterator, Optional
@@ -32,6 +36,11 @@ from .router import RoutePlan
 
 from .db import get_mongo_client
 
+
+from .tools.fetch_code_file import fetch_code_file as fetch_code_file_tool
+from .tools.lookup_refs_for_def import lookup_refs_for_def
+from .tools.lookup_def_usages import lookup_def_usages
+from .db import attention_db_runtime
 # Optional import for dir listing (ask the user to provide if unavailable)
 try:  # pragma: no cover - availability depends on host project
     from .tools.list_files_in_dir import list_files_in_dir  # type: ignore
@@ -170,6 +179,89 @@ StreamFn = Callable[[str], None]
 def default_streamer(chunk: str) -> None:
     print(chunk, flush=True)
 
+
+# ----- Tool schemas & runtime -----
+def _fn(name: str, description: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": parameters,
+        },
+    }
+
+
+DECISION_TOOLS: List[Dict[str, Any]] = [
+    _fn(
+        "list_entry_points",
+        "Return likely repo entry point file paths.",
+        {"type": "object", "properties": {}, "additionalProperties": False},
+    ),
+    _fn(
+        "list_dir",
+        "List files inside a directory. If recursive=true, include sub-directories (best-effort).",
+        {
+            "type": "object",
+            "properties": {
+                "directory": {"type": "string"},
+                "recursive": {"type": "boolean", "default": True},
+            },
+            "required": ["directory"],
+            "additionalProperties": False,
+        },
+    ),
+    _fn(
+        "get_cross_refs",
+        "Return cross-file references for a given path (dependencies).",
+        {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    ),
+    _fn(
+        "lookup_symbol_usages",
+        "Return usage locations for a symbol.",
+        {
+            "type": "object",
+            "properties": {"symbol": {"type": "string"}},
+            "required": ["symbol"],
+            "additionalProperties": False,
+        },
+    ),
+    _fn(
+        "lookup_symbol_refs",
+        "Return definitions / referenced symbols related to a symbol.",
+        {
+            "type": "object",
+            "properties": {"symbol": {"type": "string"}},
+            "required": ["symbol"],
+            "additionalProperties": False,
+        },
+    ),
+    _fn(
+        "fetch_code_file",
+        "Fetch the full content of a code file by its path.",
+        {
+            "type": "object",
+            "properties": {"file_path": {"type": "string"}},
+            "required": ["file_path"],
+            "additionalProperties": False,
+        },
+    ),
+    _fn(
+        "search_repo_vectordb",
+        "Search the code file summaries in the Vector DB.",
+        {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+            "additionalProperties": True,
+        },
+    ),
+]
 
 # ------------------------------
 # Base workflow (shared core with custom initial paths)
@@ -370,6 +462,226 @@ class FileWalkthroughWorkflow(_BaseWalkthrough):
         yield from self._walk(self.file_paths)
 
 
+## Freeform QA planner
+class FreeformPlanner:
+    """LLM + tool-calling planner that outputs an ordered file-inspection plan.
+    All planner-specific helpers, tool schemas, dispatch, and prompts are encapsulated here.
+    """
+    MODEL_NAME = "openai/gpt-oss-20b"
+    PATH_RE = re.compile(r"(?:^|\s)([\w./\\-]+\.(?:py|ts|tsx|js|jsx|go|rs|java|kt|scala|rb|php|cs|cpp|c|h|hpp|m|mm|swift|sql|sh|bash|ps1|ya?ml|json))\b")
+
+    # ----- Data models (scoped to the planner) -----
+    @dataclass
+    class PlanStep:
+        file: str
+        look_for: str
+        priority: int
+
+    @dataclass
+    class FreeformPlan:
+        steps: List["FreeformPlanner.PlanStep"]
+        notes: str
+
+
+    class _ToolRuntime:
+        def list_entry_points(self, _args: Dict[str, Any]) -> Dict[str, Any]:
+            try:
+                paths = fetch_entry_point_files_as_list(self.repo_name)
+            except Exception:
+                paths = []
+            return {"paths": paths}
+
+        def search_seed_paths(self, args: Dict[str, Any]) -> Dict[str, Any]:
+            # q = (args.get("query") or "").lower()
+            # lim = int(args.get("limit") or 10)
+            # matches = [p for p in self._index_paths if q in p.lower()]
+            return {"paths": fetch_entry_point_files_as_list(self.repo_name)}
+
+        def list_dir(self, args: Dict[str, Any]) -> Dict[str, Any]:
+            directory = args.get("directory") or ""
+            recursive = bool(args.get("recursive", True))
+            if list_files_in_dir is None:
+                return {"paths": [], "warning": "list_files_in_dir unavailable"}
+            try:
+                paths = list(list_files_in_dir(directory))  # best-effort; recursion depends on host impl
+            except Exception:
+                paths = []
+            return {"paths": paths, "recursive": recursive}
+
+        def get_cross_refs(self, args: Dict[str, Any]) -> Dict[str, Any]:
+            path = args.get("path") or ""
+            try:
+                _, refs = fetch_cross_file_refs_for_file_as_list(path, self.repo_name)
+            except Exception:
+                refs = []
+            return {"paths": refs}
+
+        def lookup_symbol_usages(self, args: Dict[str, Any]) -> Dict[str, Any]:
+            sym = args.get("symbol") or ""
+            if lookup_def_usages is None:
+                return {"locations": [], "warning": "lookup_def_usages unavailable"}
+            try:
+                locs = list(lookup_def_usages(sym, self.repo_name))
+            except Exception:
+                locs = []
+            return {"locations": locs}
+
+        def lookup_symbol_refs(self, args: Dict[str, Any]) -> Dict[str, Any]:
+            sym = args.get("symbol") or ""
+            if lookup_refs_for_def is None:
+                return {"refs": [], "warning": "lookup_refs_for_def unavailable"}
+            try:
+                refs = list(lookup_refs_for_def(sym, self.repo_name))
+            except Exception:
+                refs = []
+            return {"refs": refs}
+        
+        def fetch_code_file(self, args: Dict[str, Any]) -> Dict[str, Any]:
+            path = args.get("file_path") or ""
+            try:
+                code = fetch_code_file_tool(path)
+                return {"path": path, "code": code}
+            except Exception as e:
+                return {"path": path, "error": str(e), "code": ""}
+
+        def search_repo_vectordb(self, args: Dict[str, Any]) -> Dict[str, Any]:
+            query = args.get("query") or ""
+            try:
+                _, pack_items = attention_db_runtime._pack_blocking(self.repo_name, query)
+            except Exception:
+                pack_items = []
+
+            response = []
+            for record in pack_items:
+                response.append({
+                    "file_path": record.get("file_path"),
+                    "summary": record.get("summary"),
+                })
+
+            return {"results": response}
+
+
+    _TOOL_DISPATCH: Dict[str, Callable[["_ToolRuntime", Dict[str, Any]], Dict[str, Any]]] = {
+        "list_entry_points": _ToolRuntime.list_entry_points,
+        "list_dir": _ToolRuntime.list_dir,
+        "get_cross_refs": _ToolRuntime.get_cross_refs,
+        "lookup_symbol_usages": _ToolRuntime.lookup_symbol_usages,
+        "lookup_symbol_refs": _ToolRuntime.lookup_symbol_refs,
+        "fetch_code_file": _ToolRuntime.fetch_code_file,
+        "search_repo_vectordb": _ToolRuntime.search_repo_vectordb,
+    }
+
+    # ----- Prompts & helpers -----
+    PLANNER_SYSTEM = (
+        "You are a planning agent for Freeform QA in a codebase. "
+        "Use tools to identify the MOST RELEVANT files to inspect, in order, to fully answer the user's question. "
+        "Prefer entry points and files referenced by them; include config/middleware as needed. "
+        "Finally, return ONLY a JSON object with fields: steps[], notes. "
+        "Each step: {file, look_for, priority (1..N)}. "
+        "Use tools to normalize short names (e.g., 'main.py' → 'src/main.py'). "
+        f"TOOLS YOU MAY CALL (and ONLY these): {[tool['function']['name'] for tool in DECISION_TOOLS]}"
+    )
+
+    @staticmethod
+    def _extract_paths(seed_prompt: str) -> List[str]:
+        return list({m.group(1) for m in FreeformPlanner.PATH_RE.finditer(seed_prompt or "")})
+
+    def _build_seed_table(self, seed_prompt: str, top_k: int = 30) -> str:
+        lines = [ln.strip() for ln in (seed_prompt or "").splitlines() if ln.strip()]
+        paths = self._extract_paths(seed_prompt)[:top_k]
+        rows = ["path | hint"]
+        for p in paths:
+            idx = next((i for i, ln in enumerate(lines) if p in ln), -1)
+            hint = lines[idx + 1] if idx != -1 and idx + 1 < len(lines) and len(lines[idx + 1]) < 160 else ""
+            rows.append(f"{p} | {hint}")
+        return "\n".join(rows)
+
+    def _planner_user(self, repo: str, question: str, seed_prompt: str) -> str:
+        return textwrap.dedent(
+            f"""
+            [REPO] {repo}
+            [QUESTION] {question}
+            [SEED PROMPT]
+            {seed_prompt}
+
+            Use the seed prompt to figure out the files needed to answer the question.
+            Avoid duplicates. Keep 'look_for' short and concrete.
+            Output ONLY JSON: {{"steps": [...], "notes": "..."}}
+            """
+        ).strip()
+
+    # ----- Public API -----
+    def __init__(self, llm: Any, *, model: str = MODEL_NAME, temperature: float = 0.1):
+        self.llm = llm
+        self.model = model
+        self.temperature = temperature
+
+    def plan(self, *, repo_name: str, seed_prompt: str, user_question: str) -> "FreeformPlanner.FreeformPlan":
+        messages = [
+            {"role": "system", "content": self.PLANNER_SYSTEM},
+            {"role": "user", "content": self._planner_user(repo_name, user_question, seed_prompt)},
+        ]
+        run = FreeformPlanner._ToolRuntime(repo_name, seed_prompt)
+
+        for _ in range(8):
+            resp = self.llm.generate(
+                messages=messages,
+                tools=DECISION_TOOLS,
+                reasoning_effort="medium",
+                tool_choice="auto",
+                temperature=self.temperature,
+                stream=False,
+                response_format=None,
+                return_raw=True,
+            )
+            choice = resp.choices[0]
+            msg = choice.message
+            tool_calls = msg.tool_calls
+            if tool_calls:
+                for tc in tool_calls:
+                    name = tc.function.name
+                    raw = tc.function.arguments
+                    args = json.loads(raw) if isinstance(raw, str) else (raw or {})
+                    handler = FreeformPlanner._TOOL_DISPATCH.get(name)
+                    if handler is None:
+                        result = {"error": f"unknown tool: {name}"}
+                    else:
+                        result = handler(run, args)
+                    messages.append({"role": "assistant", "tool_calls": [tc], "content": None})
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": getattr(tc, "id", name),
+                        "name": name,
+                        "content": json.dumps(result, ensure_ascii=False),
+                    })
+                continue
+
+            # Expect final JSON plan
+            content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+            try:
+                data = json.loads(content or "{}")
+            except Exception:
+                data = {"steps": [], "notes": "model failed to return JSON"}
+
+            steps_raw = data.get("steps", []) or []
+            steps: List[FreeformPlanner.PlanStep] = []
+            seen = set()
+            for i, s in enumerate(steps_raw, start=1):
+                fp = str(s.get("file", "")).strip()
+                lf = str(s.get("look_for", "")).strip() or "general overview"
+                pr = int(s.get("priority", i))
+                if not fp or fp in seen:
+                    continue
+                seen.add(fp)
+                steps.append(FreeformPlanner.PlanStep(file=fp, look_for=lf[:200], priority=pr))
+            steps.sort(key=lambda x: x.priority)
+            notes = str(data.get("notes", "")).strip()
+            return FreeformPlanner.FreeformPlan(steps=steps[:7], notes=notes[:400])
+
+        # Fallback empty plan
+        return FreeformPlanner.FreeformPlan(steps=[], notes="timeout")
+
+
 
 # ------------------------------
 # FastAPI wiring helpers (optional)
@@ -410,6 +722,47 @@ def file_walkthrough_generator_for_fastapi(*, llm: Any, repo_name: str, file_pat
     return wf.stream_iter()
 
 
+def freeform_qa_generator_for_fastapi(
+    *,
+    llm: Any,
+    repo_name: str,
+    seed_prompt: str,
+    user_question: str,
+    initial_files: Optional[Sequence[str]] = None,
+    config: Optional[WalkConfig] = None,
+) -> Iterator[str]:
+    planner = FreeformPlanner(llm)
+    plan = planner.plan(repo_name=repo_name, seed_prompt=seed_prompt, user_question=user_question)
+    if not plan.steps:
+        yield "**Planner produced no steps; falling back to entry points.**\n"
+        initial = fetch_entry_point_files_as_list(repo_name)
+        for f in initial[:5]:
+            yield f"\n# Focus file: `{f}`\n"
+            yield from file_walkthrough_generator_for_fastapi(
+                llm=llm, repo_name=repo_name, file_path=f, seed_prompt=seed_prompt, user_question=user_question, config=config or WalkConfig()
+            )
+        return
+
+
+    yield "# Freeform QA Plan\n"
+    if plan.notes:
+        yield f"> Notes: {plan.notes}\n"
+
+
+    for step in plan.steps:
+        yield f"\n## {step.priority}. {step.file}\n"
+        if step.look_for:
+            yield f"- Look for: {step.look_for}\n"
+        yield from file_walkthrough_generator_for_fastapi(
+            llm=llm,
+            repo_name=repo_name,
+            file_path=step.file,
+            seed_prompt=seed_prompt,
+            user_question=user_question,
+            config=config or WalkConfig(),
+        )
+
+
 def execute_route(
     *,
     route_plan: RoutePlan,               # RoutePlan
@@ -441,8 +794,14 @@ def execute_route(
             llm=llm, repo_name=repo_name, seed_prompt=seed_prompt, user_question=user_question, file_paths=T.files, config=cfg
         )
         return
+    elif r == "FREEFORM_QA":
+        yield from freeform_qa_generator_for_fastapi(
+            llm=llm, repo_name=repo_name, seed_prompt=seed_prompt, user_question=user_question, config=cfg
+        )
     else:
-        yield "<Unknown route>"
+        print(f"**Unsupported route `{r}`.**\n")
+        print(f"Target directories: {T.dirs}")
+        yield f"**Unsupported route `{r}`.**\n"
 
 # ------------------------------
 # Example usage + lightweight self-tests (pseudo; wire your real `llm`)

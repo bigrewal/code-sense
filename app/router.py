@@ -28,7 +28,6 @@ import re
 # ---- Project tools (some optional) ----
 from .tools.fetch_entry_point_files import fetch_entry_point_files_as_list
 from .tools.fetch_cross_file_refs_for_file import fetch_cross_file_refs_for_file_as_list
-from .tools.fetch_code_file import fetch_code_file  # not used directly here
 
 try:  # optional symbol tools
     from .tools.lookup_refs_for_def import lookup_refs_for_def  # type: ignore
@@ -61,7 +60,7 @@ ROUTE_VALUES = {
     "FILE_WALKTHROUGH": "Question names a specific file; resolve short names (e.g., 'main.py') to the canonical path using tools before returning.",
     # "SYMBOL_EXPLAIN": "Question asks how a function/class/constant works (e.g., 'How does schedule_jobs() work?').",
     # "SYMBOL_USAGES": "Question asks who/where a symbol is used (callers/call sites).",
-    "FREEFORM_QA": "Topical or cross-cutting questions (e.g., 'How does auth work?') or when scope is unclear; return 3–7 seed-matched files as the initial focus."
+    "FREEFORM_QA": "Topical or cross-cutting questions (e.g., 'How does auth work?') or when scope is unclear"
 }
 
 ROUTE_HINTS = "\n".join(f"- {k}: {v}" for k, v in ROUTE_VALUES.items())
@@ -274,27 +273,17 @@ SYSTEM_PROMPT = (
     "\n"
     "OUTPUT REQUIREMENTS:\n"
     "- Return a SINGLE JSON object with EXACT keys: route, targets{dirs,files,symbols}, workflow_limits{max_files,max_depth}, assumptions[], confidence, notes_for_workflow.\n"
-    "- route MUST be one of the VALID ROUTES above (do NOT invent new routes like 'inspect').\n"
+    "- route MUST be one of the VALID ROUTES above (do NOT invent new routes).\n"
     "- targets.dirs/files/symbols MUST reference existing entities grounded in the seed digest or tool outputs. If the user provides a short file name (e.g., 'main.py'), use tools to resolve it to the canonical path BEFORE returning.\n"
-    "- For DIR_WALKTHROUGH set recursive=true conceptually (include sub-dirs in your selection logic). For FREEFORM_QA, provide 3–7 seed-matched files with a brief rationale.\n"
+    "- For DIR_WALKTHROUGH set recursive=true conceptually (include sub-dirs in your selection logic). For FREEFORM_QA, provide matched files with a brief rationale.\n"
     "- confidence MUST be a number between 0 and 1 (float), not a string.\n"
-    "- If none of FILE/DIR/SYMBOL routes can be confidently chosen, prefer FREEFORM_QA.\n"
+    "- If none of the valid routes can be confidently chosen, prefer FREEFORM_QA.\n"
     "- Do NOT emit any prose outside the JSON.\n"
     "\n"
     f"TOOLS YOU MAY CALL (and ONLY these): {[tool['function']['name'] for tool in DECISION_TOOLS]}"
+    "Don't use the same tool with the same arguments again"
+    "When calling a tool, arguments must be strict JSON: double quotes only, no trailing commas, no comments, no placeholders."
 )
-
-
-def _router_user_prompt(repo_name: str, user_question: str, digest: SeedDigest) -> str:
-    table = serialize_seed_digest_for_prompt(digest)
-    return (
-        f"[REPO]\n{repo_name}\n\n"
-        f"[QUESTION]\n{user_question}\n\n"
-        f"[SEED DIGEST (top-{len(digest.entries)})]\n{table}\n\n"
-        "Decide the best workflow route that will fully answer the question. "
-        "Prefer the smallest sufficient scope. If the user references a file like 'main.py', use tools to find the canonical path first. "
-        "Finally, output ONLY the JSON object described above."
-    )
 
 
 def _router_user_prompt(repo_name: str, user_question: str, seed_prompt: str) -> str:
