@@ -322,8 +322,8 @@ class _BaseWalkthrough:
             return
 
         files_processed = 0
-        yield f"# Walkthrough for `{self.repo_name}`\n"
-        yield "_Progressive walkthrough starting from the requested scope and expanding through dependencies._\n"
+        # yield f"# Walkthrough for `{self.repo_name}`\n"
+        # yield "_Progressive walkthrough starting from the requested scope and expanding through dependencies._\n"
 
         while queue and files_processed < self.config.max_files:
             item = queue.popleft()
@@ -344,11 +344,12 @@ class _BaseWalkthrough:
 
             parts: List[str] = []
             # Check mongoDB
-            existing_insight = self.mental_model_collection.find_one({
-                "repo_id": self.repo_name,
-                "file_path": item.path,
-                "document_type": "FILE_SUMMARY"
-            })
+            # existing_insight = self.mental_model_collection.find_one({
+            #     "repo_id": self.repo_name,
+            #     "file_path": item.path,
+            #     "document_type": "FILE_SUMMARY"
+            # })
+            existing_insight = False
 
             if existing_insight:
                 summary = existing_insight["data"]
@@ -484,6 +485,9 @@ class FreeformPlanner:
 
 
     class _ToolRuntime:
+        def __init__(self, repo_name: str):
+            self.repo_name = repo_name
+
         def list_entry_points(self, _args: Dict[str, Any]) -> Dict[str, Any]:
             try:
                 paths = fetch_entry_point_files_as_list(self.repo_name)
@@ -582,20 +586,6 @@ class FreeformPlanner:
         f"TOOLS YOU MAY CALL (and ONLY these): {[tool['function']['name'] for tool in DECISION_TOOLS]}"
     )
 
-    @staticmethod
-    def _extract_paths(seed_prompt: str) -> List[str]:
-        return list({m.group(1) for m in FreeformPlanner.PATH_RE.finditer(seed_prompt or "")})
-
-    def _build_seed_table(self, seed_prompt: str, top_k: int = 30) -> str:
-        lines = [ln.strip() for ln in (seed_prompt or "").splitlines() if ln.strip()]
-        paths = self._extract_paths(seed_prompt)[:top_k]
-        rows = ["path | hint"]
-        for p in paths:
-            idx = next((i for i, ln in enumerate(lines) if p in ln), -1)
-            hint = lines[idx + 1] if idx != -1 and idx + 1 < len(lines) and len(lines[idx + 1]) < 160 else ""
-            rows.append(f"{p} | {hint}")
-        return "\n".join(rows)
-
     def _planner_user(self, repo: str, question: str, seed_prompt: str) -> str:
         return textwrap.dedent(
             f"""
@@ -611,7 +601,7 @@ class FreeformPlanner:
         ).strip()
 
     # ----- Public API -----
-    def __init__(self, llm: Any, *, model: str = MODEL_NAME, temperature: float = 0.1):
+    def __init__(self, llm: Any, *, model: str = MODEL_NAME, temperature: float = 0.0):
         self.llm = llm
         self.model = model
         self.temperature = temperature
@@ -621,7 +611,7 @@ class FreeformPlanner:
             {"role": "system", "content": self.PLANNER_SYSTEM},
             {"role": "user", "content": self._planner_user(repo_name, user_question, seed_prompt)},
         ]
-        run = FreeformPlanner._ToolRuntime(repo_name, seed_prompt)
+        run = FreeformPlanner._ToolRuntime(repo_name)
 
         for _ in range(8):
             resp = self.llm.generate(
@@ -642,6 +632,7 @@ class FreeformPlanner:
                     name = tc.function.name
                     raw = tc.function.arguments
                     args = json.loads(raw) if isinstance(raw, str) else (raw or {})
+                    print(f"Invoking tool in freeform QA: {name} with args {args}")
                     handler = FreeformPlanner._TOOL_DISPATCH.get(name)
                     if handler is None:
                         result = {"error": f"unknown tool: {name}"}
@@ -657,9 +648,11 @@ class FreeformPlanner:
                 continue
 
             # Expect final JSON plan
-            content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+            content = msg.content.strip()
+            data = {}
             try:
                 data = json.loads(content or "{}")
+                print("Planner final JSON:", data)
             except Exception:
                 data = {"steps": [], "notes": "model failed to return JSON"}
 
@@ -731,18 +724,18 @@ def freeform_qa_generator_for_fastapi(
     initial_files: Optional[Sequence[str]] = None,
     config: Optional[WalkConfig] = None,
 ) -> Iterator[str]:
+    print(f"**Freeform QA for repo `{repo_name}`**\n")
     planner = FreeformPlanner(llm)
     plan = planner.plan(repo_name=repo_name, seed_prompt=seed_prompt, user_question=user_question)
     if not plan.steps:
         yield "**Planner produced no steps; falling back to entry points.**\n"
         initial = fetch_entry_point_files_as_list(repo_name)
-        for f in initial[:5]:
-            yield f"\n# Focus file: `{f}`\n"
-            yield from file_walkthrough_generator_for_fastapi(
-                llm=llm, repo_name=repo_name, file_path=f, seed_prompt=seed_prompt, user_question=user_question, config=config or WalkConfig()
+        yield from file_walkthrough_generator_for_fastapi(
+                llm=llm, repo_name=repo_name, file_paths=initial, seed_prompt=seed_prompt, user_question=user_question, config=config or WalkConfig()
             )
         return
 
+    print(f"**Planner produced {len(plan.steps)} steps.**\n")
 
     yield "# Freeform QA Plan\n"
     if plan.notes:
@@ -751,14 +744,15 @@ def freeform_qa_generator_for_fastapi(
 
     for step in plan.steps:
         yield f"\n## {step.priority}. {step.file}\n"
-        if step.look_for:
-            yield f"- Look for: {step.look_for}\n"
+        look_for = step.look_for
+        q = f"{user_question}\nFocus on: {look_for}" if look_for else user_question
+        
         yield from file_walkthrough_generator_for_fastapi(
             llm=llm,
             repo_name=repo_name,
-            file_path=step.file,
+            file_paths=[step.file],
             seed_prompt=seed_prompt,
-            user_question=user_question,
+            user_question=q,
             config=config or WalkConfig(),
         )
 
@@ -800,7 +794,6 @@ def execute_route(
         )
     else:
         print(f"**Unsupported route `{r}`.**\n")
-        print(f"Target directories: {T.dirs}")
         yield f"**Unsupported route `{r}`.**\n"
 
 # ------------------------------

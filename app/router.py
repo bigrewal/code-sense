@@ -56,11 +56,11 @@ TOP_K_SEED = 20
 
 ROUTE_VALUES = {
     "REPO_WALKTHROUGH": "User asks for an overall architecture or 'end-to-end' / 'overview' of the repo.",
-    "DIR_WALKTHROUGH": "Question targets a directory/module or feature area that maps to a directory; include sub-directories (recursive=true).",
-    "FILE_WALKTHROUGH": "Question names a specific file; resolve short names (e.g., 'main.py') to the canonical path using tools before returning.",
+    "DIR_WALKTHROUGH": "Question targets a directory/module or feature area that maps to a directory; include sub-directories (recursive=true). If the user provides a short dir name, use tools to resolve it to the canonical path before returning. If the directory doesn't exist, fallback to FREEFORM_QA.",
+    "FILE_WALKTHROUGH": "Question names a specific file; resolve short names (e.g., 'main.py') to the canonical path using tools before returning. If the file doesn't exist, fallback to FREEFORM_QA.",
     # "SYMBOL_EXPLAIN": "Question asks how a function/class/constant works (e.g., 'How does schedule_jobs() work?').",
     # "SYMBOL_USAGES": "Question asks who/where a symbol is used (callers/call sites).",
-    "FREEFORM_QA": "Topical or cross-cutting questions (e.g., 'How does auth work?') or when scope is unclear"
+    "FREEFORM_QA": "Question is about some functionality, behavior, or concept in the repo but does not clearly specify a repo, directory, or file.",
 }
 
 ROUTE_HINTS = "\n".join(f"- {k}: {v}" for k, v in ROUTE_VALUES.items())
@@ -122,56 +122,6 @@ class SeedDigest:
         return {e.path for e in self.entries}
 
 
-PATH_RE = re.compile(r"(?:^|\s)([\w./\\-]+\.(?:py|ts|tsx|js|jsx|go|rs|java|kt|scala|rb|php|cs|cpp|c|h|hpp|m|mm|swift|sql|sh|bash|ps1|ya?ml|json))\b")
-
-
-def _extract_paths(seed_prompt: str) -> List[str]:
-    return list({m.group(1) for m in PATH_RE.finditer(seed_prompt or "")})
-
-
-def _extract_entries(seed_prompt: str, top_k: int = TOP_K_SEED) -> List[SeedEntry]:
-    lines = [ln.strip() for ln in (seed_prompt or "").splitlines() if ln.strip()]
-    paths = _extract_paths(seed_prompt)
-    seen = set()
-    entries: List[SeedEntry] = []
-    for p in paths:
-        if p in seen:
-            continue
-        seen.add(p)
-        cand_idx = next((i for i, ln in enumerate(lines) if p in ln), -1)
-        summary = ""
-        if cand_idx != -1:
-            summary = lines[cand_idx]
-            if cand_idx + 1 < len(lines) and len(lines[cand_idx + 1]) < 160:
-                summary = lines[cand_idx + 1]
-        tags = [tok.lower() for tok in re.findall(r"[A-Za-z0-9_]+", summary) if len(tok) > 2][:8]
-        xref = summary.lower().count("->") + summary.lower().count("import") + summary.lower().count("uses")
-        entries.append(SeedEntry(path=p, summary=summary[:200], tags=tags[:8], cross_ref_count=xref))
-    entries.sort(key=lambda e: (-(e.cross_ref_count), len(e.path)))
-    return entries[:top_k]
-
-
-def _build_keywords_index(entries: Sequence[SeedEntry]) -> Dict[str, List[str]]:
-    idx: Dict[str, List[str]] = {}
-    for e in entries:
-        for t in e.tags:
-            idx.setdefault(t, []).append(e.path)
-    return idx
-
-
-def build_seed_digest(seed_prompt: str, top_k: int = TOP_K_SEED) -> SeedDigest:
-    entries = _extract_entries(seed_prompt, top_k=top_k)
-    return SeedDigest(entries=entries, keywords_index=_build_keywords_index(entries))
-
-
-def serialize_seed_digest_for_prompt(digest: SeedDigest) -> str:
-    lines = ["path | tags | xref | summary"]
-    for e in digest.entries:
-        tags = ",".join(e.tags[:6])
-        lines.append(f"{e.path} | {tags} | {e.cross_ref_count} | {e.summary}")
-    return "\n".join(lines)
-
-
 # ------------------------------
 # Decision-support tool schemas (OpenAI-compatible)
 # ------------------------------
@@ -206,46 +156,46 @@ DECISION_TOOLS: List[Dict[str, Any]] = [
             "additionalProperties": False,
         },
     ),
-    _fn(
-        "get_cross_refs",
-        "Return cross-file references for a given path (dependencies).",
-        {
-            "type": "object",
-            "properties": {"path": {"type": "string"}},
-            "required": ["path"],
-            "additionalProperties": False,
-        },
-    ),
-    _fn(
-        "lookup_symbol_usages",
-        "Return usage locations for a symbol.",
-        {
-            "type": "object",
-            "properties": {"symbol": {"type": "string"}},
-            "required": ["symbol"],
-            "additionalProperties": False,
-        },
-    ),
-    _fn(
-        "lookup_symbol_refs",
-        "Return definitions / referenced symbols related to a symbol.",
-        {
-            "type": "object",
-            "properties": {"symbol": {"type": "string"}},
-            "required": ["symbol"],
-            "additionalProperties": False,
-        },
-    ),
-    _fn(
-        "fetch_code_file",
-        "Fetch the full content of a code file by its path.",
-        {
-            "type": "object",
-            "properties": {"file_path": {"type": "string"}},
-            "required": ["file_path"],
-            "additionalProperties": False,
-        },
-    ),
+    # _fn(
+    #     "get_cross_refs",
+    #     "Return cross-file references for a given path (dependencies).",
+    #     {
+    #         "type": "object",
+    #         "properties": {"path": {"type": "string"}},
+    #         "required": ["path"],
+    #         "additionalProperties": False,
+    #     },
+    # ),
+    # _fn(
+    #     "lookup_symbol_usages",
+    #     "Return usage locations for a symbol.",
+    #     {
+    #         "type": "object",
+    #         "properties": {"symbol": {"type": "string"}},
+    #         "required": ["symbol"],
+    #         "additionalProperties": False,
+    #     },
+    # ),
+    # _fn(
+    #     "lookup_symbol_refs",
+    #     "Return definitions / referenced symbols related to a symbol.",
+    #     {
+    #         "type": "object",
+    #         "properties": {"symbol": {"type": "string"}},
+    #         "required": ["symbol"],
+    #         "additionalProperties": False,
+    #     },
+    # ),
+    # _fn(
+    #     "fetch_code_file",
+    #     "Fetch the full content of a code file by its path.",
+    #     {
+    #         "type": "object",
+    #         "properties": {"file_path": {"type": "string"}},
+    #         "required": ["file_path"],
+    #         "additionalProperties": False,
+    #     },
+    # ),
     _fn(
         "search_repo_vectordb",
         "Search the code file summaries in the Vector DB.",
@@ -405,7 +355,6 @@ class Router:
 
     def route(self, *, user_question: str, repo_name: str, seed_prompt: str) -> RoutePlan:
         print(f"Routing question: {user_question} in repo {repo_name}")
-        # digest = build_seed_digest(seed_prompt)
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": _router_user_prompt(repo_name, user_question, seed_prompt)},

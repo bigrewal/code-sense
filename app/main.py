@@ -67,6 +67,7 @@ async def query_repo(request: QueryRequest):
 
         router: Router = Router(llm)
         route: RoutePlan = router.route(user_question=request.question, seed_prompt=mental_model, repo_name=request.repo_id)
+
         gen = execute_route(
             route_plan=route,
             llm=llm,
