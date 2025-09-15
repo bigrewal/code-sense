@@ -196,7 +196,7 @@ DECISION_TOOLS: List[Dict[str, Any]] = [
     _fn(
         "list_entry_points",
         "Return likely repo entry point file paths.",
-        {"type": "object", "properties": {}, "additionalProperties": False},
+        {"type": "object", "properties": {}, "additionalProperties": True},
     ),
     _fn(
         "list_dir",
@@ -211,46 +211,46 @@ DECISION_TOOLS: List[Dict[str, Any]] = [
             "additionalProperties": False,
         },
     ),
-    _fn(
-        "get_cross_refs",
-        "Return cross-file references for a given path (dependencies).",
-        {
-            "type": "object",
-            "properties": {"path": {"type": "string"}},
-            "required": ["path"],
-            "additionalProperties": False,
-        },
-    ),
-    _fn(
-        "lookup_symbol_usages",
-        "Return usage locations for a symbol.",
-        {
-            "type": "object",
-            "properties": {"symbol": {"type": "string"}},
-            "required": ["symbol"],
-            "additionalProperties": False,
-        },
-    ),
-    _fn(
-        "lookup_symbol_refs",
-        "Return definitions / referenced symbols related to a symbol.",
-        {
-            "type": "object",
-            "properties": {"symbol": {"type": "string"}},
-            "required": ["symbol"],
-            "additionalProperties": False,
-        },
-    ),
-    _fn(
-        "fetch_code_file",
-        "Fetch the full content of a code file by its path.",
-        {
-            "type": "object",
-            "properties": {"file_path": {"type": "string"}},
-            "required": ["file_path"],
-            "additionalProperties": False,
-        },
-    ),
+    # _fn(
+    #     "get_cross_refs",
+    #     "Return cross-file references for a given path (dependencies).",
+    #     {
+    #         "type": "object",
+    #         "properties": {"path": {"type": "string"}},
+    #         "required": ["path"],
+    #         "additionalProperties": False,
+    #     },
+    # ),
+    # _fn(
+    #     "lookup_symbol_usages",
+    #     "Return usage locations for a symbol.",
+    #     {
+    #         "type": "object",
+    #         "properties": {"symbol": {"type": "string"}},
+    #         "required": ["symbol"],
+    #         "additionalProperties": False,
+    #     },
+    # ),
+    # _fn(
+    #     "lookup_symbol_refs",
+    #     "Return definitions / referenced symbols related to a symbol.",
+    #     {
+    #         "type": "object",
+    #         "properties": {"symbol": {"type": "string"}},
+    #         "required": ["symbol"],
+    #         "additionalProperties": False,
+    #     },
+    # ),
+    # _fn(
+    #     "fetch_code_file",
+    #     "Fetch the full content of a code file by its path.",
+    #     {
+    #         "type": "object",
+    #         "properties": {"file_path": {"type": "string"}},
+    #         "required": ["file_path"],
+    #         "additionalProperties": False,
+    #     },
+    # ),
     _fn(
         "search_repo_vectordb",
         "Search the code file summaries in the Vector DB.",
@@ -577,13 +577,14 @@ class FreeformPlanner:
 
     # ----- Prompts & helpers -----
     PLANNER_SYSTEM = (
-        "You are a planning agent for Freeform QA in a codebase. "
+        "Your task is to simply shortlist the files to inspect, in order, to answer the user's question. "
         "Use tools to identify the MOST RELEVANT files to inspect, in order, to fully answer the user's question. "
         "Prefer entry points and files referenced by them; include config/middleware as needed. "
         "Finally, return ONLY a JSON object with fields: steps[], notes. "
         "Each step: {file, look_for, priority (1..N)}. "
         "Use tools to normalize short names (e.g., 'main.py' → 'src/main.py'). "
         f"TOOLS YOU MAY CALL (and ONLY these): {[tool['function']['name'] for tool in DECISION_TOOLS]}"
+        "Don't use the same tool with the same arguments again."
     )
 
     def _planner_user(self, repo: str, question: str, seed_prompt: str) -> str:

@@ -274,7 +274,7 @@ def init_mongo_client():
 
 def get_neo4j_client() -> Neo4jClient:
     if neo4j_client is None:
-        raise RuntimeError("Neo4j client not initialized")
+        init_neo4j_client()
     return neo4j_client
 
 def get_mongo_client() -> MyMongoClient:

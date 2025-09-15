@@ -12,6 +12,7 @@ from .config import Config
 from .mental_model import MentalModelFetcher
 from .planner import QueryPlanner
 from .planner_two import execute_route
+from .planner_three import FreeformQA
 from .router import RoutePlan, Router
 from .executor import PlanExecutor
 from .synthesizer import ResponseSynthesizer
@@ -65,16 +66,26 @@ async def query_repo(request: QueryRequest):
         # plan, mental_model_summary = await planner.plan(request.question, mental_model)
         # execution_results = await executor.execute(plan, request.question, mental_model, request.repo_id, parallel=True)
 
-        router: Router = Router(llm)
-        route: RoutePlan = router.route(user_question=request.question, seed_prompt=mental_model, repo_name=request.repo_id)
+        # router: Router = Router(llm)
+        # route: RoutePlan = router.route(user_question=request.question, seed_prompt=mental_model, repo_name=request.repo_id)
 
-        gen = execute_route(
-            route_plan=route,
+        # gen = execute_route(
+        #     route_plan=route,
+        #     llm=llm,
+        #     repo_name=request.repo_id,
+        #     seed_prompt=mental_model,
+        #     user_question=request.question,
+        # )
+
+
+        fqa = FreeformQA(
             llm=llm,
             repo_name=request.repo_id,
             seed_prompt=mental_model,
             user_question=request.question,
         )
+        gen = fqa.answer()
+
         return StreamingResponse(gen, media_type="text/markdown")
         # walkthrough_gen = walkthrough_generator_for_fastapi(
         #         llm=llm,  # your injected client

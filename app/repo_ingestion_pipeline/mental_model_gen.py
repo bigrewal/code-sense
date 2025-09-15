@@ -80,7 +80,7 @@ class MentalModelStage(PipelineStage):
             # self._write_to_jsonl(insights, file_summaries, repo_id, dir_tree)
             self._write_to_jsonl_v2(insights, repo_id)
 
-            await attention_db_runtime.build_keybank(repo_id)
+            # await attention_db_runtime.build_keybank(repo_id)
 
             print(f"Job {self.job_id}: Mental model generated and written to MD file")
             
@@ -254,9 +254,11 @@ class MentalModelStage(PipelineStage):
         # Add _cross_file_interactions_in_file in insights
         for insight in insights:
             file_path = insight["file_path"]
-            interactions, cross_file_paths = self._cross_file_interactions_in_file(file_path, repo_id)
-            insight["cross_file_interactions"] = interactions
-            insight["cross_file_paths"] = cross_file_paths
+            dependency_info = self._cross_file_interactions_in_file(file_path, repo_id)
+            insight["downstream_dep_interactions"] = dependency_info["downstream"]["interactions"]
+            insight["downstream_dep_files"] = list(dependency_info["downstream"]["files"])
+            insight["upstream_dep_interactions"] = dependency_info["upstream"]["interactions"]
+            insight["upstream_dep_files"] = list(dependency_info["upstream"]["files"])
 
         return insights, ignored
 
@@ -311,8 +313,8 @@ class MentalModelStage(PipelineStage):
                 "Provide only the requested output, strictly adhering to the specified format."
             )
 
-            interactions, _ = self._cross_file_interactions_in_file(file_path, repo_id)
-            cross_refs = "\n".join(interactions) if interactions else "No cross-file dependencies."
+            dependency_info = self._cross_file_interactions_in_file(file_path, repo_id)
+            cross_refs = "\n".join(dependency_info["downstream"]["interactions"]) if dependency_info["downstream"]["interactions"] else "No cross-file dependencies."
 
             prompt = (
                 f"{file_path} in repo {repo_id}:\n\n{code}\n\n"
@@ -362,11 +364,11 @@ class MentalModelStage(PipelineStage):
             
             for file_path, result in zip(batch, file_results):
                 if isinstance(result, str):  # Ensure no exceptions
-                    interactions, _ = self._cross_file_interactions_in_file(file_path, repo_id)
+                    dependency_info = self._cross_file_interactions_in_file(file_path, repo_id)
                     file_info = {
                         "path": file_path,
                         "summary": result or "No summary available.",
-                        "cross_file_interactions": interactions,
+                        "cross_file_interactions": dependency_info["downstream"]["interactions"],
                     }
                     file_summaries.append(file_info)
                 else:
@@ -392,9 +394,11 @@ class MentalModelStage(PipelineStage):
 
         return {'files': file_summaries}
 
-    def _cross_file_interactions_in_file(self, file_path: str, repo_id: str) -> List[str]:
-        """Infer cross-file interactions for a given file by finding references to definitions in other files."""
-        query = """
+    def _cross_file_interactions_in_file(self, file_path: str, repo_id: str):
+        """Infer cross-file interactions for a given file by finding references to and from definitions in other files."""
+
+        # Downstream: file_path → other files
+        downstream_query = """
         MATCH (ref:ASTNode {repo_id: $repo_id, file_path: $file_path, is_reference: true})
         -[:REFERENCES]->(ident:ASTNode)
         WHERE ident.file_path <> $file_path
@@ -402,20 +406,48 @@ class MentalModelStage(PipelineStage):
         WHERE def.node_id = ident.parent_id
         RETURN DISTINCT ref.name AS ref_name, def.node_type AS node_type, def.file_path AS def_file_path
         """
+
+        # Upstream: other files → file_path
+        upstream_query = """
+        MATCH (ref:ASTNode {repo_id: $repo_id, is_reference: true})
+        -[:REFERENCES]->(ident:ASTNode {file_path: $file_path})
+        MATCH (def:ASTNode)
+        WHERE def.node_id = ident.parent_id
+        RETURN DISTINCT ref.file_path AS ref_file_path, ref.name AS ref_name, def.node_type AS node_type
+        """
+
         with self.neo4j_client.driver.session() as session:
-            result = session.run(query, repo_id=repo_id, file_path=file_path)
-            # Collect records into a list to avoid exhausting the result cursor
-            records = list(result)
-            
-            interactions = [
+            # Downstream
+            downstream_result = list(session.run(downstream_query, repo_id=repo_id, file_path=file_path))
+            downstream_interactions = [
                 f"{record['ref_name']} REFERENCES {record['node_type']} IN {record['def_file_path']}"
-                for record in records
+                for record in downstream_result
             ]
+            downstream_files = {
+                record['def_file_path'] for record in downstream_result if record['def_file_path'] != file_path
+            }
 
-            # Add each record['def_file_path'] in a set to get rid of duplicates
-            cross_file_paths = {record['def_file_path'] for record in records}
+            # Upstream
+            upstream_result = list(session.run(upstream_query, repo_id=repo_id, file_path=file_path))
+            upstream_interactions = [
+                f"{record['ref_name']} IN {record['ref_file_path']} REFERENCES {record['node_type']} IN {file_path}"
+                for record in upstream_result
+            ]
+            upstream_files = {
+                record['ref_file_path'] for record in upstream_result if record['ref_file_path'] != file_path
+            }
 
-            return interactions, cross_file_paths
+            return {
+                "downstream": {
+                    "interactions": downstream_interactions,
+                    "files": downstream_files,
+                },
+                "upstream": {
+                    "interactions": upstream_interactions,
+                    "files": upstream_files,
+                },
+            }
+
 
     def _write_to_md(self, repo_summary: List[Dict], file_summaries: Dict, repo_id: str, dir_tree: Dict) -> None:
         """Write the hierarchical mental model to a Markdown file."""
@@ -447,7 +479,7 @@ class MentalModelStage(PipelineStage):
         repo_summary_md.append("## Critical Files\n")
 
         for insight in repo_summary:
-            interaction_list = "\n".join([f"- {interaction}" for interaction in insight['cross_file_interactions']])
+            interaction_list = "\n".join([f"- {interaction}" for interaction in insight["downstream_dep_interactions"]])
             repo_summary_md.append(f"### {file_number}. `{insight['file_path']}`\n")
             repo_summary_md.append(f"**Summary**: {insight['summary']}\n")
             repo_summary_md.append("**Cross-File Interactions**:\n" + (interaction_list if interaction_list else "- None\n") + "\n")
@@ -620,17 +652,21 @@ class MentalModelStage(PipelineStage):
                 continue
 
             summary = (item.get("summary") or "").strip()
+            
+            upstream_dep_files = item.get("upstream_dep_files") or []
+            downstream_dep_files = item.get("downstream_dep_files") or []
 
-            cross = item.get("cross_file_paths") or []
-            # Ensure list-of-strings, normalize, then stringify as a single comma-separated string
-            cross_norm = [norm_path(str(p)) for p in cross if p]
-            cross_str = ", ".join(cross_norm)
+            # cross = item.get("cross_file_paths") or []
+            # # Ensure list-of-strings, normalize, then stringify as a single comma-separated string
+            # cross_norm = [norm_path(str(p)) for p in cross if p]
+            # cross_str = ", ".join(cross_norm)
 
             records.append({
                 "id": path,
                 "file_path": path,
                 "summary": summary,
-                "cross_file_deps": cross_str,
+                "upstream_deps": upstream_dep_files,
+                "downstream_deps": downstream_dep_files,
             })
 
         with out_path.open("w", encoding="utf-8") as f:
