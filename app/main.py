@@ -2,7 +2,7 @@ import json
 import logging
 from contextlib import asynccontextmanager
 import asyncio
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -13,6 +13,7 @@ from .mental_model import MentalModelFetcher
 from .planner import QueryPlanner
 from .planner_two import execute_route
 from .planner_three import FreeformQA
+from .retriever_four import retrieve_records_planner, Neo4jHooks
 from .router import RoutePlan, Router
 from .executor import PlanExecutor
 from .synthesizer import ResponseSynthesizer
@@ -54,6 +55,9 @@ async def stream_response(question: str, mental_model: Dict[str, str], execution
         yield f"event: message\ndata: {json.dumps(chunk)}\n\n"
 
 
+def dummy_gen():
+    yield "This endpoint is under construction. Please check back later."
+
 @app.post("/query")
 async def query_repo(request: QueryRequest):
     try:
@@ -77,16 +81,36 @@ async def query_repo(request: QueryRequest):
         #     user_question=request.question,
         # )
 
+        print(f"Processing query for repo: {request.repo_id} with question: {request.question}")
 
-        fqa = FreeformQA(
-            llm=llm,
+        class StubNeo(Neo4jHooks):
+            def upstream(self, file_path: str) -> List[str]:
+                return []
+            def downstream(self, file_path: str) -> List[str]:
+                return []
+            def scc_closure(self, files: Set[str]) -> Set[str]:
+                return set(files)
+
+        repo_overview = {"overview": "Dictquery is a python library that allows users to query nested dictionaries using a simple DSL. It provides parsers and visitors to traverse and extract data from complex dictionary structures."}
+        out = retrieve_records_planner(
             repo_name=request.repo_id,
-            seed_prompt=mental_model,
-            user_question=request.question,
+            question=request.question,
+            repo_overview=repo_overview,
+            llm=llm,
+            neo=StubNeo(),
         )
-        gen = fqa.answer()
 
-        return StreamingResponse(gen, media_type="text/markdown")
+        print(json.dumps(out, indent=2))
+
+        # fqa = FreeformQA(
+        #     llm=llm,
+        #     repo_name=request.repo_id,
+        #     seed_prompt=mental_model,
+        #     user_question=request.question,
+        # )
+        # gen = fqa.answer()
+        
+        return StreamingResponse(dummy_gen(), media_type="text/markdown")
         # walkthrough_gen = walkthrough_generator_for_fastapi(
         #         llm=llm,  # your injected client
         #         repo_name=request.repo_id,

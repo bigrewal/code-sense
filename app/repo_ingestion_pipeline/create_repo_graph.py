@@ -17,6 +17,7 @@ from ..models.data_model import (
 )
 from ..db import get_neo4j_client
 
+PYTHON_LANGUAGE_DEFS = {"function_definition", "class_definition"}
 
 class ASTProcessorStage(PipelineStage):
     """Stage for AST creation and graph database population."""
@@ -70,6 +71,14 @@ class ASTProcessorStage(PipelineStage):
 
             reference_edges = self._create_reference_edges(all_nodes, reference_results.references, global_leaf_lookup)
             all_edges.extend(reference_edges)
+
+            print(
+                f"Job {self.job_id}: Pre-Pruning: {len(all_nodes)} nodes, "
+                f"{len(all_edges)} edges created"
+            )
+
+            all_nodes, all_edges = self._prune_graph(all_nodes, all_edges)
+
             print(f"Job {self.job_id}: Created {len(reference_edges)} reference edges")
             
             # Create graph representation
@@ -200,6 +209,7 @@ class ASTProcessorStage(PipelineStage):
                     end_column=current_node.end_point[1],
                     parent_id=parent_id,
                     children_ids=[],
+                    is_definition= current_node.type in PYTHON_LANGUAGE_DEFS,
                     file_path=str(code_file.relative_path),
                 )
                 
@@ -280,64 +290,64 @@ class ASTProcessorStage(PipelineStage):
                 continue
                 
             # Get the last (most specific) definition
-            for def_location in definitions:
-                # def_location = definitions[-1]
-                ref_file, ref_line, ref_col = ref_location
-                def_file, def_line, def_col = def_location
-                
-                # Find reference node
-                ref_node_id = self._find_node_at_location(ref_file, ref_line, ref_col, global_leaf_lookup)
-                if not ref_node_id:
-                    # print(f"Job {self.job_id}: Could not find reference node at {ref_location}")
-                    continue
-                
-                # Find definition node
-                def_node_id = self._find_node_at_location(def_file, def_line, def_col, global_leaf_lookup)
-                if not def_node_id:
-                    # print(f"Job {self.job_id}: Could not find definition node at {def_location}")
-                    continue
-                
-                # Create reference edge
-                reference_edges.append({
-                    "source": ref_node_id,
-                    "target": def_node_id,
-                    "type": "REFERENCES",
-                    "sequence": 1,
-                })
-                
-                # Mark definition node based on parent's child count
-                if def_node_id in nodes_by_id:
-                    def_node = nodes_by_id[def_node_id]
-                    if def_node.parent_id and def_node.parent_id in nodes_by_id:
-                        parent_node = nodes_by_id[def_node.parent_id]
-                        parent_node.is_definition = True
-                        # Read file content from def_node's file_path
-                        file_path = Path(def_node.file_path)
-                        try:
-                            with file_path.open('r', encoding='utf-8', errors='ignore') as f:
-                                lines = f.readlines()
-                                # Extract content based on line and column numbers
-                                if def_node.start_line == def_node.end_line:
-                                    # Single line case
-                                    line_content = lines[def_node.start_line]
-                                    node_content = line_content[def_node.start_column:def_node.end_column]
-                                else:
-                                    # Multi-line case
-                                    node_content = []
-                                    for i, line in enumerate(lines[def_node.start_line:def_node.end_line + 1]):
-                                        if i == 0:
-                                            # First line, start from start_column
-                                            node_content.append(line[def_node.start_column:])
-                                        elif i == def_node.end_line - def_node.start_line:
-                                            # Last line, end at end_column
-                                            node_content.append(line[:def_node.end_column])
-                                        else:
-                                            # Middle lines, include full line
-                                            node_content.append(line)
-                                    node_content = ''.join(node_content)
-                                parent_node.name = node_content.strip()
-                        except Exception as e:
-                            print(f"Job {self.job_id}: Failed to read file {file_path} for def_node content: {str(e)}")
+            # for def_location in definitions:
+            def_location = definitions[-1]
+            ref_file, ref_line, ref_col = ref_location
+            def_file, def_line, def_col = def_location
+            
+            # Find reference node
+            ref_node_id = self._find_node_at_location(ref_file, ref_line, ref_col, global_leaf_lookup)
+            if not ref_node_id:
+                # print(f"Job {self.job_id}: Could not find reference node at {ref_location}")
+                continue
+            
+            # Find definition node
+            def_node_id = self._find_node_at_location(def_file, def_line, def_col, global_leaf_lookup)
+            if not def_node_id:
+                # print(f"Job {self.job_id}: Could not find definition node at {def_location}")
+                continue
+            
+            # Create reference edge
+            reference_edges.append({
+                "source": ref_node_id,
+                "target": def_node_id,
+                "type": "REFERENCES",
+                "sequence": 1,
+            })
+            
+            # Mark definition node based on parent's child count
+            if def_node_id in nodes_by_id:
+                def_node = nodes_by_id[def_node_id]
+                if def_node.parent_id and def_node.parent_id in nodes_by_id:
+                    parent_node = nodes_by_id[def_node.parent_id]
+                    parent_node.is_definition = True
+                    # Read file content from def_node's file_path
+                    file_path = Path(def_node.file_path)
+                    try:
+                        with file_path.open('r', encoding='utf-8', errors='ignore') as f:
+                            lines = f.readlines()
+                            # Extract content based on line and column numbers
+                            if def_node.start_line == def_node.end_line:
+                                # Single line case
+                                line_content = lines[def_node.start_line]
+                                node_content = line_content[def_node.start_column:def_node.end_column]
+                            else:
+                                # Multi-line case
+                                node_content = []
+                                for i, line in enumerate(lines[def_node.start_line:def_node.end_line + 1]):
+                                    if i == 0:
+                                        # First line, start from start_column
+                                        node_content.append(line[def_node.start_column:])
+                                    elif i == def_node.end_line - def_node.start_line:
+                                        # Last line, end at end_column
+                                        node_content.append(line[:def_node.end_column])
+                                    else:
+                                        # Middle lines, include full line
+                                        node_content.append(line)
+                                node_content = ''.join(node_content)
+                            parent_node.name = node_content.strip()
+                    except Exception as e:
+                        print(f"Job {self.job_id}: Failed to read file {file_path} for def_node content: {str(e)}")
 
         return reference_edges
 
@@ -356,3 +366,138 @@ class ASTProcessorStage(PipelineStage):
             isinstance(self.config.get("supported_languages", []), list) and
             isinstance(self.config.get("max_file_size", 0), int)
         )
+    
+    def _prune_graph(self, nodes: List[ASTNode], edges: List[dict]) -> tuple[List[ASTNode], List[dict]]:
+        """
+        Prune non-root, non-definition, non-reference nodes while preserving hierarchy.
+
+        This version is **iterative** (no recursion) and guards against accidental
+        cycles in the CONTAINS graph to avoid RecursionError.
+        """
+        # Split edges by type
+        contains_edges = [e for e in edges if e.get("type") == "CONTAINS"]
+        ref_edges = [e for e in edges if e.get("type") == "REFERENCES"]
+
+        nodes_by_id = {n.node_id: n for n in nodes}
+        all_ids = set(nodes_by_id.keys())
+
+        # Build children map (preserve original order via sequence) and indegree map
+        children_seq: dict[str, List[tuple[int, str]]] = {}
+        indegree: dict[str, int] = {}
+
+        for e in contains_edges:
+            src = e["source"]
+            tgt = e["target"]
+            seq = e.get("sequence", 1)
+
+            children_seq.setdefault(src, []).append((seq, tgt))
+            indegree[tgt] = indegree.get(tgt, 0) + 1
+            indegree.setdefault(src, indegree.get(src, 0))
+
+        # Sort children by the original sequence index and flatten to just child ids
+        children: dict[str, List[str]] = {
+            src: [cid for _, cid in sorted(lst, key=lambda x: x[0])]
+            for src, lst in children_seq.items()
+        }
+
+        # Determine roots: nodes without a parent_id OR with indegree 0 from edges
+        root_ids = {n.node_id for n in nodes if n.parent_id is None} | {
+            nid for nid in all_ids if indegree.get(nid, 0) == 0
+        }
+        if not root_ids:
+            # In pathological cases (cycle-only graphs), pick a stable pseudo-root
+            # to ensure we still produce a connected pruned graph.
+            # We'll also start separate traversals from any kept nodes later.
+            first = next(iter(all_ids), None)
+            if first is not None:
+                root_ids = {first}
+
+        # Decide which nodes to keep
+        def is_kept(n: ASTNode) -> bool:
+            return (n.node_id in root_ids) or getattr(n, "is_definition", False) or getattr(n, "is_reference", False)
+
+        keep_ids = {n.node_id for n in nodes if is_kept(n)}
+
+        # We'll rebuild CONTAINS edges, attaching each kept node to its nearest kept ancestor.
+        new_contains: List[dict] = []
+        next_seq: dict[str, int] = {}  # sequence counter per kept parent
+        seen_attach: set[tuple[str, str]] = set()  # avoid duplicate (parent, child) edges
+
+        def attach_edge(parent_id: str, child_id: str):
+            if (parent_id, child_id) in seen_attach:
+                return
+            seq = next_seq.get(parent_id, 1)
+            new_contains.append({
+                "source": parent_id,
+                "target": child_id,
+                "type": "CONTAINS",
+                "sequence": seq,
+            })
+            next_seq[parent_id] = seq + 1
+            seen_attach.add((parent_id, child_id))
+
+        visited: set[str] = set()
+
+        def traverse(start_id: str, force_keep_root: bool = True):
+            # Ensure the traversal start is kept (mirrors previous behavior)
+            if force_keep_root:
+                keep_ids.add(start_id)
+
+            # Stack holds frames: (current_node_id, anchor_kept_id, next_child_index)
+            stack: List[tuple[str, str | None, int]] = [(start_id, start_id, 0)]
+            on_path: set[str] = {start_id}
+
+            while stack:
+                node_id, anchor, idx = stack.pop()
+                child_list = children.get(node_id, [])
+
+                if idx >= len(child_list):
+                    visited.add(node_id)
+                    on_path.discard(node_id)
+                    continue
+
+                # Re-push current frame with advanced child index
+                stack.append((node_id, anchor, idx + 1))
+
+                child_id = child_list[idx]
+
+                # Skip back-edges to avoid cycles
+                if child_id in on_path:
+                    continue
+
+                # Attach kept child to current anchor
+                child_kept = child_id in keep_ids
+                if child_kept and anchor is not None:
+                    attach_edge(anchor, child_id)
+
+                # The new anchor is the kept child, otherwise it stays the same
+                new_anchor = child_id if child_kept else anchor
+
+                # If we've fully processed this child elsewhere and it's not needed to re-walk, skip
+                # (We still attached above if necessary.)
+                if child_id in visited:
+                    continue
+
+                # Dive into child
+                stack.append((child_id, new_anchor, 0))
+                on_path.add(child_id)
+
+        # Primary traversals from roots
+        for root_id in root_ids:
+            if root_id in all_ids:
+                traverse(root_id, force_keep_root=True)
+
+        # Secondary traversals: ensure all kept nodes in disconnected components get anchored
+        for nid in (keep_ids - visited):
+            traverse(nid, force_keep_root=True)
+
+        # Filter nodes to the kept set
+        pruned_nodes = [nodes_by_id[nid] for nid in keep_ids if nid in nodes_by_id]
+
+        # Keep only reference edges whose endpoints remain
+        kept = keep_ids
+        pruned_ref_edges = [e for e in ref_edges if e["source"] in kept and e["target"] in kept]
+
+        pruned_edges = new_contains + pruned_ref_edges
+        return pruned_nodes, pruned_edges
+
