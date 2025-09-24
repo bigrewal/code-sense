@@ -5,6 +5,7 @@ from .resolve_references import ReferenceResolverStage
 from .code_reader import ChunkLLMProcessorStage
 from .create_repo_graph import ASTProcessorStage
 from .mental_model_gen import MentalModelStage
+from .record_gen import RecordGenStage
 from pathlib import Path
 
 
@@ -48,9 +49,10 @@ async def start_ingestion_pipeline(local_repo_path: Path, job_id: str = None) ->
     resolver_stage = ReferenceResolverStage({"job_id": job_id, **config.RESOLVER_CONFIG})
     ast_stage = ASTProcessorStage({"job_id": job_id, **config.AST_CONFIG})
     # llm_stage = ChunkLLMProcessorStage({"job_id": job_id})
+    record_gen_stage = RecordGenStage({"job_id": job_id})  # Reuse LLM config or add specific
     mental_model_stage = MentalModelStage({"job_id": job_id})  # Reuse LLM config or add specific
 
-    pipeline.add_stages([resolver_stage, ast_stage, mental_model_stage])
+    pipeline.add_stages([resolver_stage, ast_stage, record_gen_stage])
 
     print(f"Job {job_id}: Starting pipeline execution...")
     

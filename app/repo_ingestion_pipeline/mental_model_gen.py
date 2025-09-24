@@ -116,8 +116,8 @@ class MentalModelStage(PipelineStage):
                 if cross_file_path in potential_entry_points:
                     potential_entry_points.remove(cross_file_path)
 
-        print(f"Potential entry points: {potential_entry_points}")
-        print(f"Cross-file reference counts: {cross_file_ref_counts}")
+        # print(f"Potential entry points: {potential_entry_points}")
+        # print(f"Cross-file reference counts: {cross_file_ref_counts}")
         if not potential_entry_points:
             if cross_file_ref_counts:
                 # Find the minimum number of references
@@ -141,7 +141,7 @@ class MentalModelStage(PipelineStage):
                 upsert=True
             )
 
-        print(f"Final potential entry points: {potential_entry_points}")
+        # print(f"Final potential entry points: {potential_entry_points}")
         # Convert set to sorted list for consistent output
         return sorted(list(potential_entry_points))
 

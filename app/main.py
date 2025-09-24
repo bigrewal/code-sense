@@ -13,7 +13,7 @@ from .mental_model import MentalModelFetcher
 from .planner import QueryPlanner
 from .planner_two import execute_route
 from .planner_three import FreeformQA
-from .retriever_four import retrieve_records_planner, Neo4jHooks
+from .retriever_four import retrieve_records_planner
 from .router import RoutePlan, Router
 from .executor import PlanExecutor
 from .synthesizer import ResponseSynthesizer
@@ -83,21 +83,12 @@ async def query_repo(request: QueryRequest):
 
         print(f"Processing query for repo: {request.repo_id} with question: {request.question}")
 
-        class StubNeo(Neo4jHooks):
-            def upstream(self, file_path: str) -> List[str]:
-                return []
-            def downstream(self, file_path: str) -> List[str]:
-                return []
-            def scc_closure(self, files: Set[str]) -> Set[str]:
-                return set(files)
-
         repo_overview = {"overview": "Dictquery is a python library that allows users to query nested dictionaries using a simple DSL. It provides parsers and visitors to traverse and extract data from complex dictionary structures."}
         out = retrieve_records_planner(
             repo_name=request.repo_id,
             question=request.question,
             repo_overview=repo_overview,
             llm=llm,
-            neo=StubNeo(),
         )
 
         print(json.dumps(out, indent=2))
