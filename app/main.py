@@ -13,7 +13,7 @@ from .mental_model import MentalModelFetcher
 from .planner import QueryPlanner
 from .planner_two import execute_route
 from .planner_three import FreeformQA
-from .retriever_four import retrieve_records_planner
+from .retriever_four import retrieve_records_planner, answer_with_snippets
 from .router import RoutePlan, Router
 from .executor import PlanExecutor
 from .synthesizer import ResponseSynthesizer
@@ -91,7 +91,13 @@ async def query_repo(request: QueryRequest):
             llm=llm,
         )
 
-        print(json.dumps(out, indent=2))
+        gen = answer_with_snippets(
+            question=request.question,
+            selection=out,
+            llm=llm,
+            repo_root=request.repo_id
+        )
+        
 
         # fqa = FreeformQA(
         #     llm=llm,
@@ -101,7 +107,7 @@ async def query_repo(request: QueryRequest):
         # )
         # gen = fqa.answer()
         
-        return StreamingResponse(dummy_gen(), media_type="text/markdown")
+        return StreamingResponse(gen, media_type="text/markdown")
         # walkthrough_gen = walkthrough_generator_for_fastapi(
         #         llm=llm,  # your injected client
         #         repo_name=request.repo_id,
