@@ -17,6 +17,12 @@ from pathlib import Path
 from collections import deque
 from tqdm import tqdm
 
+import asyncio
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Tuple, Set, Any
+
+
 from bson import ObjectId
 
 from .core.base import PipelineStage, StageResult
@@ -52,33 +58,12 @@ class MentalModelStage(PipelineStage):
             
             insights, ignored_files = await self.generate_repo_overview_2(dir_tree, repo_id)
             print(f"Job {self.job_id}: GENERATED repo overview with {len(insights)} insights, ignoring {len(ignored_files)} files")
-
+            repo_summary = await self.generate_repo_summary(insights, repo_id)
             await self._set_potential_entry_points(insights, repo_id)
 
-            # Get _cross_file_interactions_in_file(self, file_path: str, repo_id: str) in insights
-
-
-            # await self.generate_dependency_graph(repo_id, ignored_files)
-            # print(f"Files ignored: {ignored_files}")
-
-            # Step 2: Generate hierarchical summaries bottom-up
-            # file_summaries = await self._generate_hierarchical_summary(dir_tree, repo_id, insights)
-
-            # print(f"Job {self.job_id}: GENERATED hierarchical summaries for {len(file_summaries)} files")
-
-            
-            # Step 3: Add repo-level summary
-            # repo_summary = await self._generate_repo_summary(file_summaries, repo_id)
-            # repo_summary = await self.generate_repo_overview(dir_tree, repo_id)
-            
-
-            # Step 4: Write to .md file
-            # self._write_to_md(repo_summary, file_summaries, repo_id, dir_tree)
-            # self._write_to_jsonl(repo_summary, file_summaries, repo_id, dir_tree)
-
-            self._write_to_md(insights, [], repo_id, dir_tree)
-            # self._write_to_jsonl(insights, file_summaries, repo_id, dir_tree)
-            self._write_to_jsonl_v2(insights, repo_id)
+            # self._write_to_md(insights, [], repo_id, dir_tree)
+            # # self._write_to_jsonl(insights, file_summaries, repo_id, dir_tree)
+            # self._write_to_jsonl_v2(insights, repo_id)
 
             # await attention_db_runtime.build_keybank(repo_id)
 
@@ -100,6 +85,8 @@ class MentalModelStage(PipelineStage):
         potential_entry_points = set()
         cross_file_ref_counts = {}
 
+        insights_files = {insight.get("file_path") for insight in insights}
+
         # Initially add all files to potential_entry_counts
         for insight in insights:
             file_path = insight.get("file_path")
@@ -108,13 +95,20 @@ class MentalModelStage(PipelineStage):
         for insight in insights:
             # Extract file paths from insights
             file_path = insight.get("file_path")
-            cross_file_paths = insight.get("cross_file_paths", {})
+            upstream_dep_files = insight.get("upstream_dep_files", {})
+            print(f"File: {file_path} has upstream deps: {upstream_dep_files}")
 
             cross_file_ref_counts[file_path] = len(cross_file_paths)
 
-            for cross_file_path in cross_file_paths:
-                if cross_file_path in potential_entry_points:
-                    potential_entry_points.remove(cross_file_path)
+            for upstream_file in upstream_dep_files:
+                if upstream_file in insights_files and file_path in potential_entry_points:
+                    potential_entry_points.remove(file_path)
+                    print(f"Removed {file_path} from potential entry points due to upstream dependency on {upstream_file}")
+
+
+            # for cross_file_path in cross_file_paths :
+            #     if cross_file_path in potential_entry_points and cross_file_path not in insights_files:
+            #         potential_entry_points.remove(cross_file_path)
 
         # print(f"Potential entry points: {potential_entry_points}")
         # print(f"Cross-file reference counts: {cross_file_ref_counts}")
@@ -141,7 +135,7 @@ class MentalModelStage(PipelineStage):
                 upsert=True
             )
 
-        # print(f"Final potential entry points: {potential_entry_points}")
+        print(f"Final potential entry points: {potential_entry_points}")
         # Convert set to sorted list for consistent output
         return sorted(list(potential_entry_points))
 
@@ -174,18 +168,6 @@ class MentalModelStage(PipelineStage):
             code = None
             with open(file_path, "r", encoding="utf-8") as f:
                 code = f.read()
-            
-            # system_prompt = (
-            #     "Given the repo_name, file_path and its code - your task is to write a 3-4 line summary of what the code does "
-            #     "only if its critical to understanding the behaviour of the code repo otherwise simply output \"IGNORE\" "
-
-            #     "Ignore: "
-            #     "- tutorial example files"
-            #     "- tests"
-            #     "- docs"
-
-            #     "While paying attention to the code, also pay attention to where in the repo the file is located."
-            # )
 
             system_prompt = "Given the repo_name, file_path and its code - your task is to write a 3-4 line summary of what the code does only if its critical to understanding the behaviour of the code repo otherwise simply output \\\"IGNORE\\\". \n\nIgnore:\n- tutorial example files, \n- tests \n- docs. \n\nWhile paying attention to the code, also pay attention to where in the repo the file is located."
 
@@ -448,6 +430,153 @@ class MentalModelStage(PipelineStage):
                 },
             }
 
+    async def generate_repo_summary(
+        self,
+        insights: List[Dict[str, Any]],
+        repo_id: str,
+        *,
+        max_files_in_prompt: int = 20,
+        max_code_chars_per_file: int = 20000,
+        max_summary_words: int = 500,
+    ) -> str:
+        # ---------- helpers ----------
+        async def _read_file_text(path: str) -> Tuple[str, str]:
+            """Read file text asynchronously via a thread (to avoid blocking loop)."""
+            def _read(p: str) -> str:
+                try:
+                    with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                        return f.read()
+                except Exception:
+                    return ""
+            text = await asyncio.to_thread(_read, path)
+            return path, text
+
+        def _truncate(s: str, n: int) -> str:
+            return s if len(s) <= n else s[: n - 3] + "..."
+
+        def _word_limit_prompt(limit_words: int) -> str:
+            return (
+                f"Keep the overall summary under ~{limit_words} words. "
+                f"Be clear, non-jargony, and suitable for newcomers."
+            )
+
+        # ---------- choose & read files ----------
+        # Use the order provided by insights; deduplicate; optionally cap to avoid huge prompts.
+        seen = set()
+        ordered_files: List[str] = []
+        for it in insights:
+            fp = it.get("file_path")
+            if fp and fp not in seen:
+                seen.add(fp)
+                ordered_files.append(fp)
+        if len(ordered_files) > max_files_in_prompt:
+            ordered_files = ordered_files[:max_files_in_prompt]
+
+        # Read code
+        read_tasks = [_read_file_text(p) for p in ordered_files]
+        read_results = await asyncio.gather(*read_tasks)
+        code_by_file: Dict[str, str] = {p: c for p, c in read_results}
+
+        # ---------- iterative fold over files with LLM ----------
+        # Running state entirely maintained by the LLM:
+        running_summary = ""  # textual repo summary so far
+        running_entry_points: List[str] = []  # file paths the LLM currently believes are entry points (based on seen code only)
+        seen_files: List[str] = []
+
+        # Check if repo summary already exists in MongoDB
+        existing_summary_doc = self.mental_model_collection.find_one({"repo_id": repo_id, "document_type": "REPO_SUMMARY"})
+        if existing_summary_doc:
+            print(f"Job {self.job_id}: Repo summary already exists in MongoDB for {repo_id}, skipping generation.")
+            return existing_summary_doc.get("data", "")
+
+        # System prompt used for every fold update (no static analysis, LLM owns entry point inference)
+        system_prompt = (
+            "You are constructing a single comprehensive summary of a code repository by iteratively reading files.\n"
+            "At each step, you receive: (1) the current cumulative summary and entry point candidates, and (2) the next file's path and full code.\n"
+            "Update the cumulative summary so a newcomer understands what the repo does and how parts fit together.\n"
+            "(e.g., presence of a main routine, startup/bootstrapping behavior, CLI invocation, web server start, etc.). "
+            "Do not guess based on filenames, locations, or conventions; rely strictly on code content seen so far.\n"
+            "Keep the summary concise and concrete, avoid file-by-file laundry lists, and integrate new information logically."
+        )
+
+        # We ask for strict JSON so we can carry state cleanly each step.
+        # Output schema:
+        # {
+        #   "summary": "<updated plain-English repo summary>",
+        #   "entry_points": ["path/one.py", ...]    # subset of seen_files; inferred from code only
+        # }
+
+        for idx, file_path in enumerate(ordered_files):
+            seen_files.append(file_path)
+            file_code_raw = code_by_file.get(file_path, "") or ""
+            file_code = _truncate(file_code_raw, max_code_chars_per_file)
+
+            user_prompt = (
+                f"Repository: {repo_id}\n"
+                f"Files seen so far (count={len(seen_files)}): {seen_files}\n\n"
+                f"Current cumulative summary:\n{running_summary or '(empty)'}\n\n"
+                f"Current entry point candidates (from code seen so far only): {running_entry_points or []}\n\n"
+                f"NEXT_FILE_PATH: {file_path}\n"
+                f"NEXT_FILE_CODE:\n<<<\n{file_code}\n>>>\n\n"
+                "Produce a BRIEF, plain-English update to the cumulative summary that integrates info from NEXT_FILE_CODE.\n"
+                "   - Explain what this file contributes at a high level (APIs, CLI, services, jobs, data flow), "
+                "     and how it interacts with previously seen parts—only if supported by code.\n"
+                "   - Avoid low-level details and exhaustive lists.\n\n"
+                f"{_word_limit_prompt(max_summary_words)}"
+            )
+
+            step_out = await self.llm_client.generate_async(
+                prompt=user_prompt,
+                system_prompt=system_prompt,
+                reasoning_effort="low",
+                temperature=0.0,
+            )
+            step_out = (step_out or "").strip()
+
+            # Best-effort JSON parse; if it fails, wrap as summary-only.
+            new_summary = running_summary
+            new_entry_points = running_entry_points
+            try:
+                parsed = json.loads(step_out)
+                if isinstance(parsed, dict):
+                    cand_summary = parsed.get("summary")
+                    cand_eps = parsed.get("entry_points")
+                    if isinstance(cand_summary, str) and cand_summary.strip():
+                        new_summary = cand_summary.strip()
+                    if isinstance(cand_eps, list):
+                        # Keep only files we've actually seen; dedupe preserving order
+                        seen_set = set(seen_files)
+                        dedup = []
+                        for ep in cand_eps:
+                            if isinstance(ep, str) and ep in seen_set and ep not in dedup:
+                                dedup.append(ep)
+                        new_entry_points = dedup
+            except Exception:
+                # Fallback: treat whole output as the updated summary text
+                if step_out:
+                    new_summary = step_out
+
+            running_summary = new_summary
+            running_entry_points = new_entry_points
+
+        final_summary = (running_summary or "").strip()
+        final_entry_points = running_entry_points or []
+
+        # ---------- persist to Mongo ----------
+        document = {
+            "repo_id": repo_id,
+            "document_type": "REPO_SUMMARY",
+            "data": final_summary,
+            "entry_points": final_entry_points,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.mental_model_collection.update_one(
+            {"repo_id": repo_id, "document_type": "REPO_SUMMARY"},
+            {"$set": document},
+            upsert=True,
+        )
+
+        return final_summary
 
     def _write_to_md(self, repo_summary: List[Dict], file_summaries: Dict, repo_id: str, dir_tree: Dict) -> None:
         """Write the hierarchical mental model to a Markdown file."""

@@ -52,7 +52,7 @@ async def start_ingestion_pipeline(local_repo_path: Path, job_id: str = None) ->
     record_gen_stage = RecordGenStage({"job_id": job_id})  # Reuse LLM config or add specific
     mental_model_stage = MentalModelStage({"job_id": job_id})  # Reuse LLM config or add specific
 
-    pipeline.add_stages([resolver_stage, ast_stage, record_gen_stage])
+    pipeline.add_stages([resolver_stage, ast_stage, mental_model_stage])
 
     print(f"Job {job_id}: Starting pipeline execution...")
     
