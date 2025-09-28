@@ -10,13 +10,8 @@ from pydantic import BaseModel
 from .llm import GroqLLM
 from .config import Config
 from .mental_model import MentalModelFetcher
-from .planner import QueryPlanner
-from .planner_two import execute_route
-from .planner_three import FreeformQA
 from .retriever_four import retrieve_records_planner, answer_with_snippets
-from .router import RoutePlan, Router
 from .executor import PlanExecutor
-from .synthesizer import ResponseSynthesizer
 from .db import init_mongo_client, init_neo4j_client, attention_db_runtime, get_mongo_client, get_entry_point_files, get_repo_summary
 from pathlib import Path
 from .repo_ingestion_pipeline import start_ingestion_pipeline
@@ -42,10 +37,7 @@ init_mongo_client()
 
 llm = GroqLLM()
 mental_model_fetcher = MentalModelFetcher()
-planner = QueryPlanner(llm)
 executor = PlanExecutor(llm)
-synthesizer = ResponseSynthesizer(llm)
-
 
 class QueryRequest(BaseModel):
     question: str
@@ -54,9 +46,9 @@ class QueryRequest(BaseModel):
 class WalkthroughRequest(BaseModel):
     repo_id: str
 
-async def stream_response(question: str, mental_model: Dict[str, str], execution_results: List[Dict[str, Any]]):
-    async for chunk in synthesizer.synthesize(question, mental_model, execution_results):
-        yield f"event: message\ndata: {json.dumps(chunk)}\n\n"
+# async def stream_response(question: str, mental_model: Dict[str, str], execution_results: List[Dict[str, Any]]):
+#     async for chunk in synthesizer.synthesize(question, mental_model, execution_results):
+#         yield f"event: message\ndata: {json.dumps(chunk)}\n\n"
 
 
 def dummy_gen():
@@ -66,25 +58,6 @@ def dummy_gen():
 async def query_repo(request: QueryRequest):
     try:
         mental_model = mental_model_fetcher.seed_prompt(request.repo_id)
-        # print("Mental model fetched and prompt seeded. \n ", mental_model)
-        # mental_model = mental_model_fetcher.fetch()
-        # pack_md, pack_items = await attention_db_runtime.pack(request.repo_id, request.question)
-        # print("Packed items:", pack_items)
-
-        # plan, mental_model_summary = await planner.plan(request.question, mental_model)
-        # execution_results = await executor.execute(plan, request.question, mental_model, request.repo_id, parallel=True)
-
-        # router: Router = Router(llm)
-        # route: RoutePlan = router.route(user_question=request.question, seed_prompt=mental_model, repo_name=request.repo_id)
-
-        # gen = execute_route(
-        #     route_plan=route,
-        #     llm=llm,
-        #     repo_name=request.repo_id,
-        #     seed_prompt=mental_model,
-        #     user_question=request.question,
-        # )
-
         print(f"Processing query for repo: {request.repo_id} with question: {request.question}")
 
         repo_overview = {"overview": "Dictquery is a python library that allows users to query nested dictionaries using a simple DSL. It provides parsers and visitors to traverse and extract data from complex dictionary structures."}
@@ -102,60 +75,8 @@ async def query_repo(request: QueryRequest):
             repo_root=request.repo_id
         )
         
-
-        # fqa = FreeformQA(
-        #     llm=llm,
-        #     repo_name=request.repo_id,
-        #     seed_prompt=mental_model,
-        #     user_question=request.question,
-        # )
-        # gen = fqa.answer()
-        
         return StreamingResponse(gen, media_type="text/markdown")
-        # walkthrough_gen = walkthrough_generator_for_fastapi(
-        #         llm=llm,  # your injected client
-        #         repo_name=request.repo_id,
-        #         seed_prompt=mental_model,
-        #         user_question=request.question,
-        #     )
 
-        # async for chunk in synthesizer.synthesize(request.question, mental_model_summary, execution_results):
-        #     print(chunk, end="")
-        
-        # return {
-        #     "response": "Check the console for the streamed response."
-        # }
-
-        # return {
-        #     "response": "Check the console for the streamed response."
-        # }
-        # for chunk in walkthrough_gen:
-        #     print(chunk, end="")
-
-        # return StreamingResponse(
-        #     walkthrough_gen,
-        #     media_type="text/markdown",
-        #     headers={
-        #         "Cache-Control": "no-cache",
-        #         "Connection": "keep-alive",
-        #         # Optional but often useful:
-        #         "X-Accel-Buffering": "no",
-        #     },
-        # )
-        # return StreamingResponse(
-        #     stream_response(
-        #         request.question,
-        #         mental_model_summary,  # send the summary you synthesized with
-        #         execution_results
-        #     ),
-        #     media_type="text/event-stream",
-        #     headers={
-        #         "Cache-Control": "no-cache",
-        #         "Connection": "keep-alive",
-        #         # Optional but often useful:
-        #         "X-Accel-Buffering": "no",
-        #     },
-        # )
 
     except Exception as e:
         return {"error": str(e)}
