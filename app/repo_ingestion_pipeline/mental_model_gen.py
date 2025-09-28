@@ -98,7 +98,7 @@ class MentalModelStage(PipelineStage):
             upstream_dep_files = insight.get("upstream_dep_files", {})
             print(f"File: {file_path} has upstream deps: {upstream_dep_files}")
 
-            cross_file_ref_counts[file_path] = len(cross_file_paths)
+            # cross_file_ref_counts[file_path] = len(cross_file_paths)
 
             for upstream_file in upstream_dep_files:
                 if upstream_file in insights_files and file_path in potential_entry_points:
@@ -112,15 +112,15 @@ class MentalModelStage(PipelineStage):
 
         # print(f"Potential entry points: {potential_entry_points}")
         # print(f"Cross-file reference counts: {cross_file_ref_counts}")
-        if not potential_entry_points:
-            if cross_file_ref_counts:
-                # Find the minimum number of references
-                min_refs = min(cross_file_ref_counts.values())
-                # Add files with the minimum number of references to potential entry points
-                potential_entry_points.update(
-                    file_path for file_path, ref_count in cross_file_ref_counts.items()
-                    if ref_count == min_refs
-                )
+        # if not potential_entry_points:
+        #     if cross_file_ref_counts:
+        #         # Find the minimum number of references
+        #         min_refs = min(cross_file_ref_counts.values())
+        #         # Add files with the minimum number of references to potential entry points
+        #         potential_entry_points.update(
+        #             file_path for file_path, ref_count in cross_file_ref_counts.items()
+        #             if ref_count == min_refs
+        #         )
         
         # Add potential entry points to the DB
         for file_path in potential_entry_points:

@@ -5,10 +5,13 @@ from pymongo import MongoClient
 from .config import Config
 from .models.data_model import CodeGraph, ASTNode
 
-from typing import Dict
+from typing import Dict, Tuple
 from typing import List, Dict, Any
 import time
 logger = logging.getLogger(__name__)
+
+## Silence WARNING:neo4j.notifications: 
+logging.getLogger("neo4j.notifications").setLevel(logging.WARNING)
 
 class Neo4jClient:
     """Neo4j database client wrapper."""
@@ -243,6 +246,46 @@ class Neo4jClient:
             logger.error(f"Failed to get graph stats: {e}")
             return {}
     
+    def file_dependencies(self, repo_id: str, file_path: str) -> Tuple[List[str], List[str]]:
+        """
+        Return upstream and downstream file dependencies for a given file.
+        Upstream: other files that reference something inside this file.
+        Downstream: other files that this file references.
+        Uses leaf-level REFERENCES edges between ASTNode nodes and groups by file_path.
+        """
+        cypher = """
+        // Compute upstream (incoming) file dependencies
+        CALL {
+        WITH $repo_id AS repo_id, $file_path AS fp
+        MATCH (leaf:ASTNode {repo_id: repo_id, file_path: fp})
+        MATCH (ref_leaf:ASTNode {repo_id: repo_id})-[:REFERENCES]->(leaf)
+        WHERE ref_leaf.file_path <> fp
+        RETURN COLLECT(DISTINCT ref_leaf.file_path) AS upstream_paths
+        }
+
+        // Compute downstream (outgoing) file dependencies
+        CALL {
+        WITH $repo_id AS repo_id, $file_path AS fp
+        MATCH (leaf:ASTNode {repo_id: repo_id, file_path: fp})
+        MATCH (leaf)-[:REFERENCES]->(tgt_leaf:ASTNode {repo_id: repo_id})
+        WHERE tgt_leaf.file_path <> fp
+        RETURN COLLECT(DISTINCT tgt_leaf.file_path) AS downstream_paths
+        }
+
+        RETURN upstream_paths AS upstream, downstream_paths AS downstream
+        """
+        with self.driver.session() as session:
+            rec = session.run(
+                cypher,
+                repo_id=repo_id,
+                file_path=file_path,
+            ).single()
+            upstream = sorted([p for p in (rec["upstream"] or []) if p])
+            downstream = sorted([p for p in (rec["downstream"] or []) if p])
+            return upstream, downstream
+
+
+
     def close(self):
         """Close the Neo4j connection."""
         if self.driver:
@@ -256,6 +299,21 @@ class MyMongoClient:
 
     def get_database(self, name: str):
         return self._client[name]
+    
+def get_entry_point_files(db_client, repo_id: str) -> List[str]:
+    collection = db_client["mental_model"]
+    docs = collection.find({"repo_id": repo_id, "document_type": "POTENTIAL_ENTRY_POINTS"})
+    entry_point_files = []
+    for doc in docs:
+        entry_point_files.append(doc.get("file_path"))
+    return entry_point_files
+
+def get_repo_summary(db_client, repo_id: str) -> str:
+    collection = db_client["mental_model"]
+    doc = collection.find_one({"repo_id": repo_id, "document_type": "REPO_SUMMARY"})
+    if doc:
+        return doc.get("data", "")
+    return ""
 
 attention_db_runtime = AttentionDBRuntime(data_root="data")
 

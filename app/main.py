@@ -17,10 +17,12 @@ from .retriever_four import retrieve_records_planner, answer_with_snippets
 from .router import RoutePlan, Router
 from .executor import PlanExecutor
 from .synthesizer import ResponseSynthesizer
-from .db import init_mongo_client, init_neo4j_client, attention_db_runtime
+from .db import init_mongo_client, init_neo4j_client, attention_db_runtime, get_mongo_client, get_entry_point_files, get_repo_summary
 from pathlib import Path
 from .repo_ingestion_pipeline import start_ingestion_pipeline
 from .service import fetch_job_status
+from .walkthrough_service import stream_walkthrough_next
+from fastapi.responses import StreamingResponse
 
 logging.basicConfig(level=logging.INFO)
 
@@ -49,6 +51,8 @@ class QueryRequest(BaseModel):
     question: str
     repo_id: str
 
+class WalkthroughRequest(BaseModel):
+    repo_id: str
 
 async def stream_response(question: str, mental_model: Dict[str, str], execution_results: List[Dict[str, Any]]):
     async for chunk in synthesizer.synthesize(question, mental_model, execution_results):
@@ -188,3 +192,24 @@ async def list_repos():
     """List all ingested code repositories."""
     # Implement logic to retrieve and return the list of repositories
     return {"repos": ["data/dictquery", "data/xai-sdk-python", "data/fastapi"]}
+
+
+# Endpoints for repo walkthrough
+@app.post("/walkthrough/start")
+async def start_walkthrough(request: WalkthroughRequest):
+    db_client = get_mongo_client()
+    entry_points = get_entry_point_files(db_client, request.repo_id)
+    repo_summary = get_repo_summary(db_client, request.repo_id)
+
+    return {
+        "entry_points": entry_points,
+        "repo_summary": repo_summary,
+        "repo_id": request.repo_id,
+    }
+
+@app.post("/walkthrough/next")
+async def walkthrough_next(request: WalkthroughRequest):
+    return StreamingResponse(
+        stream_walkthrough_next(request.repo_id),
+        media_type="text/markdown"
+    )
