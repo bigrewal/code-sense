@@ -89,8 +89,6 @@ async def stream_walkthrough_next(repo_id: str):
 
     # Query Neo4j for dependencies
     upstream_files, downstream_files = neo4j.file_dependencies(repo_id=repo_id, file_path=file_path)
-    # print(f"========== Upstream of {file_path}: {upstream_files}")
-    # print(f"========== Downstream of {file_path}: {downstream_files}")
 
     # 5) Generate nugget (streaming)
     yield _nugget_header(file_path, consumer_path)

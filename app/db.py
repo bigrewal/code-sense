@@ -13,6 +13,8 @@ logger = logging.getLogger(__name__)
 ## Silence WARNING:neo4j.notifications: 
 logging.getLogger("neo4j.notifications").setLevel(logging.WARNING)
 
+DEF_NODE_TYPES = {"function_definition", "class_definition"}
+
 class Neo4jClient:
     """Neo4j database client wrapper."""
 
@@ -284,6 +286,150 @@ class Neo4jClient:
             downstream = sorted([p for p in (rec["downstream"] or []) if p])
             return upstream, downstream
 
+    def _fetch_def_nodes(self, repo_id: str) -> List[Dict[str, Any]]:
+        """
+        Bring back enough coordinates to reconstruct the source snippet.
+        """
+        cypher = """
+        MATCH (def:ASTNode)
+        WHERE def.is_definition = true
+          AND def.node_type IN $types
+          AND def.node_id STARTS WITH $repo_id_prefix
+        RETURN def.node_id AS node_id,
+               def.node_type AS node_type,
+               def.file_path AS file_path,
+               def.start_line AS start_line,
+               def.start_column AS start_column,
+               def.end_line AS end_line,
+               def.end_column AS end_column
+        """
+        with self.driver.session() as session:
+            res = session.run(
+                cypher,
+                types=list(DEF_NODE_TYPES),
+                repo_id_prefix=repo_id + ":",
+            )
+            return [r.data() for r in res]
+
+    def _fetch_symbol_from_ast(self, def_node_id: str) -> str:
+        """
+        For Python trees, the function/class name appears as an `identifier` leaf
+        under the definition node. Grab the earliest identifier by traversal order.
+        """
+        cypher = """
+        MATCH (def:ASTNode {node_id: $def_node_id})
+        MATCH path = (def)-[rels:CONTAINS*..4]->(leaf:ASTNode)
+        WHERE leaf.node_type = 'identifier'
+        WITH leaf, reduce(s=0, r IN rels | s + coalesce(r.sequence, 1)) AS order_key
+        RETURN leaf.name AS ident
+        ORDER BY order_key ASC
+        LIMIT 1
+        """
+        with self.driver.session() as session:
+            res = session.run(cypher, def_node_id=def_node_id)
+            rec = res.single()
+            return (rec and (rec["ident"] or "").strip()) or ""
+
+    def _neighbors_up(self, def_node_id: str, def_file: str) -> List[str]:
+        """
+        Definitions (functions/classes) OUTSIDE this definition that reference/call
+        something inside this definition (incoming REFERENCES).
+        Returns distinct definition node_ids.
+        """
+        cypher = """
+        MATCH (def:ASTNode {node_id: $def_node_id})
+        MATCH (def)-[:CONTAINS*]->(def_leaf:ASTNode)
+        MATCH (ref_leaf:ASTNode)-[:REFERENCES]->(def_leaf)
+        MATCH (ref_def:ASTNode)-[:CONTAINS*]->(ref_leaf)
+        WHERE ref_def.is_definition = true
+        AND ref_def.node_type IN $types
+        AND ref_def.node_id <> $def_node_id
+        AND NOT (def)-[:CONTAINS*]->(ref_def)   // exclude nested-in-self
+        RETURN DISTINCT ref_def.node_id AS dep_id
+        """
+        with self.driver.session() as session:
+            res = session.run(
+                cypher,
+                def_node_id=def_node_id,
+                types=list(DEF_NODE_TYPES),
+            )
+            return sorted([r["dep_id"] for r in res])
+
+    def _neighbors_down(self, def_node_id: str, def_file: str) -> List[str]:
+        """
+        Definitions (functions/classes) OUTSIDE this definition that are referenced/called
+        by something inside this definition (outgoing REFERENCES).
+        Returns distinct definition node_ids.
+        """
+        cypher = """
+        MATCH (def:ASTNode {node_id: $def_node_id})
+        MATCH (def)-[:CONTAINS*]->(my_leaf:ASTNode)
+        MATCH (my_leaf)-[:REFERENCES]->(tgt_leaf:ASTNode)
+        MATCH (tgt_def:ASTNode)-[:CONTAINS*]->(tgt_leaf)
+        WHERE tgt_def.is_definition = true
+        AND tgt_def.node_type IN $types
+        AND tgt_def.node_id <> $def_node_id
+        AND NOT (def)-[:CONTAINS*]->(tgt_def)   // exclude nested-in-self
+        RETURN DISTINCT tgt_def.node_id AS dep_id
+        """
+        with self.driver.session() as session:
+            res = session.run(
+                cypher,
+                def_node_id=def_node_id,
+                types=list(DEF_NODE_TYPES),
+            )
+            return sorted([r["dep_id"] for r in res])
+
+    def _fetch_all_def_dependencies(self, repo_id: str) -> Dict[str, Dict[str, set]]:
+        """
+        For every definition in the repo, compute:
+          - downstream: defs this def references (calls/uses)
+          - upstream:   defs that reference this def (callers)
+        Returns a map: def_id -> {"upstream": set(ids), "downstream": set(ids)}
+        """
+        cypher = """
+        MATCH (d:ASTNode)
+        WHERE d.is_definition = true
+          AND d.node_type IN $types
+          AND d.node_id STARTS WITH $repo_id_prefix
+
+        // downstream: d -> callee_def
+        CALL {
+          WITH d
+          OPTIONAL MATCH (d)-[:CONTAINS*]->(my_leaf:ASTNode)-[:REFERENCES]->(tgt_leaf:ASTNode)
+          OPTIONAL MATCH (callee_def:ASTNode)-[:CONTAINS*]->(tgt_leaf)
+          WHERE callee_def.is_definition = true
+            AND callee_def.node_type IN $types
+            AND callee_def.node_id <> d.node_id
+          RETURN collect(DISTINCT callee_def.node_id) AS downstream
+        }
+
+        // upstream: caller_def -> d
+        CALL {
+          WITH d
+          OPTIONAL MATCH (caller_def:ASTNode)-[:CONTAINS*]->(ref_leaf:ASTNode)-[:REFERENCES]->(my_leaf:ASTNode)
+          OPTIONAL MATCH (d)-[:CONTAINS*]->(my_leaf)
+          WHERE caller_def.is_definition = true
+            AND caller_def.node_type IN $types
+            AND caller_def.node_id <> d.node_id
+          RETURN collect(DISTINCT caller_def.node_id) AS upstream
+        }
+
+        RETURN d.node_id AS def_id, upstream, downstream
+        """
+        out: Dict[str, Dict[str, set]] = {}
+        with self.driver.session() as session:
+            res = session.run(
+                cypher,
+                types=list(DEF_NODE_TYPES),
+                repo_id_prefix=repo_id + ":",
+            )
+            for r in res:
+                def_id = r["def_id"]
+                upstream = set((r.get("upstream") or []))
+                downstream = set((r.get("downstream") or []))
+                out[def_id] = {"upstream": upstream, "downstream": downstream}
+        return out
 
 
     def close(self):

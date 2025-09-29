@@ -9,14 +9,14 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from .llm import GroqLLM
 from .config import Config
-from .mental_model import MentalModelFetcher
+# from .mental_model import MentalModelFetcher
 from .retriever_four import retrieve_records_planner, answer_with_snippets
-from .executor import PlanExecutor
 from .db import init_mongo_client, init_neo4j_client, attention_db_runtime, get_mongo_client, get_entry_point_files, get_repo_summary
 from pathlib import Path
 from .repo_ingestion_pipeline import start_ingestion_pipeline
 from .service import fetch_job_status
 from .walkthrough_service import stream_walkthrough_next
+from .walkthrough_def_service import build_definition_walkthrough_plan, stream_definition_walkthrough
 from fastapi.responses import StreamingResponse
 
 logging.basicConfig(level=logging.INFO)
@@ -36,8 +36,7 @@ init_neo4j_client()
 init_mongo_client()
 
 llm = GroqLLM()
-mental_model_fetcher = MentalModelFetcher()
-executor = PlanExecutor(llm)
+# mental_model_fetcher = MentalModelFetcher()
 
 class QueryRequest(BaseModel):
     question: str
@@ -45,6 +44,13 @@ class QueryRequest(BaseModel):
 
 class WalkthroughRequest(BaseModel):
     repo_id: str
+
+
+class DefWalkRequest(BaseModel):
+    repo_id: str
+    file_path: str
+    definition_name: str
+    depth: int = 2
 
 # async def stream_response(question: str, mental_model: Dict[str, str], execution_results: List[Dict[str, Any]]):
 #     async for chunk in synthesizer.synthesize(question, mental_model, execution_results):
@@ -134,3 +140,31 @@ async def walkthrough_next(request: WalkthroughRequest):
         stream_walkthrough_next(request.repo_id),
         media_type="text/markdown"
     )
+
+
+@app.post("/walkthrough/def/start")
+async def walkthrough_def_start(req: DefWalkRequest):
+    return StreamingResponse(
+        stream_definition_walkthrough(
+            repo_id=req.repo_id,
+            file_path=req.file_path,
+            definition_name=req.definition_name,
+            depth=req.depth,
+        ),
+        media_type="text/markdown"
+    )
+
+
+@app.post("/walkthrough/def/plan")
+async def walkthrough_def_plan(req: DefWalkRequest):
+    """
+    Return a plan (graph + sequence) for walking through a definition.
+    UI can render this as Def A -> Def B -> Def C with depth levels.
+    """
+    plan = await build_definition_walkthrough_plan(
+        repo_id=req.repo_id,
+        file_path=req.file_path,
+        definition_name=req.definition_name,
+        depth=req.depth,
+    )
+    return plan
