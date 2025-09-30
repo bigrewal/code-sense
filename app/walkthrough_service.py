@@ -223,3 +223,83 @@ def _nugget_header(file_path: str, consumer_path: Optional[str]) -> str:
     if consumer_path:
         return f"\n## How {file_path} serves {consumer_path}\n"
     return f"\n## Entry point: {file_path}\n"
+
+
+async def build_repo_walkthrough_plan(
+    repo_id: str,
+    depth: int = 3,
+) -> dict:
+    """
+    Build a deterministic plan for a repo walkthrough:
+    - Start from the first entry point (auto-picked from DB).
+    - Traverse downstream dependencies via Neo4j (BFS).
+    - Limit traversal depth with `depth`.
+    
+    Returns JSON-serializable dict with nodes, edges, and sequence.
+    """
+    mongo = get_mongo_client()
+    neo = get_neo4j_client()
+
+    entry_points = get_entry_point_files(mongo, repo_id) or []
+    if not entry_points:
+        return {
+            "repo_id": repo_id,
+            "depth": depth,
+            "error": "No entry points found for this repo."
+        }
+
+    start_fp = entry_points[0]
+
+    visited: set[str] = set()
+    levels: dict[str, int] = {start_fp: 0}
+    parents: dict[str, Optional[str]] = {start_fp: None}
+    queue: list[str] = [start_fp]
+
+    nodes_out: dict[str, dict] = {}
+    edges_out: list[dict] = []
+    sequence_out: list[dict] = []
+
+    def _emit_node(fp: str):
+        if fp not in nodes_out:
+            nodes_out[fp] = {
+                "file_path": fp,
+                "level": levels.get(fp, 0),
+            }
+
+    while queue:
+        cur = queue.pop(0)
+        if cur in visited:
+            continue
+        visited.add(cur)
+
+        _emit_node(cur)
+        sequence_out.append({
+            "file_path": cur,
+            "parent_file": parents.get(cur),
+            "level": levels.get(cur, 0),
+        })
+
+        cur_level = levels.get(cur, 0)
+        if cur_level >= depth:
+            continue
+
+        # Downstream dependencies (files this file references)
+        _, downstream = neo.file_dependencies(repo_id, cur)
+        downstream_sorted = sorted(downstream)
+
+        for child in downstream_sorted:
+            if child not in visited and child not in queue:
+                parents[child] = cur
+                levels[child] = cur_level + 1
+                queue.append(child)
+                _emit_node(child)
+                edges_out.append({"from": cur, "to": child})
+
+    return {
+        "repo_id": repo_id,
+        "depth": depth,
+        "entry_point": start_fp,
+        "nodes": list(nodes_out.values()),
+        "edges": edges_out,
+        "sequence": sequence_out,
+    }
