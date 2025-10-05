@@ -58,7 +58,8 @@ class MentalModelStage(PipelineStage):
             
             insights, ignored_files = await self.generate_repo_overview_2(dir_tree, repo_id)
             print(f"Job {self.job_id}: GENERATED repo overview with {len(insights)} insights, ignoring {len(ignored_files)} files")
-            repo_summary = await self.generate_repo_summary(insights, repo_id)
+            # repo_summary = await self.generate_repo_summary(insights, repo_id)
+            await self.gen_repo_summary_from_file_overview(repo_id)
             await self._set_potential_entry_points(insights, repo_id)
 
             # self._write_to_md(insights, [], repo_id, dir_tree)
@@ -79,6 +80,235 @@ class MentalModelStage(PipelineStage):
             traceback.print_exc()
             print(f"Job {self.job_id}: Mental model generation error: {str(e)}")
             return StageResult(success=False, error=str(e))
+        
+    async def gen_repo_summary_from_file_overview(self, repo_id: str) -> str:
+        """Generate a repo summary from existing BRIEF_FILE_OVERVIEW documents in MongoDB.
+        Produces a single summary + a validated list of entry points (subset of repo files).
+        Handles large corpora via map-reduce with strict char budgets per LLM call.
+        """
+        import asyncio
+        import json
+        from datetime import datetime, timezone
+
+        # ---- constants & helpers ----
+        # 1 token ≈ 4 chars. Keep well under 80k chars to include prompt & JSON headroom.
+        MAX_CHARS_PER_CALL = 75000
+        MAP_CONCURRENCY = 4  # parallelism for map stage
+
+        # Check MongoDB for existing REPO_SUMMARY. if exists, skip.
+        existing_summary = self.mental_model_collection.find_one(
+            {"repo_id": repo_id, "document_type": "REPO_SUMMARY"}
+        )
+        if existing_summary:
+            print(f"Job {self.job_id}: REPO_SUMMARY already exists for repo {repo_id}, skipping write.")
+            return existing_summary["data"], existing_summary["entry_points"]
+
+        def serialize_pairs(pairs):
+            # Each item as:
+            # FILE: <path>\nSUMMARY: <summary>\n---
+            # Keep it simple and deterministic.
+            lines = []
+            for p in pairs:
+                fp = p["file_path"]
+                sm = (p["summary"] or "").strip()
+                lines.append(f"FILE: {fp}\nSUMMARY: {sm}\n---")
+            return "\n".join(lines)
+
+        def chunk_pairs(pairs, max_chars=MAX_CHARS_PER_CALL, overhead=3000):
+            """Greedy packing into chunks under (max_chars - overhead)."""
+            chunks = []
+            cur = []
+            cur_len = 0
+            limit = max_chars - overhead
+            for p in pairs:
+                item_txt = f"FILE: {p['file_path']}\nSUMMARY: {(p['summary'] or '').strip()}\n---\n"
+                if cur and cur_len + len(item_txt) > limit:
+                    chunks.append(cur)
+                    cur = []
+                    cur_len = 0
+                cur.append(p)
+                cur_len += len(item_txt)
+            if cur:
+                chunks.append(cur)
+            return chunks
+
+        async def llm_map_chunk(chunk_pairs_list):
+            """Call LLM on one chunk and return parsed JSON with chunk_summary & candidates."""
+            system_prompt = (
+                "Repository name: " + repo_id + "\n\n"
+                "You are summarizing a subset of repository files.\n"
+                "Given file-path + brief summaries, produce:\n"
+                "1) 'chunk_summary': 5–10 concise bullets that capture what these files collectively do.\n"
+                "2) 'candidate_entry_points': only file paths from THIS CHUNK whose summaries clearly indicate they start/launch/boot/serve as CLI.\n"
+                "   - Base this ONLY on the summaries provided.\n"
+                "Return STRICT JSON: {\"chunk_summary\": [...], \"candidate_entry_points\": [..]}"
+            )
+            # Serialize only this chunk
+            serialized = serialize_pairs(chunk_pairs_list)
+            user_prompt = (
+                "FILES & SUMMARIES:\n"
+                "<<<\n" + serialized + "\n>>>\n\n"
+                "Return STRICT JSON with keys: chunk_summary (list of strings) and candidate_entry_points (list of file paths from this chunk)."
+            )
+            out = await self.llm_client.generate_async(
+                prompt=user_prompt,
+                system_prompt=system_prompt,
+                reasoning_effort="medium",
+                temperature=0.0,
+            )
+            text = (out or "").strip()
+            # Parse tolerant
+            try:
+                obj = json.loads(text)
+            except Exception:
+                # try to extract first {...}
+                import re
+                m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+                obj = json.loads(m.group(0)) if m else {"chunk_summary": [], "candidate_entry_points": []}
+            # Normalize
+            chunk_summary = obj.get("chunk_summary") or []
+            if isinstance(chunk_summary, str):
+                chunk_summary = [chunk_summary]
+            candidates = [c for c in (obj.get("candidate_entry_points") or []) if isinstance(c, str)]
+            return {"chunk_summary": chunk_summary, "candidate_entry_points": candidates}
+
+        async def map_stage(pairs):
+            """Process all chunks in parallel with bounded concurrency."""
+            chunks = chunk_pairs(pairs)
+            sem = asyncio.Semaphore(MAP_CONCURRENCY)
+            results = []
+
+            async def run_one(ch):
+                async with sem:
+                    return await llm_map_chunk(ch)
+
+            tasks = [asyncio.create_task(run_one(ch)) for ch in chunks]
+            for t in asyncio.as_completed(tasks):
+                results.append(await t)
+            return results
+
+        def build_reduce_docs(map_results):
+            """Flatten map outputs into reduce-ready docs."""
+            all_bullets = []
+            all_candidates = []
+            for r in map_results:
+                all_bullets.extend(r.get("chunk_summary", []))
+                all_candidates.extend(r.get("candidate_entry_points", []))
+            return all_bullets, all_candidates
+
+        async def reduce_once(bullets, candidates, allowed_file_paths):
+            """One reduce pass: compress bullets and reconcile candidates."""
+            import textwrap
+            # Prepare text; pack into budget
+            bullet_text = "\n".join(f"- {b}" for b in bullets)
+            # If too long, chunk bullets and summarize again
+            blocks = []
+            cur = []
+            cur_len = 0
+            for b in bullets:
+                line = f"- {b}\n"
+                if cur_len + len(line) > (MAX_CHARS_PER_CALL - 3000):
+                    blocks.append(cur)
+                    cur = []
+                    cur_len = 0
+                cur.append(b)
+                cur_len += len(line)
+            if cur:
+                blocks.append(cur)
+
+            # If multiple blocks, summarize each block, then summarize the summaries.
+            if len(blocks) > 1:
+                block_summaries = []
+                for blk in blocks:
+                    sys = (
+                        "You are compressing bullet points about a codebase into 5–8 bullets, preserving core themes.\n"
+                        "Return strict JSON: {\"bullets\": [..]}"
+                    )
+                    usr = "BULLETS:\n" + "\n".join(f"- {x}" for x in blk) + "\n\nReturn JSON with key 'bullets'."
+                    out = await self.llm_client.generate_async(
+                        prompt=usr, system_prompt=sys, reasoning_effort="low", temperature=0.0
+                    )
+                    try:
+                        obj = json.loads(out)
+                        block_summaries.extend(obj.get("bullets", []))
+                    except Exception:
+                        block_summaries.extend(blk[:8])  # fallback
+                bullets = block_summaries
+
+            # Now final reduce: produce final summary + entry points
+            allowed_paths_text = "\n".join(sorted(allowed_file_paths))
+            sys_final = (
+                "You are producing a single, clear repository summary and confirming entry points.\n"
+                "Rules:\n"
+                "- Use only the provided bullets (they came from file summaries) to write a ~300–400 word overview.\n"
+                "- For entry points, choose ONLY from the ALLOWED_PATHS list and ONLY if bullets imply they start/launch/serve/CLI/etc.\n"
+                "- Return STRICT JSON with keys: 'repo_summary' (string) and 'entry_points' (list of strings from ALLOWED_PATHS)."
+            )
+            usr_final = (
+                "BULLETS:\n" + "\n".join(f"- {b}" for b in bullets) + "\n\n"
+                "CANDIDATE ENTRY POINT HINTS (from earlier chunks):\n" + "\n".join(f"- {c}" for c in set(candidates)) + "\n\n"
+                "ALLOWED_PATHS (must choose entry points only from this list):\n" + allowed_paths_text + "\n\n"
+                "Return STRICT JSON with keys 'repo_summary' and 'entry_points'."
+            )
+            final_out = await self.llm_client.generate_async(
+                prompt=usr_final,
+                system_prompt=sys_final,
+                reasoning_effort="medium",
+                temperature=0.0,
+            )
+            final_text = (final_out or "").strip()
+            try:
+                final_obj = json.loads(final_text)
+            except Exception:
+                import re
+                m = re.search(r"\{.*\}", final_text, flags=re.DOTALL)
+                final_obj = json.loads(m.group(0)) if m else {"repo_summary": "", "entry_points": []}
+
+            repo_summary = (final_obj.get("repo_summary") or "").strip()
+            eps = [e for e in (final_obj.get("entry_points") or []) if e in allowed_file_paths]
+            # Deduplicate preserving order
+            seen = set()
+            entry_points = [e for e in eps if not (e in seen or seen.add(e))]
+            return repo_summary, entry_points
+
+        # ---- main body ----
+        insights_cursor = self.mental_model_collection.find(
+            {"repo_id": repo_id, "document_type": "BRIEF_FILE_OVERVIEW"},
+            {"_id": 0, "file_path": 1, "data": 1}
+        )
+        insights = list(insights_cursor)
+        if not insights:
+            print(f"Job {getattr(self, 'job_id', 'NA')}: No BRIEF_FILE_OVERVIEW documents found for repo {repo_id}")
+            return ""
+
+        pairs = [{"file_path": d["file_path"], "summary": d["data"]} for d in insights]
+        allowed_paths = [p["file_path"] for p in pairs]
+
+        # MAP
+        map_results = await map_stage(pairs)
+
+        # REDUCE (maybe multi-pass)
+        bullets, candidates = build_reduce_docs(map_results)
+
+        # If bullets are excessive, the reduce_once handles re-chunking internally.
+        final_summary, entry_points = await reduce_once(bullets, candidates, allowed_paths)
+
+        # Persist to Mongo
+        document = {
+            "repo_id": repo_id,
+            "document_type": "REPO_SUMMARY",
+            "data": final_summary,
+            "entry_points": entry_points,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "method": "map_reduce_from_file_overviews_v1"
+        }
+        self.mental_model_collection.update_one(
+            {"repo_id": repo_id, "document_type": "REPO_SUMMARY"},
+            {"$set": document},
+            upsert=True
+        )
+
+        return final_summary, entry_points
 
     async def _set_potential_entry_points(self, insights: List[dict], repo_id: str) -> List[str]:
         """Get potential entry points for the repo based on insights."""
@@ -96,14 +326,13 @@ class MentalModelStage(PipelineStage):
             # Extract file paths from insights
             file_path = insight.get("file_path")
             upstream_dep_files = insight.get("upstream_dep_files", {})
-            print(f"File: {file_path} has upstream deps: {upstream_dep_files}")
+            # print(f"File: {file_path} has upstream deps: {upstream_dep_files}")
 
             # cross_file_ref_counts[file_path] = len(cross_file_paths)
 
             for upstream_file in upstream_dep_files:
                 if upstream_file in insights_files and file_path in potential_entry_points:
                     potential_entry_points.remove(file_path)
-                    print(f"Removed {file_path} from potential entry points due to upstream dependency on {upstream_file}")
 
 
             # for cross_file_path in cross_file_paths :
@@ -430,379 +659,379 @@ class MentalModelStage(PipelineStage):
                 },
             }
 
-    async def generate_repo_summary(
-        self,
-        insights: List[Dict[str, Any]],
-        repo_id: str,
-        *,
-        max_files_in_prompt: int = 20,
-        max_code_chars_per_file: int = 20000,
-        max_summary_words: int = 500,
-    ) -> str:
-        # ---------- helpers ----------
-        async def _read_file_text(path: str) -> Tuple[str, str]:
-            """Read file text asynchronously via a thread (to avoid blocking loop)."""
-            def _read(p: str) -> str:
-                try:
-                    with open(p, "r", encoding="utf-8", errors="ignore") as f:
-                        return f.read()
-                except Exception:
-                    return ""
-            text = await asyncio.to_thread(_read, path)
-            return path, text
+    # async def generate_repo_summary(
+    #     self,
+    #     insights: List[Dict[str, Any]],
+    #     repo_id: str,
+    #     *,
+    #     max_files_in_prompt: int = 20,
+    #     max_code_chars_per_file: int = 20000,
+    #     max_summary_words: int = 500,
+    # ) -> str:
+    #     # ---------- helpers ----------
+    #     async def _read_file_text(path: str) -> Tuple[str, str]:
+    #         """Read file text asynchronously via a thread (to avoid blocking loop)."""
+    #         def _read(p: str) -> str:
+    #             try:
+    #                 with open(p, "r", encoding="utf-8", errors="ignore") as f:
+    #                     return f.read()
+    #             except Exception:
+    #                 return ""
+    #         text = await asyncio.to_thread(_read, path)
+    #         return path, text
 
-        def _truncate(s: str, n: int) -> str:
-            return s if len(s) <= n else s[: n - 3] + "..."
+    #     def _truncate(s: str, n: int) -> str:
+    #         return s if len(s) <= n else s[: n - 3] + "..."
 
-        def _word_limit_prompt(limit_words: int) -> str:
-            return (
-                f"Keep the overall summary under ~{limit_words} words. "
-                f"Be clear, non-jargony, and suitable for newcomers."
-            )
+    #     def _word_limit_prompt(limit_words: int) -> str:
+    #         return (
+    #             f"Keep the overall summary under ~{limit_words} words. "
+    #             f"Be clear, non-jargony, and suitable for newcomers."
+    #         )
 
-        # ---------- choose & read files ----------
-        # Use the order provided by insights; deduplicate; optionally cap to avoid huge prompts.
-        seen = set()
-        ordered_files: List[str] = []
-        for it in insights:
-            fp = it.get("file_path")
-            if fp and fp not in seen:
-                seen.add(fp)
-                ordered_files.append(fp)
-        if len(ordered_files) > max_files_in_prompt:
-            ordered_files = ordered_files[:max_files_in_prompt]
+    #     # ---------- choose & read files ----------
+    #     # Use the order provided by insights; deduplicate; optionally cap to avoid huge prompts.
+    #     seen = set()
+    #     ordered_files: List[str] = []
+    #     for it in insights:
+    #         fp = it.get("file_path")
+    #         if fp and fp not in seen:
+    #             seen.add(fp)
+    #             ordered_files.append(fp)
+    #     if len(ordered_files) > max_files_in_prompt:
+    #         ordered_files = ordered_files[:max_files_in_prompt]
 
-        # Read code
-        read_tasks = [_read_file_text(p) for p in ordered_files]
-        read_results = await asyncio.gather(*read_tasks)
-        code_by_file: Dict[str, str] = {p: c for p, c in read_results}
+    #     # Read code
+    #     read_tasks = [_read_file_text(p) for p in ordered_files]
+    #     read_results = await asyncio.gather(*read_tasks)
+    #     code_by_file: Dict[str, str] = {p: c for p, c in read_results}
 
-        # ---------- iterative fold over files with LLM ----------
-        # Running state entirely maintained by the LLM:
-        running_summary = ""  # textual repo summary so far
-        running_entry_points: List[str] = []  # file paths the LLM currently believes are entry points (based on seen code only)
-        seen_files: List[str] = []
+    #     # ---------- iterative fold over files with LLM ----------
+    #     # Running state entirely maintained by the LLM:
+    #     running_summary = ""  # textual repo summary so far
+    #     running_entry_points: List[str] = []  # file paths the LLM currently believes are entry points (based on seen code only)
+    #     seen_files: List[str] = []
 
-        # Check if repo summary already exists in MongoDB
-        existing_summary_doc = self.mental_model_collection.find_one({"repo_id": repo_id, "document_type": "REPO_SUMMARY"})
-        if existing_summary_doc:
-            print(f"Job {self.job_id}: Repo summary already exists in MongoDB for {repo_id}, skipping generation.")
-            return existing_summary_doc.get("data", "")
+    #     # Check if repo summary already exists in MongoDB
+    #     existing_summary_doc = self.mental_model_collection.find_one({"repo_id": repo_id, "document_type": "REPO_SUMMARY"})
+    #     if existing_summary_doc:
+    #         print(f"Job {self.job_id}: Repo summary already exists in MongoDB for {repo_id}, skipping generation.")
+    #         return existing_summary_doc.get("data", "")
 
-        # System prompt used for every fold update (no static analysis, LLM owns entry point inference)
-        system_prompt = (
-            "You are constructing a single comprehensive summary of a code repository by iteratively reading files.\n"
-            "At each step, you receive: (1) the current cumulative summary and entry point candidates, and (2) the next file's path and full code.\n"
-            "Update the cumulative summary so a newcomer understands what the repo does and how parts fit together.\n"
-            "(e.g., presence of a main routine, startup/bootstrapping behavior, CLI invocation, web server start, etc.). "
-            "Do not guess based on filenames, locations, or conventions; rely strictly on code content seen so far.\n"
-            "Keep the summary concise and concrete, avoid file-by-file laundry lists, and integrate new information logically."
-        )
+    #     # System prompt used for every fold update (no static analysis, LLM owns entry point inference)
+    #     system_prompt = (
+    #         "You are constructing a single comprehensive summary of a code repository by iteratively reading files.\n"
+    #         "At each step, you receive: (1) the current cumulative summary and entry point candidates, and (2) the next file's path and full code.\n"
+    #         "Update the cumulative summary so a newcomer understands what the repo does and how parts fit together.\n"
+    #         "(e.g., presence of a main routine, startup/bootstrapping behavior, CLI invocation, web server start, etc.). "
+    #         "Do not guess based on filenames, locations, or conventions; rely strictly on code content seen so far.\n"
+    #         "Keep the summary concise and concrete, avoid file-by-file laundry lists, and integrate new information logically."
+    #     )
 
-        # We ask for strict JSON so we can carry state cleanly each step.
-        # Output schema:
-        # {
-        #   "summary": "<updated plain-English repo summary>",
-        #   "entry_points": ["path/one.py", ...]    # subset of seen_files; inferred from code only
-        # }
+    #     # We ask for strict JSON so we can carry state cleanly each step.
+    #     # Output schema:
+    #     # {
+    #     #   "summary": "<updated plain-English repo summary>",
+    #     #   "entry_points": ["path/one.py", ...]    # subset of seen_files; inferred from code only
+    #     # }
 
-        for idx, file_path in enumerate(ordered_files):
-            seen_files.append(file_path)
-            file_code_raw = code_by_file.get(file_path, "") or ""
-            file_code = _truncate(file_code_raw, max_code_chars_per_file)
+    #     for idx, file_path in enumerate(ordered_files):
+    #         seen_files.append(file_path)
+    #         file_code_raw = code_by_file.get(file_path, "") or ""
+    #         file_code = _truncate(file_code_raw, max_code_chars_per_file)
 
-            user_prompt = (
-                f"Repository: {repo_id}\n"
-                f"Files seen so far (count={len(seen_files)}): {seen_files}\n\n"
-                f"Current cumulative summary:\n{running_summary or '(empty)'}\n\n"
-                f"Current entry point candidates (from code seen so far only): {running_entry_points or []}\n\n"
-                f"NEXT_FILE_PATH: {file_path}\n"
-                f"NEXT_FILE_CODE:\n<<<\n{file_code}\n>>>\n\n"
-                "Produce a BRIEF, plain-English update to the cumulative summary that integrates info from NEXT_FILE_CODE.\n"
-                "   - Explain what this file contributes at a high level (APIs, CLI, services, jobs, data flow), "
-                "     and how it interacts with previously seen parts—only if supported by code.\n"
-                "   - Avoid low-level details and exhaustive lists.\n\n"
-                f"{_word_limit_prompt(max_summary_words)}"
-            )
+    #         user_prompt = (
+    #             f"Repository: {repo_id}\n"
+    #             f"Files seen so far (count={len(seen_files)}): {seen_files}\n\n"
+    #             f"Current cumulative summary:\n{running_summary or '(empty)'}\n\n"
+    #             f"Current entry point candidates (from code seen so far only): {running_entry_points or []}\n\n"
+    #             f"NEXT_FILE_PATH: {file_path}\n"
+    #             f"NEXT_FILE_CODE:\n<<<\n{file_code}\n>>>\n\n"
+    #             "Produce a BRIEF, plain-English update to the cumulative summary that integrates info from NEXT_FILE_CODE.\n"
+    #             "   - Explain what this file contributes at a high level (APIs, CLI, services, jobs, data flow), "
+    #             "     and how it interacts with previously seen parts—only if supported by code.\n"
+    #             "   - Avoid low-level details and exhaustive lists.\n\n"
+    #             f"{_word_limit_prompt(max_summary_words)}"
+    #         )
 
-            step_out = await self.llm_client.generate_async(
-                prompt=user_prompt,
-                system_prompt=system_prompt,
-                reasoning_effort="low",
-                temperature=0.0,
-            )
-            step_out = (step_out or "").strip()
+    #         step_out = await self.llm_client.generate_async(
+    #             prompt=user_prompt,
+    #             system_prompt=system_prompt,
+    #             reasoning_effort="low",
+    #             temperature=0.0,
+    #         )
+    #         step_out = (step_out or "").strip()
 
-            # Best-effort JSON parse; if it fails, wrap as summary-only.
-            new_summary = running_summary
-            new_entry_points = running_entry_points
-            try:
-                parsed = json.loads(step_out)
-                if isinstance(parsed, dict):
-                    cand_summary = parsed.get("summary")
-                    cand_eps = parsed.get("entry_points")
-                    if isinstance(cand_summary, str) and cand_summary.strip():
-                        new_summary = cand_summary.strip()
-                    if isinstance(cand_eps, list):
-                        # Keep only files we've actually seen; dedupe preserving order
-                        seen_set = set(seen_files)
-                        dedup = []
-                        for ep in cand_eps:
-                            if isinstance(ep, str) and ep in seen_set and ep not in dedup:
-                                dedup.append(ep)
-                        new_entry_points = dedup
-            except Exception:
-                # Fallback: treat whole output as the updated summary text
-                if step_out:
-                    new_summary = step_out
+    #         # Best-effort JSON parse; if it fails, wrap as summary-only.
+    #         new_summary = running_summary
+    #         new_entry_points = running_entry_points
+    #         try:
+    #             parsed = json.loads(step_out)
+    #             if isinstance(parsed, dict):
+    #                 cand_summary = parsed.get("summary")
+    #                 cand_eps = parsed.get("entry_points")
+    #                 if isinstance(cand_summary, str) and cand_summary.strip():
+    #                     new_summary = cand_summary.strip()
+    #                 if isinstance(cand_eps, list):
+    #                     # Keep only files we've actually seen; dedupe preserving order
+    #                     seen_set = set(seen_files)
+    #                     dedup = []
+    #                     for ep in cand_eps:
+    #                         if isinstance(ep, str) and ep in seen_set and ep not in dedup:
+    #                             dedup.append(ep)
+    #                     new_entry_points = dedup
+    #         except Exception:
+    #             # Fallback: treat whole output as the updated summary text
+    #             if step_out:
+    #                 new_summary = step_out
 
-            running_summary = new_summary
-            running_entry_points = new_entry_points
+    #         running_summary = new_summary
+    #         running_entry_points = new_entry_points
 
-        final_summary = (running_summary or "").strip()
-        final_entry_points = running_entry_points or []
+    #     final_summary = (running_summary or "").strip()
+    #     final_entry_points = running_entry_points or []
 
-        # ---------- persist to Mongo ----------
-        document = {
-            "repo_id": repo_id,
-            "document_type": "REPO_SUMMARY",
-            "data": final_summary,
-            "entry_points": final_entry_points,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-        }
-        self.mental_model_collection.update_one(
-            {"repo_id": repo_id, "document_type": "REPO_SUMMARY"},
-            {"$set": document},
-            upsert=True,
-        )
+    #     # ---------- persist to Mongo ----------
+    #     document = {
+    #         "repo_id": repo_id,
+    #         "document_type": "REPO_SUMMARY",
+    #         "data": final_summary,
+    #         "entry_points": final_entry_points,
+    #         "generated_at": datetime.now(timezone.utc).isoformat(),
+    #     }
+    #     self.mental_model_collection.update_one(
+    #         {"repo_id": repo_id, "document_type": "REPO_SUMMARY"},
+    #         {"$set": document},
+    #         upsert=True,
+    #     )
 
-        return final_summary
+    #     return final_summary
 
-    def _write_to_md(self, repo_summary: List[Dict], file_summaries: Dict, repo_id: str, dir_tree: Dict) -> None:
-        """Write the hierarchical mental model to a Markdown file."""
-        output_dir = Path(f"{repo_id}/mental_model")
-        output_dir.mkdir(parents=True, exist_ok=True)
-        output_path = output_dir / "mental_model.md"
-        print(output_path)
+    # def _write_to_md(self, repo_summary: List[Dict], file_summaries: Dict, repo_id: str, dir_tree: Dict) -> None:
+    #     """Write the hierarchical mental model to a Markdown file."""
+    #     output_dir = Path(f"{repo_id}/mental_model")
+    #     output_dir.mkdir(parents=True, exist_ok=True)
+    #     output_path = output_dir / "mental_model.md"
+    #     print(output_path)
 
-        def format_dir_tree(node: Dict, prefix: str = "", level: int = 0) -> str:
-            """Recursively format directory tree as Markdown."""
-            result = []
-            indent = "  " * level
+    #     def format_dir_tree(node: Dict, prefix: str = "", level: int = 0) -> str:
+    #         """Recursively format directory tree as Markdown."""
+    #         result = []
+    #         indent = "  " * level
             
-            # Add files at current level
-            for file in sorted(node.get('files', [])):
-                result.append(f"{indent}- {file}")
+    #         # Add files at current level
+    #         for file in sorted(node.get('files', [])):
+    #             result.append(f"{indent}- {file}")
             
-            # Recursively process subdirectories
-            for subdir, subnode in sorted(node['subdirs'].items()):
-                result.append(f"{indent}- **{subdir}/**")
-                result.append(format_dir_tree(subnode, prefix=f"{prefix}/{subdir}" if prefix else subdir, level=level+1))
+    #         # Recursively process subdirectories
+    #         for subdir, subnode in sorted(node['subdirs'].items()):
+    #             result.append(f"{indent}- **{subdir}/**")
+    #             result.append(format_dir_tree(subnode, prefix=f"{prefix}/{subdir}" if prefix else subdir, level=level+1))
             
-            return "\n".join(result)
+    #         return "\n".join(result)
 
-        repo_summary_md = []
-        file_number = 1
-        repo_summary_md.append(f"# Mental Model for Repository: {repo_id}\n")
-        repo_summary_md.append("This document outlines the critical files and their interactions to understand how the repository functions.\n")
-        repo_summary_md.append("## Critical Files\n")
+    #     repo_summary_md = []
+    #     file_number = 1
+    #     repo_summary_md.append(f"# Mental Model for Repository: {repo_id}\n")
+    #     repo_summary_md.append("This document outlines the critical files and their interactions to understand how the repository functions.\n")
+    #     repo_summary_md.append("## Critical Files\n")
 
-        for insight in repo_summary:
-            interaction_list = "\n".join([f"- {interaction}" for interaction in insight["downstream_dep_interactions"]])
-            repo_summary_md.append(f"### {file_number}. `{insight['file_path']}`\n")
-            repo_summary_md.append(f"**Summary**: {insight['summary']}\n")
-            repo_summary_md.append("**Cross-File Interactions**:\n" + (interaction_list if interaction_list else "- None\n") + "\n")
-            file_number += 1
+    #     for insight in repo_summary:
+    #         interaction_list = "\n".join([f"- {interaction}" for interaction in insight["downstream_dep_interactions"]])
+    #         repo_summary_md.append(f"### {file_number}. `{insight['file_path']}`\n")
+    #         repo_summary_md.append(f"**Summary**: {insight['summary']}\n")
+    #         repo_summary_md.append("**Cross-File Interactions**:\n" + (interaction_list if interaction_list else "- None\n") + "\n")
+    #         file_number += 1
 
-        repo_summary_md_str = "\n".join(repo_summary_md)
+    #     repo_summary_md_str = "\n".join(repo_summary_md)
 
-        # Start Markdown content
-        markdown_content = [
-            repo_summary_md_str,
-            "---",
-        ]
+    #     # Start Markdown content
+    #     markdown_content = [
+    #         repo_summary_md_str,
+    #         "---",
+    #     ]
 
-        # Write to file
-        if output_path.exists():
-            print(f"Job {self.job_id}: Overwriting existing mental model file: {output_path}")
+    #     # Write to file
+    #     if output_path.exists():
+    #         print(f"Job {self.job_id}: Overwriting existing mental model file: {output_path}")
 
-        with output_path.open("w", encoding="utf-8") as f:
-            f.write("\n".join(markdown_content))
+    #     with output_path.open("w", encoding="utf-8") as f:
+    #         f.write("\n".join(markdown_content))
         
-        print(f"Job {self.job_id}: Wrote mental model to {output_path}")
+    #     print(f"Job {self.job_id}: Wrote mental model to {output_path}")
 
-    def _write_to_jsonl(self, repo_summary: dict, file_summaries: Dict, repo_id: str, dir_tree: Dict) -> None:
-        """
-        Emit attentionDB-compatible JSONL records for:
-        - repo (1 record)
-        - directories (one per dir)
-        - files (one per file)
-        Fields align with the Record schema used by attentiondb.build-keys.
+    # def _write_to_jsonl(self, repo_summary: dict, file_summaries: Dict, repo_id: str, dir_tree: Dict) -> None:
+    #     """
+    #     Emit attentionDB-compatible JSONL records for:
+    #     - repo (1 record)
+    #     - directories (one per dir)
+    #     - files (one per file)
+    #     Fields align with the Record schema used by attentiondb.build-keys.
 
-        Expected inputs:
-        - repo_summary: str
-        - file_summaries: {"files":[{"path": "...", "summary": "...", "cross_file_interactions":[...], ...}, ...]}
-        - dir_tree: {"files":[...], "subdirs": { "subdir": {...}, ... } }
-        """
-        output_dir = Path(f"{repo_id}/mental_model")
-        output_dir.mkdir(parents=True, exist_ok=True)
-        out_path = output_dir / "mental_model.jsonl"
+    #     Expected inputs:
+    #     - repo_summary: str
+    #     - file_summaries: {"files":[{"path": "...", "summary": "...", "cross_file_interactions":[...], ...}, ...]}
+    #     - dir_tree: {"files":[...], "subdirs": { "subdir": {...}, ... } }
+    #     """
+    #     output_dir = Path(f"{repo_id}/mental_model")
+    #     output_dir.mkdir(parents=True, exist_ok=True)
+    #     out_path = output_dir / "mental_model.jsonl"
 
-        def write_jsonl(records: List[Dict[str, Any]], path: Path):
-            with path.open("w", encoding="utf-8") as f:
-                for r in records:
-                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    #     def write_jsonl(records: List[Dict[str, Any]], path: Path):
+    #         with path.open("w", encoding="utf-8") as f:
+    #             for r in records:
+    #                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-        def norm_path(p: str) -> str:
-            return p.replace("\\", "/")
+    #     def norm_path(p: str) -> str:
+    #         return p.replace("\\", "/")
 
-        def dir_records_from_tree(root_id: str, tree: Dict, prefix: str = "") -> List[Dict[str, Any]]:
-            """Collect all file paths from dir_tree into a single record."""
-            file_paths: List[str] = []
+    #     def dir_records_from_tree(root_id: str, tree: Dict, prefix: str = "") -> List[Dict[str, Any]]:
+    #         """Collect all file paths from dir_tree into a single record."""
+    #         file_paths: List[str] = []
 
-            def collect_files(node: Dict, current_prefix: str = "") -> None:
-                """Helper function to recursively collect file paths."""
-                dir_path = norm_path(current_prefix)
-                # Collect files in current directory
-                for file_name in sorted(node.get("files", [])):
-                    file_path = f"{dir_path}/{file_name}" if dir_path else file_name
-                    file_paths.append(file_path)
-                # Recurse into subdirectories
-                for sub, subnode in sorted(node.get("subdirs", {}).items()):
-                    sub_prefix = f"{dir_path}/{sub}" if dir_path else sub
-                    collect_files(subnode, sub_prefix)
+    #         def collect_files(node: Dict, current_prefix: str = "") -> None:
+    #             """Helper function to recursively collect file paths."""
+    #             dir_path = norm_path(current_prefix)
+    #             # Collect files in current directory
+    #             for file_name in sorted(node.get("files", [])):
+    #                 file_path = f"{dir_path}/{file_name}" if dir_path else file_name
+    #                 file_paths.append(file_path)
+    #             # Recurse into subdirectories
+    #             for sub, subnode in sorted(node.get("subdirs", {}).items()):
+    #                 sub_prefix = f"{dir_path}/{sub}" if dir_path else sub
+    #                 collect_files(subnode, sub_prefix)
 
-            # Collect all file paths
-            collect_files(tree, prefix)
+    #         # Collect all file paths
+    #         collect_files(tree, prefix)
 
-            # Return a single record with all file paths
-            return [{
-                "id": root_id,
-                "type": "file_paths_in_repo",
-                "file_paths": file_paths
-            }]
+    #         # Return a single record with all file paths
+    #         return [{
+    #             "id": root_id,
+    #             "type": "file_paths_in_repo",
+    #             "file_paths": file_paths
+    #         }]
         
-        repo_summary_md = []
-        file_number = 1
-        for file_path, summary in repo_summary.items():
-            repo_summary_md.append(f"{file_number}. File: {file_path}\n{summary}\n\n")
-            file_number += 1
+    #     repo_summary_md = []
+    #     file_number = 1
+    #     for file_path, summary in repo_summary.items():
+    #         repo_summary_md.append(f"{file_number}. File: {file_path}\n{summary}\n\n")
+    #         file_number += 1
 
-        repo_summary_md_str = "\n".join(repo_summary_md)
+    #     repo_summary_md_str = "\n".join(repo_summary_md)
 
-        # 1) Repo record
-        repo_rec = {
-            "id": f"repo::{repo_id}",
-            "type": "repo",
-            "summary": (repo_summary_md_str or "").strip(),
-        }
+    #     # 1) Repo record
+    #     repo_rec = {
+    #         "id": f"repo::{repo_id}",
+    #         "type": "repo",
+    #         "summary": (repo_summary_md_str or "").strip(),
+    #     }
 
-        # 2) Directory records
-        dir_records = dir_records_from_tree(repo_id, dir_tree)
+    #     # 2) Directory records
+    #     dir_records = dir_records_from_tree(repo_id, dir_tree)
 
-        # 3) File records
-        file_records: List[Dict[str, Any]] = []
-        for fi in file_summaries.get("files", []):
-            path = norm_path(fi.get("path", ""))
-            if not path:
-                continue
-            file_id = f"file::{path}"
-            name = os.path.basename(path)
+    #     # 3) File records
+    #     file_records: List[Dict[str, Any]] = []
+    #     for fi in file_summaries.get("files", []):
+    #         path = norm_path(fi.get("path", ""))
+    #         if not path:
+    #             continue
+    #         file_id = f"file::{path}"
+    #         name = os.path.basename(path)
 
-            # Map cross_file_interactions → deps (best-effort; keep as strings if unknown)
-            # If your strings have structure (e.g., "calls: file::core/db.py:connect"), you can parse more precisely.
-            interactions: List[str] = fi.get("cross_file_interactions", []) or []
-            deps_imports, deps_calls = [], []
-            for s in interactions:
-                s_norm = str(s).strip()
-                deps_imports.append(s_norm)
+    #         # Map cross_file_interactions → deps (best-effort; keep as strings if unknown)
+    #         # If your strings have structure (e.g., "calls: file::core/db.py:connect"), you can parse more precisely.
+    #         interactions: List[str] = fi.get("cross_file_interactions", []) or []
+    #         deps_imports, deps_calls = [], []
+    #         for s in interactions:
+    #             s_norm = str(s).strip()
+    #             deps_imports.append(s_norm)
 
-            file_records.append({
-                "id": file_id,
-                "type": "file",
-                "path": path,
-                "name": name,
-                "summary": (fi.get("summary") or "").strip(),
-                "deps": {
-                    "imports": deps_imports,
-                },
-                # "subsystem": subsystem,
-                # "spans": fi.get("spans", []),                   # if you tracked file:line evidence, add it here
-                # "size_loc": fi.get("size_loc"),                 # optional
-                # "centrality": fi.get("centrality"),             # optional precomputed importance
-                # "commit_sha": fi.get("commit_sha"),             # optional
-            })
+    #         file_records.append({
+    #             "id": file_id,
+    #             "type": "file",
+    #             "path": path,
+    #             "name": name,
+    #             "summary": (fi.get("summary") or "").strip(),
+    #             "deps": {
+    #                 "imports": deps_imports,
+    #             },
+    #             # "subsystem": subsystem,
+    #             # "spans": fi.get("spans", []),                   # if you tracked file:line evidence, add it here
+    #             # "size_loc": fi.get("size_loc"),                 # optional
+    #             # "centrality": fi.get("centrality"),             # optional precomputed importance
+    #             # "commit_sha": fi.get("commit_sha"),             # optional
+    #         })
 
-        # 4) Write JSONL (repo → dirs → files)
-        records_all = [repo_rec] + dir_records + file_records
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        write_jsonl(records_all, out_path)
-        print(f"Job {self.job_id}: Wrote attentionDB JSONL ({len(records_all)} records) to {out_path}")
+    #     # 4) Write JSONL (repo → dirs → files)
+    #     records_all = [repo_rec] + dir_records + file_records
+    #     out_path.parent.mkdir(parents=True, exist_ok=True)
+    #     write_jsonl(records_all, out_path)
+    #     print(f"Job {self.job_id}: Wrote attentionDB JSONL ({len(records_all)} records) to {out_path}")
 
-    def _write_to_jsonl_v2(self, insights: List[Dict[str, Any]], repo_id: str) -> None:
-        """
-        Write one JSONL record per insight.
+    # def _write_to_jsonl_v2(self, insights: List[Dict[str, Any]], repo_id: str) -> None:
+    #     """
+    #     Write one JSONL record per insight.
 
-        Expected inputs:
-        - insights: [
-            {
-            "file_path": "<file_path>",
-            "summary": "<summary>",
-            "cross_file_paths": ["<file_path>", ...]
-            },
-            ...
-        ]
-        - repo_id: string
+    #     Expected inputs:
+    #     - insights: [
+    #         {
+    #         "file_path": "<file_path>",
+    #         "summary": "<summary>",
+    #         "cross_file_paths": ["<file_path>", ...]
+    #         },
+    #         ...
+    #     ]
+    #     - repo_id: string
 
-        Output (mental_model/mental_model.jsonl):
-        Each line is:
-        {
-        "id": "<file_path>",
-        "file_path": "<file_path>",
-        "summary": "<summary>",
-        "cross_file_deps": "<stringified cross_file_paths paths>"
-        }
-        """
+    #     Output (mental_model/mental_model.jsonl):
+    #     Each line is:
+    #     {
+    #     "id": "<file_path>",
+    #     "file_path": "<file_path>",
+    #     "summary": "<summary>",
+    #     "cross_file_deps": "<stringified cross_file_paths paths>"
+    #     }
+    #     """
 
-        def norm_path(p: str) -> str:
-            return (p or "").replace("\\", "/")
+    #     def norm_path(p: str) -> str:
+    #         return (p or "").replace("\\", "/")
 
-        output_dir = Path(f"{repo_id}/mental_model")
-        output_dir.mkdir(parents=True, exist_ok=True)
-        out_path = output_dir / "mental_model.jsonl"
+    #     output_dir = Path(f"{repo_id}/mental_model")
+    #     output_dir.mkdir(parents=True, exist_ok=True)
+    #     out_path = output_dir / "mental_model.jsonl"
 
-        records: List[Dict[str, Any]] = []
+    #     records: List[Dict[str, Any]] = []
 
-        for item in insights or []:
-            raw_path = item.get("file_path", "")
-            path = norm_path(raw_path)
-            if not path:
-                # Skip malformed entries with no path
-                continue
+    #     for item in insights or []:
+    #         raw_path = item.get("file_path", "")
+    #         path = norm_path(raw_path)
+    #         if not path:
+    #             # Skip malformed entries with no path
+    #             continue
 
-            summary = (item.get("summary") or "").strip()
+    #         summary = (item.get("summary") or "").strip()
             
-            upstream_dep_files = item.get("upstream_dep_files") or []
-            downstream_dep_files = item.get("downstream_dep_files") or []
+    #         upstream_dep_files = item.get("upstream_dep_files") or []
+    #         downstream_dep_files = item.get("downstream_dep_files") or []
 
-            # cross = item.get("cross_file_paths") or []
-            # # Ensure list-of-strings, normalize, then stringify as a single comma-separated string
-            # cross_norm = [norm_path(str(p)) for p in cross if p]
-            # cross_str = ", ".join(cross_norm)
+    #         # cross = item.get("cross_file_paths") or []
+    #         # # Ensure list-of-strings, normalize, then stringify as a single comma-separated string
+    #         # cross_norm = [norm_path(str(p)) for p in cross if p]
+    #         # cross_str = ", ".join(cross_norm)
 
-            records.append({
-                "id": path,
-                "file_path": path,
-                "summary": summary,
-                "upstream_deps": upstream_dep_files,
-                "downstream_deps": downstream_dep_files,
-            })
+    #         records.append({
+    #             "id": path,
+    #             "file_path": path,
+    #             "summary": summary,
+    #             "upstream_deps": upstream_dep_files,
+    #             "downstream_deps": downstream_dep_files,
+    #         })
 
-        with out_path.open("w", encoding="utf-8") as f:
-            for r in records:
-                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    #     with out_path.open("w", encoding="utf-8") as f:
+    #         for r in records:
+    #             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-        print(f"Job {self.job_id}: Wrote {len(records)} JSONL records to {out_path}")
+    #     print(f"Job {self.job_id}: Wrote {len(records)} JSONL records to {out_path}")
     
-    def validate_config(self) -> bool:
-        return True
+    # def validate_config(self) -> bool:
+    #     return True

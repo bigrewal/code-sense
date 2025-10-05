@@ -448,11 +448,14 @@ class MyMongoClient:
     
 def get_entry_point_files(db_client, repo_id: str) -> List[str]:
     collection = db_client["mental_model"]
-    docs = collection.find({"repo_id": repo_id, "document_type": "POTENTIAL_ENTRY_POINTS"})
-    entry_point_files = []
-    for doc in docs:
-        entry_point_files.append(doc.get("file_path"))
-    return entry_point_files
+    doc = collection.find_one({"repo_id": repo_id, "document_type": "REPO_SUMMARY"})
+    if doc:
+        return doc.get("entry_points", [])
+    return []
+    # entry_point_files = []
+    # for doc in docs:
+    #     entry_point_files.append(doc.get("file_path"))
+    # return entry_point_files
 
 def get_repo_summary(db_client, repo_id: str) -> str:
     collection = db_client["mental_model"]

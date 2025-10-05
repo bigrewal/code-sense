@@ -15,7 +15,7 @@ from .db import get_neo4j_client, init_mongo_client, init_neo4j_client, attentio
 from pathlib import Path
 from .repo_ingestion_pipeline import start_ingestion_pipeline
 from .service import fetch_job_status
-from .walkthrough_service import build_repo_walkthrough_plan, stream_walkthrough_next
+from .walkthrough_service import build_repo_walkthrough_plan, stream_walkthrough_goto, stream_walkthrough_next, clear_repo_walkthrough_sessions
 from .walkthrough_def_service import Neo4jClient, build_definition_walkthrough_plan, stream_definition_walkthrough
 from fastapi.responses import StreamingResponse
 
@@ -54,6 +54,10 @@ class DefWalkRequest(BaseModel):
 
 
 class GetDefsRequest(BaseModel):
+    repo_id: str
+    file_path: str
+
+class GotoRequest(BaseModel):
     repo_id: str
     file_path: str
 
@@ -128,6 +132,7 @@ async def start_walkthrough(request: WalkthroughRequest):
     db_client = get_mongo_client()
     entry_points = get_entry_point_files(db_client, request.repo_id)
     repo_summary = get_repo_summary(db_client, request.repo_id)
+    clear_repo_walkthrough_sessions(request.repo_id)
 
     return {
         "entry_points": entry_points,
@@ -146,7 +151,7 @@ async def walkthrough_next(request: WalkthroughRequest):
 async def walkthrough_repo_plan(req: WalkthroughRequest):
     plan = await build_repo_walkthrough_plan(
         repo_id=req.repo_id,
-        depth=100000,
+        depth=2,
     )
     return plan
 
@@ -211,3 +216,10 @@ async def list_definitions(repo_id: str, file_path: str):
         "file_path": file_path,
         "definitions": results
     }
+
+@app.post("/walkthrough/goto")
+async def goto_step(req: GotoRequest):
+    return StreamingResponse(
+        stream_walkthrough_goto(repo_id=req.repo_id, file_path=req.file_path),
+        media_type="text/markdown"
+    )
