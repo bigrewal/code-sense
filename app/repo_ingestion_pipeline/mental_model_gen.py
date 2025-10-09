@@ -29,6 +29,7 @@ from .core.base import PipelineStage, StageResult
 from ..models.data_model import S3StorageInfo
 from ..db import Neo4jClient, get_neo4j_client, get_mongo_client, attention_db_runtime
 from ..llm import GroqLLM
+from ..repo_arch_service import build_repo_architecture
 
 
 class MentalModelStage(PipelineStage):
@@ -61,6 +62,7 @@ class MentalModelStage(PipelineStage):
             # repo_summary = await self.generate_repo_summary(insights, repo_id)
             await self.gen_repo_summary_from_file_overview(repo_id)
             await self._set_potential_entry_points(insights, repo_id)
+            await build_repo_architecture(repo_id)
 
             # self._write_to_md(insights, [], repo_id, dir_tree)
             # # self._write_to_jsonl(insights, file_summaries, repo_id, dir_tree)

@@ -3,6 +3,7 @@ import logging
 from contextlib import asynccontextmanager
 import asyncio
 from typing import Any, Dict, List, Set
+from urllib import request
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -17,6 +18,8 @@ from .repo_ingestion_pipeline import start_ingestion_pipeline
 from .service import fetch_job_status
 from .walkthrough_service import build_repo_walkthrough_plan, stream_walkthrough_goto, stream_walkthrough_next, clear_repo_walkthrough_sessions
 from .walkthrough_def_service import Neo4jClient, build_definition_walkthrough_plan, stream_definition_walkthrough
+from .repo_arch_service import get_repo_architecture
+
 from fastapi.responses import StreamingResponse
 
 logging.basicConfig(level=logging.INFO)
@@ -38,12 +41,18 @@ init_mongo_client()
 llm = GroqLLM()
 # mental_model_fetcher = MentalModelFetcher()
 
+class RepoArchRequest(BaseModel):
+    repo_id: str
+
 class QueryRequest(BaseModel):
     question: str
     repo_id: str
 
 class WalkthroughRequest(BaseModel):
     repo_id: str
+    depth: int = 2
+    entry_point: str = None  # Optional entry point file path
+    current_level: int = 0  # Current depth level in the walkthrough
 
 
 class DefWalkRequest(BaseModel):
@@ -126,6 +135,16 @@ async def list_repos():
     return {"repos": ["data/dictquery", "data/xai-sdk-python", "data/fastapi"]}
 
 
+@app.get("/repo/architecture")
+async def get_repo_arch(repo_id: str):
+    """Get the architecture overview for a specific repository."""
+    try:
+        architecture = await get_repo_architecture(repo_id)
+        return architecture
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
 # Endpoints for repo walkthrough
 @app.post("/walkthrough/repo/start")
 async def start_walkthrough(request: WalkthroughRequest):
@@ -143,7 +162,12 @@ async def start_walkthrough(request: WalkthroughRequest):
 @app.post("/walkthrough/repo/next")
 async def walkthrough_next(request: WalkthroughRequest):
     return StreamingResponse(
-        stream_walkthrough_next(request.repo_id),
+        stream_walkthrough_next(
+            request.repo_id, 
+            request.depth, 
+            request.entry_point, 
+            request.current_level
+        ),
         media_type="text/markdown"
     )
 
