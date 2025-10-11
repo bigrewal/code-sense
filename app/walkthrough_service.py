@@ -30,14 +30,13 @@ async def stream_walkthrough_next(
     level: int | None = None,
 ):
     """
-    Plan-driven NEXT:
+    Plan-driven walkthrough (NEXT):
       - Reads the precomputed plan from mental_model (one doc per entry_point).
       - Tracks a per-entry-point cursor in session (plan_cursors).
       - If current_file_path/level are given, repositions the cursor to that step.
       - Streams the nugget for the step at the cursor, then advances the cursor by 1.
-    Fallback:
-      - If no plan is found, falls back to event-based traversal (existing behavior).
     """
+
     # Ensure async generator even if we early-return
     if False:
         yield ""
@@ -45,108 +44,25 @@ async def stream_walkthrough_next(
     mongo = get_mongo_client()
     sessions = mongo[WALK_SESSIONS_COL]
     nuggets = mongo[WALK_NUGGETS_COL]
+    mental_model = mongo[MENTAL_MODEL_COL]
     neo4j = get_neo4j_client()
 
-    mental_model = mongo[MENTAL_MODEL_COL]
-
-    # --- 1) Try to load plan(s) for this repo ---
-    plan_docs = list(mental_model.find(
-        {"repo_id": repo_id, "plan": {"$exists": True}},
-        {"_id": 0, "entry_point": 1, "plan": 1}
-    ))
+    # --- 1) Load plan(s) for this repo ---
+    plan_docs = list(
+        mental_model.find(
+            {"repo_id": repo_id, "plan": {"$exists": True}},
+            {"_id": 0, "entry_point": 1, "plan": 1},
+        )
+    )
 
     if not plan_docs:
-        # ---- Fallback to your previous event-based traversal ----
-        # (exactly your prior logic)
-        session = _get_or_create_session(mongo, repo_id)
-        _seed_events_if_empty(session, sessions, repo_id)
-
-        events = session.get("traversal_events", [])
-        idx = int(session.get("cursor", 0))
-
-        # skip already-visited events
-        visited_events = set(tuple(x) for x in session.get("visited_events", []))
-        while idx < len(events):
-            ev_key = (events[idx].get("file"), events[idx].get("parent"))
-            if ev_key in visited_events:
-                idx += 1
-            else:
-                break
-        if idx != session.get("cursor", 0):
-            session["cursor"] = idx
-            sessions.update_one({"_id": session["_id"]}, {"$set": {"cursor": idx}})
-
-        if not events or idx >= len(events):
-            yield "✅ Walkthrough complete.\n"
-            sessions.update_one({"_id": session["_id"]}, {"$set": {"done": True}})
-            return
-
-        ev = events[idx]
-        file_path = ev["file"]
-        consumer_path = ev["parent"]
-        lvl = ev.get("level", 0)
-
-        # cache first?
-        cached = nuggets.find_one({"repo_id": repo_id, "file_path": file_path, "consumer_path": consumer_path})
-        if cached and "summary" in cached:
-            yield f"\n## {file_path}\n"
-            yield cached["summary"] + "\n"
-            _extend_events_with_downstream_once(neo4j, repo_id, ev, session)
-            _mark_event_visited_and_advance(sessions, session, ev, event_idx=idx)
-            return
-
-        # build + stream nugget
-        repo_summary = get_repo_summary(mongo, repo_id) or ""
-        file_code = fetch_code_file(file_path=file_path) or ""
-        upstream_files, downstream_files = neo4j.file_dependencies(repo_id=repo_id, file_path=file_path)
-
-        llm = GroqLLM()
-        system_prompt = (
-            "You are generating a concise, plain-English walkthrough of a code repository.\n"
-            "Explain the CURRENT FILE and, if a consumer is given, how this file serves that consumer.\n"
-            "Guidelines:\n"
-            "- 4–8 lines. No code blocks. Avoid jargon; be concrete.\n"
-            "- If this is an entry point (no consumer), explain what it starts/boots and what it orchestrates.\n"
-            "- Use dependency lists as context; do not enumerate every import."
-        )
-        user_prompt = (
-            f"REPO_ID: {repo_id}\n"
-            f"LEVEL: {lvl}\n"
-            f"CONSUMER_FILE: {consumer_path or '(none – entry point)'}\n"
-            f"CURRENT_FILE: {file_path}\n\n"
-            f"REPO_OVERVIEW:\n{repo_summary}\n\n"
-            f"UPSTREAM_DEPENDENCIES:\n{upstream_files}\n\n"
-            f"DOWNSTREAM_DEPENDENCIES:\n{downstream_files}\n\n"
-            f"CURRENT_FILE_CODE:\n<<<\n{file_code}\n>>>\n\n"
-            "Write the nugget now."
-        )
-
-        captured = []
-        llm_stream = GroqLLM().generate(prompt=user_prompt, system_prompt=system_prompt, temperature=0.0, stream=True)
-        for ch in llm_stream:
-            content = ch.choices[0].delta.content or ""
-            if content:
-                captured.append(content)
-                yield content
-        yield "\n"
-        nugget_text = "".join(captured).strip()
-
-        # cache
-        nuggets.update_one(
-            {"repo_id": repo_id, "file_path": file_path, "consumer_path": consumer_path},
-            {"$set": {"repo_id": repo_id, "file_path": file_path, "consumer_path": consumer_path, "summary": nugget_text}},
-            upsert=True,
-        )
-
-        _extend_events_with_downstream_once(neo4j, repo_id, ev, session)
-        _mark_event_visited_and_advance(sessions, session, ev, event_idx=idx)
+        yield f"❌ No plan found for repo {repo_id}.\n"
         return
 
-    # --- 2) We have plans: pick the one to use ---
+    # --- 2) Pick the plan to use ---
     if entry_point:
         chosen = next((d for d in plan_docs if d.get("entry_point") == entry_point), None)
         if not chosen:
-            # fall back to first available plan
             chosen = plan_docs[0]
     else:
         chosen = plan_docs[0]
@@ -160,9 +76,8 @@ async def stream_walkthrough_next(
     cursors = session.get("plan_cursors", {})  # {entry_point: idx}
     idx = int(cursors.get(ep, 0))
 
-    # If UI gave us a current_file_path (and optional level), reposition cursor to that step
+    # If UI gave us a current_file_path (and optional level), reposition cursor
     if current_file_path:
-        # Find the first matching sequence position
         match_idx = None
         if level is not None:
             for i, ev in enumerate(sequence):
@@ -174,39 +89,46 @@ async def stream_walkthrough_next(
                 if ev.get("file_path") == current_file_path:
                     match_idx = i
                     break
+
         if match_idx is not None:
             idx = match_idx
             cursors[ep] = idx
-            sessions.update_one({"_id": session["_id"]}, {"$set": {"plan_cursors": cursors}})
-        # else: keep existing idx
+            sessions.update_one(
+                {"_id": session["_id"]}, {"$set": {"plan_cursors": cursors}}
+            )
 
-    # End if sequence exhausted
+    # --- 4) End if sequence exhausted ---
     if not sequence or idx >= len(sequence):
         yield "✅ Walkthrough complete.\n"
-        # mark done for this EP (optional: set a map of done flags)
         sessions.update_one({"_id": session["_id"]}, {"$set": {"done": True}})
         return
 
+    # --- 5) Process current step ---
     step = sequence[idx]
     file_path = step.get("file_path")
     consumer_path = step.get("parent_file")
     lvl = int(step.get("level", 0))
 
-    # --- 4) Stream nugget (from cache if available) ---
-    cached = nuggets.find_one({"repo_id": repo_id, "file_path": file_path, "consumer_path": consumer_path})
+    # --- 6) Stream nugget (from cache if available) ---
+    cached = nuggets.find_one(
+        {"repo_id": repo_id, "file_path": file_path, "consumer_path": consumer_path}
+    )
     if cached and "summary" in cached:
         yield f"\n## {file_path}\n"
         yield cached["summary"] + "\n"
-        # advance plan cursor by 1 for this EP
         cursors[ep] = idx + 1
-        sessions.update_one({"_id": session["_id"]}, {"$set": {"plan_cursors": cursors}})
+        sessions.update_one(
+            {"_id": session["_id"]}, {"$set": {"plan_cursors": cursors}}
+        )
         return
 
-    # Build fresh nugget from code + deps
+    # --- 7) Generate a fresh nugget via LLM ---
     repo_summary = get_repo_summary(mongo, repo_id) or ""
     file_code = fetch_code_file(file_path=file_path) or ""
     try:
-        upstream_files, downstream_files = neo4j.file_dependencies(repo_id=repo_id, file_path=file_path)
+        upstream_files, downstream_files = neo4j.file_dependencies(
+            repo_id=repo_id, file_path=file_path
+        )
     except Exception:
         upstream_files, downstream_files = [], []
 
@@ -218,6 +140,7 @@ async def stream_walkthrough_next(
         "- If this is an entry point (no consumer), explain what it starts/boots and what it orchestrates.\n"
         "- Use dependency lists as context; do not enumerate every import."
     )
+
     user_prompt = (
         f"REPO_ID: {repo_id}\n"
         f"ENTRY_POINT: {ep}\n"
@@ -232,25 +155,41 @@ async def stream_walkthrough_next(
     )
 
     captured = []
-    llm_stream = GroqLLM().generate(prompt=user_prompt, system_prompt=system_prompt, temperature=0.0, stream=True)
+    llm_stream = GroqLLM().generate(
+        prompt=user_prompt,
+        system_prompt=system_prompt,
+        temperature=0.0,
+        stream=True,
+    )
+
     for ch in llm_stream:
         content = ch.choices[0].delta.content or ""
         if content:
             captured.append(content)
             yield content
     yield "\n"
+
     nugget_text = "".join(captured).strip()
 
-    # Cache
+    # --- 8) Cache nugget and advance cursor ---
     nuggets.update_one(
         {"repo_id": repo_id, "file_path": file_path, "consumer_path": consumer_path},
-        {"$set": {"repo_id": repo_id, "file_path": file_path, "consumer_path": consumer_path, "summary": nugget_text}},
+        {
+            "$set": {
+                "repo_id": repo_id,
+                "file_path": file_path,
+                "consumer_path": consumer_path,
+                "summary": nugget_text,
+            }
+        },
         upsert=True,
     )
 
-    # Advance plan cursor for this entry point
     cursors[ep] = idx + 1
-    sessions.update_one({"_id": session["_id"]}, {"$set": {"plan_cursors": cursors}})
+    sessions.update_one(
+        {"_id": session["_id"]}, {"$set": {"plan_cursors": cursors}}
+    )
+
 
 
 
