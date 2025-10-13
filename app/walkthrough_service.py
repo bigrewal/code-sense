@@ -30,36 +30,33 @@ async def stream_walkthrough_next(
     level: int | None = None,
 ):
     """
-    Plan-driven walkthrough (NEXT):
-      - Reads the precomputed plan from mental_model (one doc per entry_point).
-      - Tracks a per-entry-point cursor in session (plan_cursors).
-      - If current_file_path/level are given, repositions the cursor to that step.
-      - Streams the nugget for the step at the cursor, then advances the cursor by 1.
+    Behavior:
+      - If current_file_path is NOT provided: return the nugget for the FIRST file in the plan.
+      - If current_file_path AND level are provided: find that step in the sequence,
+        then return the nugget for the NEXT step (index + 1).
     """
 
-    # Ensure async generator even if we early-return
+    # Ensure async generator even on early return
     if False:
         yield ""
 
     mongo = get_mongo_client()
-    sessions = mongo[WALK_SESSIONS_COL]
-    nuggets = mongo[WALK_NUGGETS_COL]
     mental_model = mongo[MENTAL_MODEL_COL]
+    nuggets = mongo[WALK_NUGGETS_COL]
     neo4j = get_neo4j_client()
 
-    # --- 1) Load plan(s) for this repo ---
+    # 1) Load plans for this repo
     plan_docs = list(
         mental_model.find(
             {"repo_id": repo_id, "plan": {"$exists": True}},
             {"_id": 0, "entry_point": 1, "plan": 1},
         )
     )
-
     if not plan_docs:
         yield f"❌ No plan found for repo {repo_id}.\n"
         return
 
-    # --- 2) Pick the plan to use ---
+    # 2) Choose plan (match entry_point if provided, else first)
     if entry_point:
         chosen = next((d for d in plan_docs if d.get("entry_point") == entry_point), None)
         if not chosen:
@@ -67,62 +64,54 @@ async def stream_walkthrough_next(
     else:
         chosen = plan_docs[0]
 
-    ep = chosen["entry_point"]
-    plan = chosen["plan"] or {}
+    plan = chosen.get("plan") or {}
     sequence = plan.get("sequence") or []  # list of {file_path, parent_file, level}
-
-    # --- 3) Track per-entry-point cursor in session ---
-    session = _get_or_create_session(mongo, repo_id)
-    cursors = session.get("plan_cursors", {})  # {entry_point: idx}
-    idx = int(cursors.get(ep, 0))
-
-    # If UI gave us a current_file_path (and optional level), reposition cursor
-    if current_file_path:
-        match_idx = None
-        if level is not None:
-            for i, ev in enumerate(sequence):
-                if ev.get("file_path") == current_file_path and int(ev.get("level", -1)) == int(level):
-                    match_idx = i
-                    break
-        else:
-            for i, ev in enumerate(sequence):
-                if ev.get("file_path") == current_file_path:
-                    match_idx = i
-                    break
-
-        if match_idx is not None:
-            idx = match_idx
-            cursors[ep] = idx
-            sessions.update_one(
-                {"_id": session["_id"]}, {"$set": {"plan_cursors": cursors}}
-            )
-
-    # --- 4) End if sequence exhausted ---
-    if not sequence or idx >= len(sequence):
+    if not sequence:
         yield "✅ Walkthrough complete.\n"
-        sessions.update_one({"_id": session["_id"]}, {"$set": {"done": True}})
         return
 
-    # --- 5) Process current step ---
-    step = sequence[idx]
+    # 3) Determine which index to fetch
+    if not current_file_path:
+        # No file provided → always return FIRST file’s nugget
+        target_idx = 0
+    else:
+        # Must have BOTH current_file_path and level to jump
+        if level is None:
+            yield "❌ You provided current_file_path without level. Both are required to jump.\n"
+            return
+
+        match_idx = None
+        for i, step in enumerate(sequence):
+            if step.get("file_path") == current_file_path and int(step.get("level", -1)) == int(level):
+                match_idx = i
+                break
+
+        if match_idx is None:
+            yield f"❌ ({current_file_path}, level={level}) not found in plan.\n"
+            return
+
+        target_idx = match_idx + 1  # fetch next in sequence
+
+    # 4) Bounds check
+    if target_idx >= len(sequence):
+        yield "✅ Walkthrough complete.\n"
+        return
+
+    step = sequence[target_idx]
     file_path = step.get("file_path")
     consumer_path = step.get("parent_file")
     lvl = int(step.get("level", 0))
 
-    # --- 6) Stream nugget (from cache if available) ---
+    # 5) Serve cached nugget if present
     cached = nuggets.find_one(
         {"repo_id": repo_id, "file_path": file_path, "consumer_path": consumer_path}
     )
     if cached and "summary" in cached:
         yield f"\n## {file_path}\n"
         yield cached["summary"] + "\n"
-        cursors[ep] = idx + 1
-        sessions.update_one(
-            {"_id": session["_id"]}, {"$set": {"plan_cursors": cursors}}
-        )
         return
 
-    # --- 7) Generate a fresh nugget via LLM ---
+    # 6) Otherwise, generate a fresh nugget (then cache it)
     repo_summary = get_repo_summary(mongo, repo_id) or ""
     file_code = fetch_code_file(file_path=file_path) or ""
     try:
@@ -133,17 +122,17 @@ async def stream_walkthrough_next(
         upstream_files, downstream_files = [], []
 
     system_prompt = (
-        "You are generating a concise, plain-English walkthrough of a code repository.\n"
+        "You are generating a plain-English walkthrough of a code repository.\n"
         "Explain the CURRENT FILE and, if a consumer is given, how this file serves that consumer.\n"
         "Guidelines:\n"
-        "- 4–8 lines. No code blocks. Avoid jargon; be concrete.\n"
+        "- Explain the code clearly and concisely.\n"
+        "- Cater to someone who is unfamiliar with the codebase.\n"
         "- If this is an entry point (no consumer), explain what it starts/boots and what it orchestrates.\n"
         "- Use dependency lists as context; do not enumerate every import."
     )
-
     user_prompt = (
         f"REPO_ID: {repo_id}\n"
-        f"ENTRY_POINT: {ep}\n"
+        f"ENTRY_POINT: {chosen.get('entry_point')}\n"
         f"LEVEL: {lvl}\n"
         f"CONSUMER_FILE: {consumer_path or '(none – entry point)'}\n"
         f"CURRENT_FILE: {file_path}\n\n"
@@ -161,7 +150,6 @@ async def stream_walkthrough_next(
         temperature=0.0,
         stream=True,
     )
-
     for ch in llm_stream:
         content = ch.choices[0].delta.content or ""
         if content:
@@ -170,101 +158,18 @@ async def stream_walkthrough_next(
     yield "\n"
 
     nugget_text = "".join(captured).strip()
-
-    # --- 8) Cache nugget and advance cursor ---
     nuggets.update_one(
         {"repo_id": repo_id, "file_path": file_path, "consumer_path": consumer_path},
-        {
-            "$set": {
-                "repo_id": repo_id,
-                "file_path": file_path,
-                "consumer_path": consumer_path,
-                "summary": nugget_text,
-            }
-        },
+        {"$set": {
+            "repo_id": repo_id,
+            "file_path": file_path,
+            "consumer_path": consumer_path,
+            "summary": nugget_text
+        }},
         upsert=True,
     )
 
-    cursors[ep] = idx + 1
-    sessions.update_one(
-        {"_id": session["_id"]}, {"$set": {"plan_cursors": cursors}}
-    )
-
-
-
-
-def _extend_events_with_downstream_once(neo4j: Neo4jClient, repo_id: str, current_event: dict, session: dict) -> None:
-    """
-    Extend traversal_events with downstream children of current_event.file as NEW EVENTS
-    (child, parent=current_file, level+1). Expand each FILE only once (expanded_files).
-    Allow the same CHILD to appear under multiple parents (multi-parent sequence).
-    """
-    file_path = current_event["file"]
-    level = current_event.get("level", 0)
-
-    expanded_files = set(session.get("expanded_files", []))
-    if file_path in expanded_files:
-        return  # already expanded this file's children
-
-    try:
-        _up, downstream = neo4j.file_dependencies(repo_id, file_path)
-    except Exception:
-        downstream = []
-
-    downstream = sorted(set(downstream))
-    events = session.get("traversal_events", [])
-    in_queue = {(e["file"], e["parent"], e.get("level", 0)) for e in events}
-
-    # Append each child as its own event; allow duplicates across different parents,
-    # but avoid exact-duplicate events (same child, same parent, same level).
-    for child in downstream:
-        ev = (child, file_path, level + 1)
-        if ev not in in_queue:
-            events.append({"file": child, "parent": file_path, "level": level + 1})
-
-    # Mark this file as expanded
-    expanded_files.add(file_path)
-    session["expanded_files"] = list(expanded_files)
-    session["traversal_events"] = events
-
-
-def _mark_event_visited_and_advance(sessions_col, session_doc: dict, event: dict, event_idx: int | None = None) -> None:
-    visited_events = set(tuple(x) for x in session_doc.get("visited_events", []))
-    key = (event["file"], event["parent"])
-    visited_events.add(key)
-    session_doc["visited_events"] = [list(x) for x in visited_events]
-
-    if event_idx is None:
-        session_doc["cursor"] = int(session_doc.get("cursor", 0)) + 1
-    else:
-        session_doc["cursor"] = event_idx + 1
-
-    if session_doc["cursor"] >= len(session_doc.get("traversal_events", [])):
-        session_doc["done"] = True
-    sessions_col.update_one({"_id": session_doc["_id"]}, {"$set": session_doc})
-
 # ---- Helpers ----
-
-def _get_or_create_session(mongo, repo_id: str) -> Dict[str, Any]:
-    sessions = mongo[WALK_SESSIONS_COL]
-    existing = sessions.find_one({"repo_id": repo_id, "done": {"$ne": True}})
-    if existing:
-        return existing
-
-    entry_points = get_entry_point_files(mongo, repo_id) or []
-    doc = {
-        "_id": str(uuid.uuid4()),
-        "repo_id": repo_id,
-        "entry_points": entry_points,
-        # event-based fields
-        "traversal_events": [],   # list of {file, parent, level}
-        "visited_events": [],     # list of [file, parent]
-        "expanded_files": [],     # list of files expanded once for children
-        "cursor": 0,
-        "done": False,
-    }
-    sessions.insert_one(doc)
-    return doc
 
 
 def clear_repo_walkthrough_sessions(repo_id: str) -> int:
@@ -276,26 +181,6 @@ def clear_repo_walkthrough_sessions(repo_id: str) -> int:
     sessions = mongo[WALK_SESSIONS_COL]
     res = sessions.delete_many({"repo_id": repo_id})
     return getattr(res, "deleted_count", 0)
-
-
-def _seed_events_if_empty(session: dict, sessions_col, repo_id: str):
-    if session.get("traversal_events"):
-        return
-
-    entry_points = session.get("entry_points") or []
-    if not entry_points:
-        # Optional: fallback to first overview file if you like
-        # ep = _pick_any_file_as_entry(get_mongo_client()[MENTAL_MODEL_COL], repo_id)
-        # entry_points = [ep] if ep else []
-        pass
-
-    events = [{"file": ep, "parent": None, "level": 0} for ep in entry_points if ep]
-    session["traversal_events"] = events
-    session["visited_events"] = []
-    session["expanded_files"] = []
-    session["cursor"] = 0
-    session["done"] = False
-    sessions_col.update_one({"_id": session["_id"]}, {"$set": session})
 
 
 # ---- Walkthrough method --
@@ -476,11 +361,13 @@ async def stream_walkthrough_goto(repo_id: str, file_path: str):
     # --- Otherwise, generate new nugget via LLM ---
     llm = GroqLLM()
     system_prompt = (
-        "You are generating a concise, plain-English explanation of a code file.\n"
-        "Explain what this file does, how it fits into the repository, and what responsibilities it has.\n"
+        "You are generating a plain-English walkthrough of a code repository.\n"
+        "Explain the CURRENT FILE and, if a consumer is given, how this file serves that consumer.\n"
         "Guidelines:\n"
-        "- 4–8 lines. No code blocks. Avoid jargon.\n"
-        "- Mention its role and its relationship to other modules if clear."
+        "- Explain the code clearly and concisely.\n"
+        "- Cater to someone who is unfamiliar with the codebase.\n"
+        "- If this is an entry point (no consumer), explain what it starts/boots and what it orchestrates.\n"
+        "- Use dependency lists as context; do not enumerate every import."
     )
 
     user_prompt = (

@@ -8,6 +8,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+
+from .chat_service import stream_chat
 from .llm import GroqLLM
 from .config import Config
 # from .mental_model import MentalModelFetcher
@@ -50,9 +52,10 @@ class QueryRequest(BaseModel):
 
 class WalkthroughRequest(BaseModel):
     repo_id: str
-    depth: int = 2
+    current_file_path: str = None  # Optional current file path
     entry_point: str = None  # Optional entry point file path
     current_level: int = 0  # Current depth level in the walkthrough
+    depth: int = 2  # Max depth for the walkthrough
 
 
 class DefWalkRequest(BaseModel):
@@ -74,33 +77,17 @@ class GotoRequest(BaseModel):
 def dummy_gen():
     yield "This endpoint is under construction. Please check back later."
 
-# @app.post("/query")
-# async def query_repo(request: QueryRequest):
-#     try:
-#         mental_model = mental_model_fetcher.seed_prompt(request.repo_id)
-#         print(f"Processing query for repo: {request.repo_id} with question: {request.question}")
-
-#         repo_overview = {"overview": "Dictquery is a python library that allows users to query nested dictionaries using a simple DSL. It provides parsers and visitors to traverse and extract data from complex dictionary structures."}
-#         out = retrieve_records_planner(
-#             repo_name=request.repo_id,
-#             question=request.question,
-#             repo_overview=repo_overview,
-#             llm=llm,
-#         )
-
-#         gen = answer_with_snippets(
-#             question=request.question,
-#             selection=out,
-#             llm=llm,
-#             repo_root=request.repo_id
-#         )
-        
-#         return StreamingResponse(gen, media_type="text/markdown")
+class ChatRequest(BaseModel):
+    repo_id: str
+    message: str
 
 
-#     except Exception as e:
-#         return {"error": str(e)}
-
+@app.post("/chat")
+async def chat(req: ChatRequest):
+    return StreamingResponse(
+        stream_chat(repo_id=req.repo_id, user_message=req.message),
+        media_type="text/markdown"
+    )
 
 # POST /ingest endpoint to ingest entire code repo folder
 @app.post("/ingest")
@@ -132,7 +119,7 @@ async def get_job_status(job_id: str):
 async def list_repos():
     """List all ingested code repositories."""
     # Implement logic to retrieve and return the list of repositories
-    return {"repos": ["data/dictquery", "data/xai-sdk-python", "data/fastapi"]}
+    return {"repos": ["data/dictquery", "data/xai-sdk-python", "data/fastapi", "data/nanochat"]}
 
 
 @app.get("/repo/architecture")
@@ -146,7 +133,7 @@ async def get_repo_arch(repo_id: str):
 
 
 # Endpoints for repo walkthrough
-@app.post("/walkthrough/repo/start")
+@app.post("/repo/walkthrough/start")
 async def start_walkthrough(request: WalkthroughRequest):
     db_client = get_mongo_client()
     entry_points = get_entry_point_files(db_client, request.repo_id)
@@ -159,23 +146,23 @@ async def start_walkthrough(request: WalkthroughRequest):
         "repo_id": request.repo_id,
     }
 
-@app.post("/walkthrough/repo/next")
+@app.post("/repo/walkthrough/next")
 async def walkthrough_next(request: WalkthroughRequest):
     return StreamingResponse(
         stream_walkthrough_next(
-            request.repo_id, 
-            request.depth, 
-            request.entry_point, 
-            request.current_level
+            repo_id=request.repo_id,
+            current_file_path=request.current_file_path,
+            entry_point=request.entry_point,
+            level=request.current_level
         ),
         media_type="text/markdown"
     )
 
-@app.post("/walkthrough/repo/plan")
+@app.post("/repo/walkthrough/plan")
 async def walkthrough_repo_plan(req: WalkthroughRequest):
     plan = await build_repo_walkthrough_plan(
         repo_id=req.repo_id,
-        depth=2,
+        depth=req.depth,
     )
     return plan
 
@@ -241,7 +228,7 @@ async def list_definitions(repo_id: str, file_path: str):
         "definitions": results
     }
 
-@app.post("/walkthrough/goto")
+@app.post("/repo/walkthrough/goto")
 async def goto_step(req: GotoRequest):
     return StreamingResponse(
         stream_walkthrough_goto(repo_id=req.repo_id, file_path=req.file_path),
