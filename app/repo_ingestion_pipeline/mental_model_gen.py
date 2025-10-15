@@ -27,7 +27,7 @@ from bson import ObjectId
 
 from .core.base import PipelineStage, StageResult
 from ..models.data_model import S3StorageInfo
-from ..db import Neo4jClient, get_neo4j_client, get_mongo_client, attention_db_runtime
+from ..db import Neo4jClient, get_neo4j_client, get_mongo_client
 from ..llm import GroqLLM
 from ..repo_arch_service import build_repo_architecture
 

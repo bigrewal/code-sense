@@ -2,8 +2,6 @@ import json
 import logging
 from contextlib import asynccontextmanager
 import asyncio
-from typing import Any, Dict, List, Set
-from urllib import request
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -12,9 +10,7 @@ from pydantic import BaseModel
 from .chat_service import stream_chat
 from .llm import GroqLLM
 from .config import Config
-# from .mental_model import MentalModelFetcher
-from .retriever_four import retrieve_records_planner, answer_with_snippets
-from .db import get_neo4j_client, init_mongo_client, init_neo4j_client, attention_db_runtime, get_mongo_client, get_entry_point_files, get_repo_summary
+from .db import get_neo4j_client, init_mongo_client, init_neo4j_client, get_mongo_client, get_entry_point_files, get_repo_summary
 from pathlib import Path
 from .repo_ingestion_pipeline import start_ingestion_pipeline
 from .service import fetch_job_status
@@ -73,9 +69,6 @@ class GotoRequest(BaseModel):
     repo_id: str
     file_path: str
 
-
-def dummy_gen():
-    yield "This endpoint is under construction. Please check back later."
 
 class ChatRequest(BaseModel):
     repo_id: str
@@ -166,6 +159,14 @@ async def walkthrough_repo_plan(req: WalkthroughRequest):
     )
     return plan
 
+
+@app.post("/repo/walkthrough/goto")
+async def goto_step(req: GotoRequest):
+    return StreamingResponse(
+        stream_walkthrough_goto(repo_id=req.repo_id, file_path=req.file_path),
+        media_type="text/markdown"
+    )
+
 @app.post("/walkthrough/def/start")
 async def walkthrough_def_start(req: DefWalkRequest):
     return StreamingResponse(
@@ -227,10 +228,3 @@ async def list_definitions(repo_id: str, file_path: str):
         "file_path": file_path,
         "definitions": results
     }
-
-@app.post("/repo/walkthrough/goto")
-async def goto_step(req: GotoRequest):
-    return StreamingResponse(
-        stream_walkthrough_goto(repo_id=req.repo_id, file_path=req.file_path),
-        media_type="text/markdown"
-    )

@@ -1,5 +1,4 @@
 import logging
-from .attention_integration import AttentionDBRuntime
 from neo4j import GraphDatabase
 from pymongo import MongoClient
 from .config import Config
@@ -463,8 +462,6 @@ def get_repo_summary(db_client, repo_id: str) -> str:
     if doc:
         return doc.get("data", "")
     return ""
-
-attention_db_runtime = AttentionDBRuntime(data_root="data")
 
 # Global shared client
 neo4j_client: Neo4jClient = None

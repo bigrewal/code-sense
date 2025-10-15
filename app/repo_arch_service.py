@@ -155,7 +155,8 @@ async def build_repo_architecture(repo_id: str, max_depth: int = 5):
             "You are a senior software architect.\n"
             "Given multiple partial architecture analyses of a repository, produce one coherent, non-redundant, clear architecture overview.\n"
             "Focus on how major components interact, key data/control flows, and entry points.\n"
-            "Keep it under 600 words, professional, and readable."
+            "Keep it professional and readable."
+            "Also include a brief summary of the repo at the top."
         )
         final_prompt = (
             f"Repository ID: {repo_id}\n\n"
@@ -220,7 +221,8 @@ async def build_repo_architecture(repo_id: str, max_depth: int = 5):
             "- Always mention exact file paths in parentheses when referring to components (e.g., (see: api/server.py)).\n"
             "- Call out entry points explicitly using the provided list.\n"
             "- When useful, note simple dependency hints like 'reads from X' or 'invokes Y', referencing file paths.\n"
-            "Constraints: Be factual; do not invent files or components beyond the provided context. Keep under ~700 words."
+            "Constraints: Be factual; do not invent files or components beyond the provided context."
+            "Also include a brief summary of the repo at the top."
         )
         retrieval_user_prompt = (
             "Using ONLY the context below, write a human-readable architecture overview that mirrors the tone and structure of the standard overview, "
