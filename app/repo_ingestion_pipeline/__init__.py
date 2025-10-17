@@ -2,7 +2,6 @@ from ..config import Config
 from ..models.data_model import UploadedRepository, S3StorageInfo
 from .core.pipeline import Pipeline, PipelineConfig
 from .resolve_references import ReferenceResolverStage
-from .code_reader import ChunkLLMProcessorStage
 from .create_repo_graph import ASTProcessorStage
 from .mental_model_gen import MentalModelStage
 from .record_gen import RecordGenStage
