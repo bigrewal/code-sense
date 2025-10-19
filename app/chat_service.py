@@ -35,10 +35,6 @@ async def stream_chat(repo_id: str, user_message: str):
 
     Yields markdown text chunks for streaming (async generator).
     """
-    # Ensure this compiles as an async generator even if we error/return early
-    if False:
-        yield ""
-
     mongo = get_mongo_client()
     mental = mongo[MENTAL_MODEL_COL]
 
@@ -228,10 +224,11 @@ async def _stream_final_answer(
         system_seed
         + "\n\nWhen you answer:\n"
           "- Be precise and complete. If you made assumptions, state them.\n"
+          "- Answer only based on the provided architecture and code snippets.\n"
           "- If code was provided, cite the specific file paths you used.\n"
           "- If the question asks for examples/fixes, include short, focused snippets."
           "- If you did not find relevant code, say so and answer from architecture only."
-          "- If the question is not about the codebase, refuse to answer."     
+          "- If the question is not about the codebase, refuse to answer."
     )
 
     ctx_part = f"Relevant code contexts:\n{ctx_text}\n" if ctx_text else ""
@@ -239,6 +236,7 @@ async def _stream_final_answer(
         f"User Question:\n{user_message}\n\n"
         f"{ctx_part}"
         "Now produce the final answer."
+        "Answer what is asked, nothing more nothing less."
     )
 
     captured: List[str] = []

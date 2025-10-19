@@ -25,18 +25,15 @@ from typing import Dict, List, Tuple, Set, Any
 
 from bson import ObjectId
 
-from .core.base import PipelineStage, StageResult
-from ..models.data_model import S3StorageInfo
 from ..db import Neo4jClient, get_neo4j_client, get_mongo_client
 from ..llm import GroqLLM
 from ..repo_arch_service import build_repo_architecture
 
 
-class MentalModelStage(PipelineStage):
+class MentalModelStage():
     """Stage for generating and storing the hierarchical mental model."""
     
     def __init__(self, config: dict = None):
-        super().__init__("Mental Model Generation", config)
         self.mongo_client = get_mongo_client()
         self.mental_model_collection = self.mongo_client["mental_model"]
         self.llm_client = GroqLLM()
@@ -44,11 +41,9 @@ class MentalModelStage(PipelineStage):
         # self.llm_client.set_params(temperature=0, max_tokens=1024)
         self.job_id = config.get("job_id", "unknown")
     
-    async def execute(self, input_data: dict) -> StageResult:
+    async def run(self, repo_id: str, local_repo_path: Path):
         try:
-            s3_info: S3StorageInfo = input_data["s3_info"]
-            repo_id = s3_info.repo_info.repo_id
-            repo_path = s3_info.local_path
+            repo_path = local_repo_path
 
             self.neo4j_client: Neo4jClient = get_neo4j_client()
             
@@ -63,25 +58,11 @@ class MentalModelStage(PipelineStage):
             await self.gen_repo_summary_from_file_overview(repo_id)
             await self._set_potential_entry_points(insights, repo_id)
             await build_repo_architecture(repo_id)
-
-            # self._write_to_md(insights, [], repo_id, dir_tree)
-            # # self._write_to_jsonl(insights, file_summaries, repo_id, dir_tree)
-            # self._write_to_jsonl_v2(insights, repo_id)
-
-            # await attention_db_runtime.build_keybank(repo_id)
-
-            print(f"Job {self.job_id}: Mental model generated and written to MD file")
-            
-            return StageResult(
-                success=True,
-                data={"repo_id": repo_id},
-                metadata={"stage": self.name}
-            )
         
         except Exception as e:
             traceback.print_exc()
             print(f"Job {self.job_id}: Mental model generation error: {str(e)}")
-            return StageResult(success=False, error=str(e))
+
         
     async def gen_repo_summary_from_file_overview(self, repo_id: str) -> str:
         """Generate a repo summary from existing BRIEF_FILE_OVERVIEW documents in MongoDB.

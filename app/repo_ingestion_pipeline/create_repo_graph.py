@@ -10,7 +10,6 @@ import tree_sitter as ts
 from tree_sitter_languages import get_parser, get_language
 import traceback
 
-from .core.base import PipelineStage, StageResult
 from ..models.data_model import (
     S3StorageInfo, ReferenceResolutionResult, CodeFile, 
     ASTNode, CodeGraph
@@ -19,18 +18,17 @@ from ..db import get_neo4j_client
 
 PYTHON_LANGUAGE_DEFS = {"function_definition", "class_definition"}
 
-class ASTProcessorStage(PipelineStage):
+class ASTProcessorStage():
     """Stage for AST creation and graph database population."""
     
     def __init__(self, config: dict = None):
-        super().__init__("AST Processing", config)
         self.supported_languages = config.get("supported_languages", ["python", "javascript", "typescript"])
         self.neo4j_client = get_neo4j_client()
     
         self.max_file_size = config.get("max_file_size", 1024 * 1024)  # 1MB
         self.job_id = config.get("job_id", "unknown")
     
-    async def execute(self, input_data: dict) -> StageResult:
+    async def run(self, local_path: Path, repo_id: str, reference_results: ReferenceResolutionResult) -> None:
         """
         Process AST and create graph in Neo4j.
         
@@ -41,12 +39,7 @@ class ASTProcessorStage(PipelineStage):
             StageResult with CodeGraph data
         """
         try:
-            s3_info: S3StorageInfo = input_data["s3_info"]
-            # s3_info: S3StorageInfo = input_data
-            reference_results: ReferenceResolutionResult = input_data["reference_results"]
-            # print(f"Job {self.job_id}: Resolved references: {reference_results.references}")
-            repo_path = s3_info.local_path
-            repo_id = s3_info.repo_info.repo_id
+            repo_path = local_path
             
             print(f"Job {self.job_id}: Starting AST processing for repository: {repo_id}")
             
@@ -93,36 +86,15 @@ class ASTProcessorStage(PipelineStage):
             # Store in Neo4j
             await self._store_in_neo4j(code_graph)
             
-            print(
-                f"Job {self.job_id}: AST processing completed: {len(all_nodes)} nodes, "
-                f"{len(all_edges)} edges created"
-            )
-            
-            return StageResult(
-                success=True,
-                data={
-                    "s3_info": s3_info,
-                    # "reference_results": reference_results,
-                    "reference_results": [],
-                    "repo_name": repo_id,
-                },
-                metadata={
-                    "stage": self.name,
-                    "files_processed": len(code_files),
-                    "total_nodes": len(all_nodes),
-                    "total_edges": len(all_edges)
-                }
-            )
-            
         except Exception as e:
             traceback.print_exc()
             print(f"Job {self.job_id}: AST processing error: {str(e)}")
-            return StageResult(
-                success=False,
-                data=None,
-                metadata={"stage": self.name},
-                error=str(e)
-            )
+            # return StageResult(
+            #     success=False,
+            #     data=None,
+            #     metadata={"stage": self.name},
+            #     error=str(e)
+            # )
     
     async def _discover_code_files(self, repo_path: Path) -> List[CodeFile]:
         """Discover and classify code files in the repository."""

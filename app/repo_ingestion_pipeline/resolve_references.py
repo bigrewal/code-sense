@@ -7,21 +7,19 @@ import time
 from typing import Any
 from pathlib import Path
 
-from .core.base import PipelineStage, StageResult
-from ..models.data_model import ReferenceResolutionResult, S3StorageInfo
+from ..models.data_model import ReferenceResolutionResult
 import tree_sitter_reference_resolver as tsrr
 
 
-class ReferenceResolverStage(PipelineStage):
+class ReferenceResolver():
     """Stage for resolving code references using tree-sitter."""
     
     def __init__(self, config: dict = None):
-        super().__init__("Reference Resolution", config)
         self.include_unresolved = config.get("include_unresolved", True)
         self.reuse_database = config.get("reuse_database", False)
         self.pipeline_id = config.get("pipeline_id", "unknown")
-    
-    async def execute(self, input_data: S3StorageInfo) -> StageResult:
+
+    async def run(self, repo_path: Path, repo_id: str) -> ReferenceResolutionResult:
         """
         Resolve references in the downloaded repository.
         
@@ -32,14 +30,13 @@ class ReferenceResolverStage(PipelineStage):
             StageResult with ReferenceResolutionResult data
         """
         try:
-            repo_path = input_data.local_path
             print(f"Job {self.pipeline_id}: Starting reference resolution for: {repo_path}")
             
             # Configure the resolver
             config = tsrr.ResolverConfig(
                 include_unresolved=self.include_unresolved,
                 reuse_database=self.reuse_database,
-                db_filename = f"stack-graphs-{input_data.repo_info.repo_id.split('/')[-1]}.db"
+                db_filename = f"stack-graphs-{repo_id.split('/')[-1]}.db"
 
             )
             
@@ -86,35 +83,11 @@ class ReferenceResolverStage(PipelineStage):
                 processing_time=processing_time
             )
             
-            print(
-                f"Job {self.pipeline_id}: Reference resolution completed: "
-                f"{len(references)} total, {resolved_count} resolved, "
-                f"{unresolved_count} unresolved in {processing_time:.2f}s"
-            )
-            
-            return StageResult(
-                success=True,
-                data={
-                    "s3_info": input_data,
-                    "reference_results": result
-                },
-                metadata={
-                    "stage": self.name,
-                    "total_references": len(references),
-                    "resolved_count": resolved_count,
-                    "unresolved_count": unresolved_count,
-                    "processing_time": processing_time
-                }
-            )
+            return result
             
         except Exception as e:
             print(f"Job {self.pipeline_id}: Reference resolution error: {str(e)}")
-            return StageResult(
-                success=False,
-                data=None,
-                metadata={"stage": self.name},
-                error=str(e)
-            )
+            raise e
     
     def validate_config(self) -> bool:
         """Validate stage configuration."""

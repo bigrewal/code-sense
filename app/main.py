@@ -84,8 +84,8 @@ async def chat(req: ChatRequest):
 
 # POST /ingest endpoint to ingest entire code repo folder
 @app.post("/ingest")
-async def ingest_repo(repo_path: str = "dictquery", job_id: str = None):
-    local_repo_path = Path("data") / repo_path
+async def ingest_repo(repo_name: str, job_id: str = None):
+    local_repo_path = Path("data") / repo_name
 
     # Return HTTP status code 404 if repository not found
     if not local_repo_path.exists():
