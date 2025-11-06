@@ -165,6 +165,7 @@ class Neo4jClient:
             # Group edges by type for efficient processing
             contains_edges = []
             references_edges = []
+            depends_on_edges = []
             
             for edge in batch:
                 edge_data = {
@@ -177,6 +178,9 @@ class Neo4jClient:
                     contains_edges.append(edge_data)
                 elif edge['type'] == 'REFERENCES':
                     references_edges.append(edge_data)
+                elif edge['type'] == 'DEPENDS_ON':
+                    depends_on_edges.append(edge_data)
+
             
             # Create CONTAINS relationships
             if contains_edges:
@@ -206,6 +210,21 @@ class Neo4jClient:
                     logger.debug(f"Created {len(references_edges)} REFERENCES edges in batch {batch_num}")
                 except Exception as e:
                     logger.error(f"Failed to create REFERENCES edges in batch {batch_num}: {e}")
+                    raise
+            
+            # Create DEPENDS_ON relationships
+            if depends_on_edges:
+                depends_on_query = """
+                UNWIND $edges AS edge
+                MATCH (source:ASTNode {node_id: edge.source})
+                MATCH (target:ASTNode {node_id: edge.target})
+                CREATE (source)-[:DEPENDS_ON {sequence: edge.sequence}]->(target)
+                """
+                try:
+                    session.run(depends_on_query, edges=depends_on_edges)
+                    logger.debug(f"Created {len(depends_on_edges)} DEPENDS_ON edges in batch {batch_num}")
+                except Exception as e:
+                    logger.error(f"Failed to create DEPENDS_ON edges in batch {batch_num}: {e}")
                     raise
             
             logger.debug(f"Processed edge batch {batch_num}/{total_batches}")
@@ -284,6 +303,26 @@ class Neo4jClient:
             upstream = sorted([p for p in (rec["upstream"] or []) if p])
             downstream = sorted([p for p in (rec["downstream"] or []) if p])
             return upstream, downstream
+
+    def file_dependencies_v2(self, file_path: str, repo_id: str) -> Dict[str, List[str]]:
+        """Get files that interact with the given file via cross-file references."""
+        down_stream_query = """
+        MATCH (ref:ASTNode {repo_id: $repo_id, file_path: $file_path})
+                -[:DEPENDS_ON]->(ident:ASTNode)
+        RETURN ident.file_path
+        """
+
+        up_stream_query = """
+        MATCH (ref:ASTNode {repo_id: $repo_id})
+                -[:DEPENDS_ON]->(ident:ASTNode {file_path: $file_path})
+        RETURN ref.file_path
+        """
+
+        with self.driver.session() as session:
+            downstream_files = [record["ident.file_path"] for record in session.run(down_stream_query, repo_id=repo_id, file_path=file_path)]
+            upstream_files = [record["ref.file_path"] for record in session.run(up_stream_query, repo_id=repo_id, file_path=file_path)]
+
+        return upstream_files, downstream_files
 
     def _fetch_def_nodes(self, repo_id: str) -> List[Dict[str, Any]]:
         """
@@ -447,20 +486,44 @@ class MyMongoClient:
     
 def get_entry_point_files(db_client, repo_id: str) -> List[str]:
     collection = db_client["mental_model"]
-    doc = collection.find_one({"repo_id": repo_id, "document_type": "REPO_SUMMARY"})
+    doc = collection.find_one({"repo_id": repo_id, "document_type": "REPO_ENTRY_POINTS"})
     if doc:
-        return doc.get("entry_points", [])
+        absolute_paths = doc.get("entry_points", [])
+        
+        relative_paths = []
+        for abs_path in absolute_paths:
+            # Check and remove the repo_id prefix from the absolute path
+            if abs_path.startswith(repo_id):
+                rel_path = abs_path[len(repo_id):]
+                if rel_path.startswith("/") or rel_path.startswith("\\"):
+                    rel_path = rel_path[1:]
+                relative_paths.append(rel_path)
+            else:
+                relative_paths.append(abs_path)  # Fallback to absolute path if prefix not found
+        
+        return relative_paths
     return []
     # entry_point_files = []
     # for doc in docs:
     #     entry_point_files.append(doc.get("file_path"))
     # return entry_point_files
 
+def get_potential_entry_points(db_client, repo_id: str) -> List[str]:
+    collection = db_client["mental_model"]
+    docs = collection.find({"repo_id": repo_id, "document_type": "POTENTIAL_ENTRY_POINTS"})
+    entry_point_files = []
+    
+    # Each docs contains the `file_path` field
+    for doc in docs:
+        entry_point_files.append(doc.get("file_path"))
+
+    return entry_point_files
+
 def get_repo_summary(db_client, repo_id: str) -> str:
     collection = db_client["mental_model"]
     doc = collection.find_one({"repo_id": repo_id, "document_type": "REPO_SUMMARY"})
     if doc:
-        return doc.get("data", "")
+        return doc.get("data", "")  
     return ""
 
 # Global shared client

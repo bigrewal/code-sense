@@ -5,30 +5,53 @@ Creates AST for code files and builds graph in Neo4j.
 
 import uuid
 from pathlib import Path
-from typing import Any, List
+from typing import Any, Dict, List, Tuple
 import tree_sitter as ts
 from tree_sitter_languages import get_parser, get_language
 import traceback
 
 from ..models.data_model import (
-    S3StorageInfo, ReferenceResolutionResult, CodeFile, 
+    ReferenceResolutionResult, CodeFile, 
     ASTNode, CodeGraph
 )
+from ..parse_dependencies import parse_dependencies
 from ..db import get_neo4j_client
 
-PYTHON_LANGUAGE_DEFS = {"function_definition", "class_definition"}
+LANGUAGE_DEFINITION_MAP = {
+    "python": {"function_definition", "class_definition"},
+    "javascript": {
+        "function_declaration", "class_declaration", "method_definition",
+        "arrow_function", "generator_function", "variable_declarator"
+    },
+    "typescript": {
+        "function_declaration", "class_declaration", "method_definition",
+        "arrow_function", "variable_declarator",
+        "interface_declaration", "type_alias_declaration",
+        "enum_declaration", "abstract_class_declaration",
+        "module_declaration"
+    },
+    "java": {
+        "class_declaration", "interface_declaration", "enum_declaration",
+        "annotation_type_declaration", "method_declaration",
+        "constructor_declaration", "field_declaration",
+        "record_declaration"
+    }
+}
+
 
 class ASTProcessorStage():
     """Stage for AST creation and graph database population."""
     
     def __init__(self, config: dict = None):
-        self.supported_languages = config.get("supported_languages", ["python", "javascript", "typescript"])
+        self.supported_languages = config.get("supported_languages", ["python", "javascript", "typescript", "java"])
         self.neo4j_client = get_neo4j_client()
     
         self.max_file_size = config.get("max_file_size", 1024 * 1024)  # 1MB
         self.job_id = config.get("job_id", "unknown")
+        self.language_defs = LANGUAGE_DEFINITION_MAP
+
     
-    async def run(self, local_path: Path, repo_id: str, reference_results: ReferenceResolutionResult) -> None:
+    async def run(self, local_path: Path, repo_id: str, reference_results: List[dict]) -> None:
         """
         Process AST and create graph in Neo4j.
         
@@ -45,8 +68,12 @@ class ASTProcessorStage():
             
             # Discover code files
             code_files = await self._discover_code_files(repo_path)
-            print(f"Job {self.job_id}: Found {len(code_files)} code files to process")
-            
+            # print(f"Job {self.job_id}: Found {len(code_files)} code files to process")
+
+            # Resolve file dependencies
+            # code_file_dependencies: Dict[str, List[str]] = parse_dependencies(repo_path)
+            # file_nodes, file_edges = await self._process_file_deps(code_file_dependencies)
+
             # Process each file and create AST
             # Create shared lookup dictionary
             global_leaf_lookup = {}
@@ -55,24 +82,27 @@ class ASTProcessorStage():
 
             # First pass: Process all files to build AST and populate global lookup
             for idx, file in enumerate(code_files, 1):
-                # print(f"Job {self.job_id}: Processing file {idx}/{len(code_files)}: {file.relative_path}")
                 nodes, edges = await self._process_file_ast(file, repo_id, global_leaf_lookup)
                 all_nodes.extend(nodes)
                 all_edges.extend(edges)
 
-            # print(f"Job {self.job_id}: Gloabal leaf created: {global_leaf_lookup}")
+            # # print(f"Job {self.job_id}: Gloabal leaf created: {global_leaf_lookup}")
 
-            reference_edges = self._create_reference_edges(all_nodes, reference_results.references, global_leaf_lookup)
+            reference_edges = self._create_reference_edges(all_nodes, reference_results, global_leaf_lookup)
             all_edges.extend(reference_edges)
 
-            print(
-                f"Job {self.job_id}: Pre-Pruning: {len(all_nodes)} nodes, "
-                f"{len(all_edges)} edges created"
-            )
+            # print(
+            #     f"Job {self.job_id}: Pre-Pruning: {len(all_nodes)} nodes, "
+            #     f"{len(all_edges)} edges created"
+            # )
 
             all_nodes, all_edges = self._prune_graph(all_nodes, all_edges)
 
-            print(f"Job {self.job_id}: Created {len(reference_edges)} reference edges")
+            # all_nodes.extend(file_nodes)
+            # all_edges.extend(file_edges)
+
+
+            print(f"Job {self.job_id}: Created {len(all_edges)} edges")
             
             # Create graph representation
             code_graph = CodeGraph(
@@ -89,12 +119,6 @@ class ASTProcessorStage():
         except Exception as e:
             traceback.print_exc()
             print(f"Job {self.job_id}: AST processing error: {str(e)}")
-            # return StageResult(
-            #     success=False,
-            #     data=None,
-            #     metadata={"stage": self.name},
-            #     error=str(e)
-            # )
     
     async def _discover_code_files(self, repo_path: Path) -> List[CodeFile]:
         """Discover and classify code files in the repository."""
@@ -103,10 +127,9 @@ class ASTProcessorStage():
         # File extension to language mapping
         lang_map = {
             ".py": "python",
-            ".js": "javascript",
-            ".ts": "typescript",
-            ".jsx": "javascript",
-            ".tsx": "typescript"
+            ".java": "java",
+            ".scala": "scala",
+            ".rs": "rust",
         }
         
         for file_path in repo_path.rglob("*"):
@@ -122,7 +145,7 @@ class ASTProcessorStage():
                 continue
 
             # Check if the file is in a test directory
-            if "tests" in file_path.parts:
+            if "tests" in file_path.parts or "test" in file_path.parts:
                 continue
 
             try:
@@ -149,6 +172,81 @@ class ASTProcessorStage():
         
         return code_files
     
+    # This only creates file-to-file dependency nodes and edges for code files where Stack graphs fail us.
+    async def _process_file_deps(self, file_dependencies: Dict[str, List[str]]) -> Tuple[List[ASTNode], List[dict]]:
+        """
+        Build a lightweight AST/graph for file-to-file dependencies.
+
+        Given a mapping of {source_file: [target_file, ...]}, this method:
+        - Creates one ASTNode per unique file (node_type="file").
+        - Creates directed edges from each source file to each target file.
+        - Uses edge type "DEPENDS_ON" to distinguish from structural "CONTAINS" edges.
+
+        Returns:
+            (nodes, edges): A tuple where `nodes` is a list of ASTNode instances,
+                            and `edges` is a list of edge dicts like in _process_file_ast.
+        """
+        nodes: List[ASTNode] = []
+        edges: List[dict] = []
+
+        if not file_dependencies:
+            return nodes, edges
+
+        # Collect all unique files (both sources and targets)
+        unique_files: set[str] = set()
+        for src, tgts in file_dependencies.items():
+            if src:
+                unique_files.add(src)
+            for tgt in tgts or []:
+                if tgt:
+                    unique_files.add(tgt)
+
+        # Create a node per unique file
+        file_node_map: Dict[str, str] = {}  # file_path -> node_id
+        for file_path in sorted(unique_files):
+            # Construct a stable node_id. We don't have repo_id here, so namespace with job_id and "scala"
+            node_id = f"{self.job_id}:scala:{file_path}:0:0:file"
+
+            node = ASTNode(
+                node_id=node_id,
+                node_type="file",
+                start_line=0,
+                start_column=0,
+                end_line=0,
+                end_column=0,
+                parent_id=None,
+                children_ids=[],
+                is_definition=True,
+                file_path=str(file_path),
+            )
+            # Optional metadata, in line with how _process_file_ast adds dynamic fields
+            node.name = str(file_path)
+
+            nodes.append(node)
+            file_node_map[file_path] = node_id
+
+        # Create dependency edges: source_file --DEPENDS_ON--> target_file
+        for src, tgts in file_dependencies.items():
+            if not src or src not in file_node_map:
+                continue
+
+            src_id = file_node_map[src]
+            sequence = 1
+            for tgt in tgts or []:
+                tgt_id = file_node_map.get(tgt)
+                if not tgt_id:
+                    continue
+
+                edges.append({
+                    "source": src_id,
+                    "target": tgt_id,
+                    "type": "DEPENDS_ON",
+                    "sequence": sequence,
+                })
+                sequence += 1
+
+        return nodes, edges
+
     async def _process_file_ast(self, code_file: CodeFile, repo_id: str, global_leaf_lookup: dict = None) -> tuple[List[ASTNode], List[dict]]:
         """Process a single file and create AST nodes and edges."""
         try:
@@ -181,7 +279,7 @@ class ASTProcessorStage():
                     end_column=current_node.end_point[1],
                     parent_id=parent_id,
                     children_ids=[],
-                    is_definition= current_node.type in PYTHON_LANGUAGE_DEFS,
+                    is_definition = current_node.type in self.language_defs.get(code_file.language, set()),
                     file_path=str(code_file.relative_path),
                 )
                 
@@ -227,7 +325,6 @@ class ASTProcessorStage():
                         node_queue.append((child, node_id, edge_sequence))
                         edge_sequence += 1
             
-            # print(f"Job {self.job_id}: Processed {code_file.relative_path}: {len(nodes)} nodes")
             return nodes, edges
             
         except Exception as e:
@@ -240,8 +337,6 @@ class ASTProcessorStage():
         try:
             print(f"Job {self.job_id}: Storing graph in Neo4j: {code_graph.total_nodes} nodes, {code_graph.total_edges} edges")
             
-            # TODO: Implement actual Neo4j storage
-            # For now, simulate successful storage
             await self.neo4j_client.store_graph(code_graph)
             
             print(f"Job {self.job_id}: Graph successfully stored in Neo4j")
@@ -250,23 +345,47 @@ class ASTProcessorStage():
             print(f"Job {self.job_id}: Failed to store graph in Neo4j: {str(e)}")
             raise
     
-    def _create_reference_edges(self, nodes: List[ASTNode], references_dict: dict, global_leaf_lookup: dict) -> List[dict]:
+    def _create_reference_edges(self, nodes: List[ASTNode], references_list: List[Dict], global_leaf_lookup: dict) -> List[dict]:
         """Create edges between references and their definitions."""
 
         print(f"Job {self.job_id}: Creating reference edges from references dictionary")
         reference_edges = []
         nodes_by_id = {node.node_id: node for node in nodes}
         
-        for ref_location, definitions in references_dict.items():
+        # Example references_list format:
+        # [{
+        #     "reference": {
+        #     "file_path": "ann/src/main/scala/com/twitter/ann/scalding/offline/KnnTruthSetGenerator.scala",
+        #     "line": 59,
+        #     "column": 7,
+        #     "location_string": "ann/src/main/scala/com/twitter/ann/scalding/offline/KnnTruthSetGenerator.scala:59:7"
+        #     },
+        #     "definitions": [
+        #     {
+        #         "file_path": "ann/src/main/scala/com/twitter/ann/scalding/offline/KnnHelper.scala",
+        #         "line": 168,
+        #         "column": 6,
+        #         "location_string": "ann/src/main/scala/com/twitter/ann/scalding/offline/KnnHelper.scala:168:6"
+        #     }
+        #     ]
+        # }]
+        for ref_info in references_list:
+            definitions = ref_info.get("definitions", [])
             if not definitions:
                 continue
                 
             # Get the last (most specific) definition
             # for def_location in definitions:
-            def_location = definitions[-1]
-            ref_file, ref_line, ref_col = ref_location
-            def_file, def_line, def_col = def_location
-            
+
+            ref_file = ref_info["reference"]["file_path"]
+            ref_line = ref_info["reference"]["line"]
+            ref_col = ref_info["reference"]["column"]
+
+            def_location = definitions[0]
+            def_file = def_location["file_path"]
+            def_line = def_location["line"]
+            def_col = def_location["column"]
+
             # Find reference node
             ref_node_id = self._find_node_at_location(ref_file, ref_line, ref_col, global_leaf_lookup)
             if not ref_node_id:
@@ -324,6 +443,7 @@ class ASTProcessorStage():
         return reference_edges
 
     def _find_node_at_location(self, file_path: str, line: int, col: int, global_leaf_lookup: dict) -> str:
+        # print(f"Job {self.job_id}: Finding node at {file_path}:{line}:{col}")
         """Find the AST node ID at the given location."""
         for (lookup_file, start_line, start_col, end_line, end_col), node_id in global_leaf_lookup.items():
             if (lookup_file == file_path and 

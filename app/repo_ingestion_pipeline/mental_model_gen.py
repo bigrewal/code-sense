@@ -18,17 +18,82 @@ from collections import deque
 from tqdm import tqdm
 
 import asyncio
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Tuple, Set, Any
+import re
+import ast
 
 
 from bson import ObjectId
 
 from ..db import Neo4jClient, get_neo4j_client, get_mongo_client
 from ..llm import GroqLLM
-from ..repo_arch_service import build_repo_architecture
+from ..repo_arch_service import build_repo_architecture_v2
 
+
+# --- add this helper anywhere in the class/file (module-level is fine) ---
+def _safe_json_loads(text: str, default_obj=None):
+    """
+    Attempt to parse sloppy LLM JSON robustly.
+    - Strips code fences and prose around JSON
+    - Normalizes smart quotes
+    - Removes JS-style comments
+    - Removes trailing commas
+    - Extracts the largest balanced {...} block
+    - Falls back to ast.literal_eval for single-quoted dicts
+    Returns default_obj (or {}) on failure.
+    """
+    if default_obj is None:
+        default_obj = {}
+
+    if not isinstance(text, str):
+        return default_obj
+
+    s = text.strip()
+
+    # 1) Strip code fences ```json ... ``` or ``` ... ```
+    s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*```$", "", s)
+
+    # 2) Normalize smart quotes
+    s = s.replace("\u201c", '"').replace("\u201d", '"').replace("\u201e", '"').replace("\u201f", '"')
+    s = s.replace("\u2018", "'").replace("\u2019", "'").replace("\u2032", "'").replace("\u2033", '"')
+
+    # 3) Remove JS-style comments
+    s = re.sub(r"//.*?$", "", s, flags=re.MULTILINE)                  # // line comments
+    s = re.sub(r"/\*.*?\*/", "", s, flags=re.DOTALL)                  # /* block comments */
+
+    # 4) Extract the largest balanced JSON object via brace stack
+    def extract_largest_braced_block(txt: str):
+        starts = []
+        best = None
+        for i, ch in enumerate(txt):
+            if ch == "{":
+                starts.append(i)
+            elif ch == "}":
+                if starts:
+                    start = starts.pop()
+                    cand = txt[start:i+1]
+                    if (best is None) or (len(cand) > len(best)):
+                        best = cand
+        return best
+
+    candidate = extract_largest_braced_block(s) or s
+
+    # 5) Remove trailing commas before } or ]
+    candidate = re.sub(r",\s*([}\]])", r"\1", candidate)
+
+    # 6) Try strict json
+    try:
+        return json.loads(candidate)
+    except Exception:
+        pass
+
+    # 7) Try literal_eval (handles single quotes)
+    try:
+        return ast.literal_eval(candidate)
+    except Exception:
+        return default_obj
 
 class MentalModelStage():
     """Stage for generating and storing the hierarchical mental model."""
@@ -52,209 +117,39 @@ class MentalModelStage():
             # Step 1: Build directory tree from file paths
             dir_tree = self._build_dir_tree(repo_id)
             
-            insights, ignored_files = await self.generate_repo_overview_2(dir_tree, repo_id)
+            insights, ignored_files = await self.identify_critical_files(dir_tree, repo_id)
             print(f"Job {self.job_id}: GENERATED repo overview with {len(insights)} insights, ignoring {len(ignored_files)} files")
             # repo_summary = await self.generate_repo_summary(insights, repo_id)
-            await self.gen_repo_summary_from_file_overview(repo_id)
+            # await self.find_entry_points(repo_id)
             await self._set_potential_entry_points(insights, repo_id)
-            await build_repo_architecture(repo_id)
+            await build_repo_architecture_v2(repo_id)
         
         except Exception as e:
             traceback.print_exc()
             print(f"Job {self.job_id}: Mental model generation error: {str(e)}")
 
-        
-    async def gen_repo_summary_from_file_overview(self, repo_id: str) -> str:
-        """Generate a repo summary from existing BRIEF_FILE_OVERVIEW documents in MongoDB.
-        Produces a single summary + a validated list of entry points (subset of repo files).
-        Handles large corpora via map-reduce with strict char budgets per LLM call.
+    async def find_entry_points(self, repo_id: str) -> list:
+        """Identify entry points in the repository from existing BRIEF_FILE_OVERVIEW documents.
+        Returns a validated list of entry point file paths.
+        Minimizes information loss by processing all files together when possible.
         """
         import asyncio
         import json
         from datetime import datetime, timezone
 
-        # ---- constants & helpers ----
-        # 1 token ≈ 4 chars. Keep well under 80k chars to include prompt & JSON headroom.
-        MAX_CHARS_PER_CALL = 75000
-        MAP_CONCURRENCY = 4  # parallelism for map stage
+        # 1 token ≈ 4 chars. Conservative budget for context + response overhead
+        MAX_CHARS_PER_CALL = 70000
+        PROMPT_OVERHEAD = 2000
 
-        # Check MongoDB for existing REPO_SUMMARY. if exists, skip.
-        existing_summary = self.mental_model_collection.find_one(
-            {"repo_id": repo_id, "document_type": "REPO_SUMMARY"}
+        # Check MongoDB for existing entry points
+        existing = self.mental_model_collection.find_one(
+            {"repo_id": repo_id, "document_type": "REPO_ENTRY_POINTS"}
         )
-        if existing_summary:
-            print(f"Job {self.job_id}: REPO_SUMMARY already exists for repo {repo_id}, skipping write.")
-            return existing_summary["data"], existing_summary["entry_points"]
+        if existing:
+            print(f"Job {self.job_id}: REPO_ENTRY_POINTS already exists for repo {repo_id}, skipping.")
+            return existing.get("entry_points", [])
 
-        def serialize_pairs(pairs):
-            # Each item as:
-            # FILE: <path>\nSUMMARY: <summary>\n---
-            # Keep it simple and deterministic.
-            lines = []
-            for p in pairs:
-                fp = p["file_path"]
-                sm = (p["summary"] or "").strip()
-                lines.append(f"FILE: {fp}\nSUMMARY: {sm}\n---")
-            return "\n".join(lines)
-
-        def chunk_pairs(pairs, max_chars=MAX_CHARS_PER_CALL, overhead=15000):
-            """Greedy packing into chunks under (max_chars - overhead)."""
-            chunks = []
-            cur = []
-            cur_len = 0
-            limit = max_chars - overhead
-            for p in pairs:
-                item_txt = f"FILE: {p['file_path']}\nSUMMARY: {(p['summary'] or '').strip()}\n---\n"
-                if cur and cur_len + len(item_txt) > limit:
-                    chunks.append(cur)
-                    cur = []
-                    cur_len = 0
-                cur.append(p)
-                cur_len += len(item_txt)
-            if cur:
-                chunks.append(cur)
-            return chunks
-
-        async def llm_map_chunk(chunk_pairs_list):
-            """Call LLM on one chunk and return parsed JSON with chunk_summary & candidates."""
-            system_prompt = (
-                "Repository name: " + repo_id + "\n\n"
-                "You are summarizing a subset of repository files.\n"
-                "Given file-path + brief summaries, produce:\n"
-                "1) 'chunk_summary': 5–10 concise bullets that capture what these files collectively do.\n"
-                "2) 'candidate_entry_points': only file paths from THIS CHUNK whose summaries clearly indicate they start/launch/boot/serve as CLI.\n"
-                "   - Base this ONLY on the summaries provided.\n"
-                "Return STRICT JSON: {\"chunk_summary\": [...], \"candidate_entry_points\": [..]}"
-            )
-            # Serialize only this chunk
-            serialized = serialize_pairs(chunk_pairs_list)
-            user_prompt = (
-                "FILES & SUMMARIES:\n"
-                "<<<\n" + serialized + "\n>>>\n\n"
-                "Return STRICT JSON with keys: chunk_summary (list of strings) and candidate_entry_points (list of file paths from this chunk)."
-            )
-            out = await self.llm_client.generate_async(
-                prompt=user_prompt,
-                system_prompt=system_prompt,
-                reasoning_effort="medium",
-                temperature=0.0,
-            )
-            text = (out or "").strip()
-            # Parse tolerant
-            try:
-                obj = json.loads(text)
-            except Exception:
-                # try to extract first {...}
-                import re
-                m = re.search(r"\{.*\}", text, flags=re.DOTALL)
-                obj = json.loads(m.group(0)) if m else {"chunk_summary": [], "candidate_entry_points": []}
-            # Normalize
-            chunk_summary = obj.get("chunk_summary") or []
-            if isinstance(chunk_summary, str):
-                chunk_summary = [chunk_summary]
-            candidates = [c for c in (obj.get("candidate_entry_points") or []) if isinstance(c, str)]
-            return {"chunk_summary": chunk_summary, "candidate_entry_points": candidates}
-
-        async def map_stage(pairs):
-            """Process all chunks in parallel with bounded concurrency."""
-            chunks = chunk_pairs(pairs)
-            sem = asyncio.Semaphore(MAP_CONCURRENCY)
-            results = []
-
-            async def run_one(ch):
-                async with sem:
-                    return await llm_map_chunk(ch)
-
-            tasks = [asyncio.create_task(run_one(ch)) for ch in chunks]
-            for t in asyncio.as_completed(tasks):
-                results.append(await t)
-            return results
-
-        def build_reduce_docs(map_results):
-            """Flatten map outputs into reduce-ready docs."""
-            all_bullets = []
-            all_candidates = []
-            for r in map_results:
-                all_bullets.extend(r.get("chunk_summary", []))
-                all_candidates.extend(r.get("candidate_entry_points", []))
-            return all_bullets, all_candidates
-
-        async def reduce_once(bullets, candidates, allowed_file_paths):
-            """One reduce pass: compress bullets and reconcile candidates."""
-            import textwrap
-            # Prepare text; pack into budget
-            bullet_text = "\n".join(f"- {b}" for b in bullets)
-            # If too long, chunk bullets and summarize again
-            blocks = []
-            cur = []
-            cur_len = 0
-            for b in bullets:
-                line = f"- {b}\n"
-                if cur_len + len(line) > (MAX_CHARS_PER_CALL - 3000):
-                    blocks.append(cur)
-                    cur = []
-                    cur_len = 0
-                cur.append(b)
-                cur_len += len(line)
-            if cur:
-                blocks.append(cur)
-
-            # If multiple blocks, summarize each block, then summarize the summaries.
-            if len(blocks) > 1:
-                block_summaries = []
-                for blk in blocks:
-                    sys = (
-                        "You are compressing bullet points about a codebase into 5–8 bullets, preserving core themes.\n"
-                        "Return strict JSON: {\"bullets\": [..]}"
-                    )
-                    usr = "BULLETS:\n" + "\n".join(f"- {x}" for x in blk) + "\n\nReturn JSON with key 'bullets'."
-                    out = await self.llm_client.generate_async(
-                        prompt=usr, system_prompt=sys, reasoning_effort="low", temperature=0.0
-                    )
-                    try:
-                        obj = json.loads(out)
-                        block_summaries.extend(obj.get("bullets", []))
-                    except Exception:
-                        block_summaries.extend(blk[:8])  # fallback
-                bullets = block_summaries
-
-            # Now final reduce: produce final summary + entry points
-            allowed_paths_text = "\n".join(sorted(allowed_file_paths))
-            sys_final = (
-                "You are producing a single, clear repository summary and confirming entry points.\n"
-                "Rules:\n"
-                "- Use only the provided bullets (they came from file summaries) to write a ~300–400 word overview.\n"
-                "- For entry points, choose ONLY from the ALLOWED_PATHS list and ONLY if bullets imply they start/launch/serve/CLI/etc.\n"
-                "- Return STRICT JSON with keys: 'repo_summary' (string) and 'entry_points' (list of strings from ALLOWED_PATHS)."
-            )
-            usr_final = (
-                "BULLETS:\n" + "\n".join(f"- {b}" for b in bullets) + "\n\n"
-                "CANDIDATE ENTRY POINT HINTS (from earlier chunks):\n" + "\n".join(f"- {c}" for c in set(candidates)) + "\n\n"
-                "ALLOWED_PATHS (must choose entry points only from this list):\n" + allowed_paths_text + "\n\n"
-                "Return STRICT JSON with keys 'repo_summary' and 'entry_points'."
-            )
-            final_out = await self.llm_client.generate_async(
-                prompt=usr_final,
-                system_prompt=sys_final,
-                reasoning_effort="medium",
-                temperature=0.0,
-            )
-            final_text = (final_out or "").strip()
-            try:
-                final_obj = json.loads(final_text)
-            except Exception:
-                import re
-                m = re.search(r"\{.*\}", final_text, flags=re.DOTALL)
-                final_obj = json.loads(m.group(0)) if m else {"repo_summary": "", "entry_points": []}
-
-            repo_summary = (final_obj.get("repo_summary") or "").strip()
-            eps = [e for e in (final_obj.get("entry_points") or []) if e in allowed_file_paths]
-            # Deduplicate preserving order
-            seen = set()
-            entry_points = [e for e in eps if not (e in seen or seen.add(e))]
-            return repo_summary, entry_points
-
-        # ---- main body ----
+        # Fetch all file overviews
         insights_cursor = self.mental_model_collection.find(
             {"repo_id": repo_id, "document_type": "BRIEF_FILE_OVERVIEW"},
             {"_id": 0, "file_path": 1, "data": 1}
@@ -262,36 +157,108 @@ class MentalModelStage():
         insights = list(insights_cursor)
         if not insights:
             print(f"Job {getattr(self, 'job_id', 'NA')}: No BRIEF_FILE_OVERVIEW documents found for repo {repo_id}")
-            return ""
+            return []
 
-        pairs = [{"file_path": d["file_path"], "summary": d["data"]} for d in insights]
+        pairs = [{"file_path": d["file_path"], "summary": (d["data"] or "").strip()} for d in insights]
         allowed_paths = [p["file_path"] for p in pairs]
 
-        # MAP
-        map_results = await map_stage(pairs)
+        def create_batches(pairs):
+            """Create batches that fit within MAX_CHARS_PER_CALL budget."""
+            batches = []
+            current_batch = []
+            current_size = 0
+            limit = MAX_CHARS_PER_CALL - PROMPT_OVERHEAD
+            
+            for p in pairs:
+                item_txt = f"FILE: {p['file_path']}\nSUMMARY: {p['summary']}\n---\n"
+                item_size = len(item_txt)
+                
+                # If adding this item exceeds limit, start new batch
+                if current_batch and current_size + item_size > limit:
+                    batches.append(current_batch)
+                    current_batch = []
+                    current_size = 0
+                
+                current_batch.append(p)
+                current_size += item_size
+            
+            # Add the last batch
+            if current_batch:
+                batches.append(current_batch)
+            
+            return batches
 
-        # REDUCE (maybe multi-pass)
-        bullets, candidates = build_reduce_docs(map_results)
+        async def find_entry_points_in_batch(batch_pairs):
+            """Ask LLM to identify entry points from a batch of files."""
+            # Serialize batch
+            serialized = "\n".join(
+                f"FILE: {p['file_path']}\nSUMMARY: {p['summary']}\n---"
+                for p in batch_pairs
+            )
+            file_paths_list = "\n".join(p["file_path"] for p in batch_pairs)
+            
+            system_prompt = (
+                f"Repository: {repo_id}\n\n"
+                "You are analyzing a codebase to identify entry points - files that serve as starting points "
+                "for running or using the application. Based on the file paths and their summaries, determine "
+                "which files are entry points.\n\n"
+                "Return ONLY valid JSON: {\"entry_points\": [\"path1\", \"path2\", ...]}\n"
+                "Only include paths from the provided file list."
+            )
+            
+            user_prompt = (
+                "FILES AND SUMMARIES:\n"
+                "<<<\n" + serialized + "\n>>>\n\n"
+                "VALID FILE PATHS (choose only from these):\n" + file_paths_list + "\n\n"
+                "Identify which files are entry points. Return JSON with key 'entry_points' containing a list of file paths."
+            )
+            
+            out = await self.llm_client.generate_async(
+                prompt=user_prompt,
+                system_prompt=system_prompt,
+                reasoning_effort="high",
+                temperature=0.0,
+            )
+            
+            text = (out or "").strip()
+            obj = _safe_json_loads(text, default_obj={"entry_points": []})
+            
+            # Validate paths against this batch
+            valid_paths = set(p["file_path"] for p in batch_pairs)
+            entry_points = [ep for ep in (obj.get("entry_points") or []) if ep in valid_paths]
+            
+            return entry_points
 
-        # If bullets are excessive, the reduce_once handles re-chunking internally.
-        final_summary, entry_points = await reduce_once(bullets, candidates, allowed_paths)
+        # Create batches that fit budget
+        batches = create_batches(pairs)
+        print(f"Job {self.job_id}: Processing {len(pairs)} files in {len(batches)} batch(es)")
+        
+        # Process each batch sequentially
+        all_entry_points = []
+        for i, batch in enumerate(batches, 1):
+            print(f"Job {self.job_id}: Processing batch {i}/{len(batches)} ({len(batch)} files)")
+            batch_entry_points = await find_entry_points_in_batch(batch)
+            all_entry_points.extend(batch_entry_points)
+        
+        # Deduplicate preserving order
+        seen = set()
+        entry_points = [ep for ep in all_entry_points if not (ep in seen or seen.add(ep))]
 
-        # Persist to Mongo
+        # Persist to MongoDB
         document = {
             "repo_id": repo_id,
-            "document_type": "REPO_SUMMARY",
-            "data": final_summary,
+            "document_type": "REPO_ENTRY_POINTS",
             "entry_points": entry_points,
             "generated_at": datetime.now(timezone.utc).isoformat(),
-            "method": "map_reduce_from_file_overviews_v1"
+            "method": "focused_entry_point_detection_v2"
         }
         self.mental_model_collection.update_one(
-            {"repo_id": repo_id, "document_type": "REPO_SUMMARY"},
+            {"repo_id": repo_id, "document_type": "REPO_ENTRY_POINTS"},
             {"$set": document},
             upsert=True
         )
 
-        return final_summary, entry_points
+        return entry_points
 
     async def _set_potential_entry_points(self, insights: List[dict], repo_id: str) -> List[str]:
         """Get potential entry points for the repo based on insights."""
@@ -299,17 +266,19 @@ class MentalModelStage():
         cross_file_ref_counts = {}
 
         insights_files = {insight.get("file_path") for insight in insights}
-
+        # print(f"Insights files: {insights_files}")
         # Initially add all files to potential_entry_counts
         for insight in insights:
             file_path = insight.get("file_path")
             potential_entry_points.add(file_path)
 
+        # insight["downstream_dep_files"] = file_dependencies["downstream_files"]
+        # insight["upstream_dep_files"] = file_dependencies["upstream_files"]
         for insight in insights:
             # Extract file paths from insights
             file_path = insight.get("file_path")
-            upstream_dep_files = insight.get("upstream_dep_files", {})
-            # print(f"File: {file_path} has upstream deps: {upstream_dep_files}")
+            upstream_dep_files = insight.get("upstream_dep_files", [])
+            # print(f"File: {file_path}, Upstream deps: {upstream_dep_files}")
 
             # cross_file_ref_counts[file_path] = len(cross_file_paths)
 
@@ -317,6 +286,7 @@ class MentalModelStage():
                 if upstream_file in insights_files and file_path in potential_entry_points:
                     potential_entry_points.remove(file_path)
 
+        print(f"Potential entry points after upstream dependency check: {potential_entry_points}")
 
             # for cross_file_path in cross_file_paths :
             #     if cross_file_path in potential_entry_points and cross_file_path not in insights_files:
@@ -347,11 +317,11 @@ class MentalModelStage():
                 upsert=True
             )
 
-        print(f"Final potential entry points: {potential_entry_points}")
+        # print(f"Final potential entry points: {potential_entry_points}")
         # Convert set to sorted list for consistent output
         return sorted(list(potential_entry_points))
 
-    async def generate_repo_overview_2(self, dir_tree: Dict, repo_id: str) -> Tuple[Dict[str, str], Set[str]]:
+    async def identify_critical_files(self, dir_tree: Dict, repo_id: str) -> Tuple[Dict[str, str], Set[str]]:
         """Generate a comprehensive overview of the repo by summarizing critical files, ignoring non-critical ones."""
 
         def get_all_files(node: Dict, path: str = "") -> list[str]:
@@ -365,6 +335,7 @@ class MentalModelStage():
             return files
 
         async def summarize_file(file_path: str) -> tuple[str, str]:
+
             # Check mongoDB if we already have file_path in the mental_model_collections BRIEF_FILE_OVERVIEW or IGNORED_FILE document type
             existing_doc = self.mental_model_collection.find_one(
                 {
@@ -382,10 +353,9 @@ class MentalModelStage():
                 code = f.read()
 
             system_prompt = (
-                "Given the repo_name, file_path, and its code — your task is to write a detailed explanation "
-                "of what the code file does, describing its purpose, logic, and functionality in depth. "
-                "If the file is not critical to understanding the overall behaviour of the code repository, "
-                "simply output \"IGNORE\".\n\n"
+                "Your task is to analyze the provided code file and determine if it is critical to the core functionality of the repository. "
+                "If the file is critical, provide a summary of its purpose and functionality."
+                "Simply output \"IGNORE\" if the file is not critical.\n\n"
                 "Ignore:\n"
                 "- tutorial example files,\n"
                 "- tests,\n"
@@ -393,7 +363,7 @@ class MentalModelStage():
                 "While analyzing the code, also consider where in the repository the file is located."
             )
 
-            prompt = f"Repo: {repo_id}\n\nFile: {file_path}\n\nCode:\n\n{code}"
+            prompt = f"Repo: {repo_id}\n\nFile: {file_path}\n\nCode:\n\n{code}\n\n Output 'IGNORE' if the file is not critical."
             response = await self.llm_client.generate_async(
                 prompt=prompt,
                 system_prompt=system_prompt,
@@ -420,40 +390,62 @@ class MentalModelStage():
                 # if summary.startswith("IGNORE"):
                 if summary == "IGNORE":
                     ignored.add(fp)
+                    document = {
+                        "repo_id": repo_id,
+                        "file_path": fp,
+                        "document_type": "IGNORED_FILE",
+                        "data": "IGNORE"
+                    }
+                    self.mental_model_collection.update_one(
+                        {"repo_id": repo_id, "file_path": fp, "document_type": "IGNORED_FILE"},
+                        {"$set": document},
+                        upsert=True
+                    )
                 else:
                     insights.append({"file_path": fp, "summary": summary})
+                    document = {
+                        "repo_id": repo_id,
+                        "file_path": fp,
+                        "document_type": "BRIEF_FILE_OVERVIEW",
+                        "data": summary
+                    }
+                    self.mental_model_collection.update_one(
+                        {"repo_id": repo_id, "file_path": fp, "document_type": "BRIEF_FILE_OVERVIEW"},
+                        {"$set": document},
+                        upsert=True
+                    )
 
             pbar.update(len(batch))
         
         pbar.close()
 
         # Add insights to the mental model mongodb collection
-        for insight in insights:
-            document = {
-                "repo_id": repo_id,
-                "file_path": insight["file_path"],
-                "document_type": "BRIEF_FILE_OVERVIEW",
-                "data": insight["summary"]
-            }
-            self.mental_model_collection.update_one(
-                {"repo_id": repo_id, "file_path": insight["file_path"], "document_type": "BRIEF_FILE_OVERVIEW"},
-                {"$set": document},
-                upsert=True
-            )
+        # for insight in insights:
+        #     document = {
+        #         "repo_id": repo_id,
+        #         "file_path": insight["file_path"],
+        #         "document_type": "BRIEF_FILE_OVERVIEW",
+        #         "data": insight["summary"]
+        #     }
+        #     self.mental_model_collection.update_one(
+        #         {"repo_id": repo_id, "file_path": insight["file_path"], "document_type": "BRIEF_FILE_OVERVIEW"},
+        #         {"$set": document},
+        #         upsert=True
+        #     )
 
         # Add ignored files to the mental model mongodb collection
-        for file_path in ignored:
-            document = {
-                "repo_id": repo_id,
-                "file_path": file_path,
-                "document_type": "IGNORED_FILE",
-                "data": "IGNORE"
-            }
-            self.mental_model_collection.update_one(
-                {"repo_id": repo_id, "file_path": file_path, "document_type": "IGNORED_FILE"},
-                {"$set": document},
-                upsert=True
-            )
+        # for file_path in ignored:
+        #     document = {
+        #         "repo_id": repo_id,
+        #         "file_path": file_path,
+        #         "document_type": "IGNORED_FILE",
+        #         "data": "IGNORE"
+        #     }
+        #     self.mental_model_collection.update_one(
+        #         {"repo_id": repo_id, "file_path": file_path, "document_type": "IGNORED_FILE"},
+        #         {"$set": document},
+        #         upsert=True
+        #     )
         
         # Add _cross_file_interactions_in_file in insights
         for insight in insights:
@@ -463,6 +455,13 @@ class MentalModelStage():
             insight["downstream_dep_files"] = list(dependency_info["downstream"]["files"])
             insight["upstream_dep_interactions"] = dependency_info["upstream"]["interactions"]
             insight["upstream_dep_files"] = list(dependency_info["upstream"]["files"])
+        
+        # for insight in insights:
+        #     file_path = insight["file_path"]
+        #     file_dependencies = self._get_file_dependencies(file_path, repo_id)
+
+        #     insight["downstream_dep_files"] = file_dependencies["downstream_files"]
+        #     insight["upstream_dep_files"] = file_dependencies["upstream_files"]
 
         return insights, ignored
 
@@ -491,112 +490,6 @@ class MentalModelStage():
         
         print(f"Job {self.job_id}: Built dir tree with {len(file_paths)} files")
         return tree
-
-    async def _generate_hierarchical_summary(self, dir_tree: Dict, repo_id: str, insights: Dict[str, str]) -> Dict:
-        """Generate detailed summaries bottom-up for files in the insights dictionary, using insights to focus on novel information."""
-        from tqdm import tqdm
-        
-        async def summarize_file(file_path: str, insight_summary: str) -> str:
-            code = None
-            with open(file_path, "r", encoding="utf-8") as f:
-                code = f.read()
-            
-            system_prompt = (
-                "You are an analytical code summarizer tasked with processing code of a single file. "
-                "Your goal is to deduce what the file does, how it does it, and how its components interact, "
-                "focusing on novel or distinctive information not covered in the provided high-level summary. "
-                "Preserve critical elements like classes, methods, and variables, emphasizing their unique roles and traits. "
-                "Retain essential details, avoiding redundancy with the high-level summary. "
-                "Output in the exact format below, ensuring concise, relevant, dense content:\n\n"
-                "Overview: 1-2 sentences summarizing the file's unique or non-obvious functionality, beyond the high-level summary.\n"
-                "Key Components:\n- Bullet: Class/Method/Variable X - its role and a distinctive or unexpected trait.\n"
-                "...\n"
-                "Interactions:\n- Bullet: A specific flow or pattern (e.g., Method A triggers Variable B update or Class C delegates to Method D).\n"
-                "...\n"
-                "Do not include code snippets or mention the system prompt in the output. "
-                "Provide only the requested output, strictly adhering to the specified format."
-            )
-
-            dependency_info = self._cross_file_interactions_in_file(file_path, repo_id)
-            cross_refs = "\n".join(dependency_info["downstream"]["interactions"]) if dependency_info["downstream"]["interactions"] else "No cross-file dependencies."
-
-            prompt = (
-                f"{file_path} in repo {repo_id}:\n\n{code}\n\n"
-                f"Cross-file interactions: {cross_refs}\n\n"
-                f"High-level summary from prior analysis: {insight_summary or 'No prior summary available.'}"
-            )
-            response = await self.llm_client.generate_async(
-                prompt=prompt,
-                system_prompt=system_prompt,
-                reasoning_effort="medium",
-                temperature=0.0,
-            )
-            return response.strip()
-
-        # Process only files present in insights
-        file_summaries = []
-        file_paths = list(insights.keys())
-        batch_size = 20
-
-        # Initialize progress bar
-        pbar = tqdm(total=len(file_paths), desc="Summarizing files")
-
-        # Verify and collect valid files
-        valid_file_paths = []
-        for file_path in file_paths:
-            path_parts = Path(file_path).parts
-            current_node = dir_tree
-            file_exists = False
-            for part in path_parts[:-1]:
-                current_node = current_node.get('subdirs', {}).get(part, {})
-            if path_parts[-1] in current_node.get('files', []):
-                file_exists = True
-                valid_file_paths.append(file_path)
-            else:
-                print(f"Job {self.job_id}: File {file_path} from insights not found in dir_tree; skipping.")
-        
-        # Process files in batches of 20
-        for i in range(0, len(valid_file_paths), batch_size):
-            batch = valid_file_paths[i:i + batch_size]
-            file_tasks = [
-                asyncio.create_task(summarize_file(fp, insights.get(fp, "")))
-                for fp in batch
-            ]
-            
-            # Gather file summaries for the batch
-            file_results = await asyncio.gather(*file_tasks, return_exceptions=True)
-            
-            for file_path, result in zip(batch, file_results):
-                if isinstance(result, str):  # Ensure no exceptions
-                    dependency_info = self._cross_file_interactions_in_file(file_path, repo_id)
-                    file_info = {
-                        "path": file_path,
-                        "summary": result or "No summary available.",
-                        "cross_file_interactions": dependency_info["downstream"]["interactions"],
-                    }
-                    file_summaries.append(file_info)
-                else:
-                    print(f"Job {self.job_id}: Failed to summarize {file_path}: {str(result)}")
-            
-            pbar.update(len(batch))
-        
-        pbar.close()
-
-        # Add file_summaries to the MongoDB mental model collection
-        for file_info in file_summaries:
-            document = {
-                "repo_id": repo_id,
-                "file_path": file_info["path"],
-                "document_type": "FILE_SUMMARY",
-                "data": file_info
-            }
-            self.mental_model_collection.update_one(
-                {"repo_id": repo_id, "file_path": file_info["path"], "document_type": "FILE_SUMMARY"},
-                {"$set": document},
-                upsert=True
-            )
-
-        return {'files': file_summaries}
 
     def _cross_file_interactions_in_file(self, file_path: str, repo_id: str):
         """Infer cross-file interactions for a given file by finding references to and from definitions in other files."""
@@ -651,3 +544,28 @@ class MentalModelStage():
                     "files": upstream_files,
                 },
             }
+    
+    def _get_file_dependencies(self, file_path: str, repo_id: str) -> Dict[str, List[str]]:
+        """Get files that interact with the given file via cross-file references."""
+        down_stream_query = """
+        MATCH (ref:ASTNode {repo_id: $repo_id, file_path: $file_path})
+                -[:DEPENDS_ON]->(ident:ASTNode)
+        RETURN ident.file_path
+        """
+
+        up_stream_query = """
+        MATCH (ref:ASTNode {repo_id: $repo_id})
+                -[:DEPENDS_ON]->(ident:ASTNode {file_path: $file_path})
+        RETURN ref.file_path
+        """
+
+        with self.neo4j_client.driver.session() as session:
+            downstream_files = [record["ident.file_path"] for record in session.run(down_stream_query, repo_id=repo_id, file_path=file_path)]
+            upstream_files = [record["ref.file_path"] for record in session.run(up_stream_query, repo_id=repo_id, file_path=file_path)]
+
+        return {
+            "downstream_files": downstream_files,
+            "upstream_files": upstream_files,
+        }
+        
+    

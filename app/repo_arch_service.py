@@ -1,297 +1,514 @@
-# repo_arch_service.py
+from __future__ import annotations
 
-import asyncio
-import json
+from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 
-from .db import get_mongo_client, get_neo4j_client, get_entry_point_files
+# Assuming these imports exist from your codebase
+from .db import get_mongo_client, get_neo4j_client, get_potential_entry_points
 from .llm import GroqLLM
 
+# === Constants =================================================================
 MENTAL_MODEL_COL = "mental_model"
-MAX_CHARS = 140000  # ~35k tokens safe buffer
+ROLLING_SUMMARY = "ROLLING_SUMMARY_V1"  # Cumulative summary per depth
+DOC_HUMAN = "REPO_ARCHITECTURE_V5"
+DOC_RETR = "REPO_ARCHITECTURE_RETRIEVAL_V5"
 
 
-async def build_repo_architecture(repo_id: str, max_depth: int = 5):
+# === Helper Functions ==========================================================
+
+def now_iso() -> str:
+    """Return current UTC timestamp in ISO format."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+# === Core Builder ==============================================================
+
+class RepoArchBuilderRolling:
     """
-    Build a high-level architecture overview of the repo using file summaries + dependency info.
-
-    Produces TWO text artifacts:
-      1) Human-readable architecture (document_type="REPO_ARCHITECTURE")
-      2) Retrieval-optimized architecture (document_type="REPO_ARCHITECTURE_RETRIEVAL")
-         - Formatted like the human-readable architecture, but enriched with explicit pointers
-           (exact file paths, entry points, dependency edges) to help an LLM Q/A agent.
-
-    IMPORTANT BEHAVIOR:
-    - Only call the LLM to (re)generate a document if that specific document does not already
-      exist in MongoDB.
-    - If both already exist, return the existing human-readable doc immediately.
+    Builds architecture overviews using rolling summary (cumulative enrichment).
+    
+    Approach:
+    1. BFS to assign depth to each file from entry point
+    2. Iterate depth by depth:
+       - Fetch rolling summary from previous depth (or empty if first)
+       - Enrich with current depth + next depth files
+       - Store enriched rolling summary
+    3. Organize final rolling summary into structured document
     """
 
-    mongo = get_mongo_client()
-    neo = get_neo4j_client()
-    mental = mongo[MENTAL_MODEL_COL]
-    llm = GroqLLM()
+    def __init__(self, *, mongo=None, neo=None, llm: GroqLLM = None) -> None:
+        self.mongo = mongo or get_mongo_client()
+        self.neo = neo or get_neo4j_client()
+        self.llm = llm or GroqLLM()
+        self.mental = self.mongo[MENTAL_MODEL_COL]
 
-    # --- 0. Check existing docs and short-circuit when possible ---
-    existing_human = mental.find_one(
-        {"repo_id": repo_id, "document_type": "REPO_ARCHITECTURE"},
-        {"_id": 0},
-    )
-    existing_retrieval = mental.find_one(
-        {"repo_id": repo_id, "document_type": "REPO_ARCHITECTURE_RETRIEVAL"},
-        {"_id": 0},
-    )
+    # ---- Public API -----------------------------------------------------------
 
-    if existing_human and existing_retrieval:
-        return existing_human
+    async def build(self, repo_id: str) -> Dict[str, Any]:
+        """
+        Build architecture overviews for all entry points.
+        Returns dict with 'human' and 'retrieval' lists of documents.
+        """
+        entry_points = get_potential_entry_points(self.mongo, repo_id) or []
+        if not entry_points:
+            raise ValueError(f"No entry points found for repo {repo_id}")
 
-    need_human = existing_human is None
-    need_retrieval = existing_retrieval is None
+        human_docs = []
+        retrieval_docs = []
 
-    # If neither is needed, return early (defensive; covered above)
-    if not (need_human or need_retrieval):
-        return existing_human
+        for ep in entry_points:
+            print(f"Building architecture for entry point: {ep}")
+            
+            # Build rolling summary through all depths
+            final_rolling_summary = await self._build_rolling_summary(repo_id, ep)
+            
+            # Organize into human-friendly document
+            human_doc = await self._organize_final_document(
+                repo_id=repo_id,
+                entry_point=ep,
+                rolling_summary=final_rolling_summary,
+                doc_type=DOC_HUMAN,
+                retrieval_mode=False
+            )
+            human_docs.append(human_doc)
+            
+            # Organize into retrieval-optimized document
+            retrieval_doc = await self._organize_final_document(
+                repo_id=repo_id,
+                entry_point=ep,
+                rolling_summary=final_rolling_summary,
+                doc_type=DOC_RETR,
+                retrieval_mode=True
+            )
+            retrieval_docs.append(retrieval_doc)
 
-    # --- 1. Load entry points and file overviews (only if we need to generate something) ---
-    entry_points = get_entry_point_files(mongo, repo_id) or []
-    if not entry_points:
-        raise ValueError(f"No entry points found for repo {repo_id}")
-
-    all_files_cursor = mental.find(
-        {"repo_id": repo_id, "document_type": "BRIEF_FILE_OVERVIEW"},
-        {"_id": 0, "file_path": 1, "data": 1},
-    )
-    file_summaries = {doc["file_path"]: doc["data"] for doc in all_files_cursor}
-    if not file_summaries:
-        raise ValueError(f"No file summaries found for repo {repo_id}")
-
-    # --- 2. BFS traversal from entry points ---
-    visited: Set[str] = set()
-    traversal_order: List[str] = []
-    queue: List[Tuple[str, int]] = [(fp, 0) for fp in entry_points]
-
-    while queue:
-        file_path, level = queue.pop(0)
-        if file_path in visited or level > max_depth:
-            continue
-        visited.add(file_path)
-        traversal_order.append(file_path)
-
-        try:
-            _, downstream = neo.file_dependencies(repo_id=repo_id, file_path=file_path)
-        except Exception:
-            downstream = []
-        for child in downstream:
-            if child not in visited:
-                queue.append((child, level + 1))
-
-    # --- 3. Prepare token-bounded chunks (used by both outputs) ---
-    chunks: List[List[str]] = []
-    current_chunk: List[str] = []
-    current_size = 0
-
-    for file_path in traversal_order:
-        brief = file_summaries.get(file_path, "No summary available.")
-        try:
-            upstream, downstream = neo.file_dependencies(repo_id=repo_id, file_path=file_path)
-        except Exception:
-            upstream, downstream = [], []
-
-        text_block = (
-            f"FILE: {file_path}\n"
-            f"SUMMARY: {brief}\n"
-            f"UPSTREAM: {upstream}\n"
-            f"DOWNSTREAM: {downstream}\n"
-            "---\n"
-        )
-        if current_size + len(text_block) > MAX_CHARS:
-            chunks.append(current_chunk)
-            current_chunk = []
-            current_size = 0
-        current_chunk.append(text_block)
-        current_size += len(text_block)
-
-    if current_chunk:
-        chunks.append(current_chunk)
-
-    # Helper to summarize a chunk (shared by both generations)
-    async def summarize_chunk(idx: int, chunk: List[str]) -> str:
-        content = "\n".join(chunk)
-        system_prompt = (
-            "You are analyzing part of a software repository.\n"
-            "Each file has a brief summary and its dependencies.\n"
-            "Your task: describe the architecture patterns, roles, and component structure suggested by these files.\n"
-            "Keep this self-contained, concise, and factual. Avoid redundancy."
-        )
-        user_prompt = (
-            f"Repo: {repo_id}\n\n"
-            f"Chunk {idx} of {len(chunks)}\n\n"
-            f"{content}\n\n"
-            "Write a concise architecture summary of this chunk."
-        )
-        result = await llm.generate_async(
-            prompt=user_prompt,
-            system_prompt=system_prompt,
-            reasoning_effort="medium",
-            temperature=0.0,
-        )
-        return (result or "").strip()
-
-    summaries: List[str] = []
-
-    # We only need to perform LLM chunk summarization if at least one of the documents is missing.
-    if need_human or need_retrieval:
-        summaries = await asyncio.gather(*(summarize_chunk(i, c) for i, c in enumerate(chunks)))
-
-    # --- 4. Generate missing human-readable architecture (LLM ONLY IF NEEDED) ---
-    architecture_text = existing_human["architecture"] if existing_human else ""
-
-    if need_human:
-        combined_input = "\n\n".join(
-            f"PART {i+1}:\n{summary}" for i, summary in enumerate(summaries)
-        )
-        final_system_prompt = (
-            "You are a senior software architect.\n"
-            "Given multiple partial architecture analyses of a repository, produce one coherent, non-redundant, clear architecture overview.\n"
-            "Focus on how major components interact, key data/control flows, and entry points.\n"
-            "Keep it professional and readable."
-            "Also include a brief summary of the repo at the top."
-        )
-        final_prompt = (
-            f"Repository ID: {repo_id}\n\n"
-            f"Partial architecture summaries:\n{combined_input}\n\n"
-            "Now write a unified architecture overview for someone who has not seen the codebase before."
-        )
-
-        final_summary = await llm.generate_async(
-            prompt=final_prompt,
-            system_prompt=final_system_prompt,
-            reasoning_effort="medium",
-            temperature=0.0,
-        )
-        architecture_text = (final_summary or "").strip()
-
-        # Persist human-readable doc
-        doc_human = {
-            "repo_id": repo_id,
-            "document_type": "REPO_ARCHITECTURE",
-            "entry_points": entry_points,
-            "architecture": architecture_text,
-            "num_chunks": len(chunks),
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "max_depth": max_depth,
+        return {
+            "human": human_docs,
+            "retrieval": retrieval_docs
         }
-        mental.update_one(
-            {"repo_id": repo_id, "document_type": "REPO_ARCHITECTURE"},
-            {"$set": doc_human},
-            upsert=True,
-        )
 
-    # --- 5. Generate missing retrieval-optimized text (LLM ONLY IF NEEDED) ---
-    if need_retrieval:
-        # Build compact, factual context to enrich with pointers.
-        dep_up: Dict[str, List[str]] = {}
-        dep_down: Dict[str, List[str]] = {}
-        for fp in traversal_order:
+    # ---- Core Logic -----------------------------------------------------------
+
+    async def _build_rolling_summary(self, repo_id: str, entry_point: str) -> str:
+        """
+        Build rolling summary by iterating through depth levels.
+        Each iteration enriches understanding without losing detail.
+        """
+        # 1. Build depth map via BFS
+        depth_map = self._build_depth_map(repo_id, entry_point)
+        
+        if not depth_map:
+            return f"Entry point {entry_point} (no dependencies found)"
+        
+        # 2. Group files by depth
+        files_by_depth = defaultdict(list)
+        for file_path, depth in depth_map.items():
+            files_by_depth[depth].append(file_path)
+        
+        max_depth = max(files_by_depth.keys())
+        print(f"  Found {len(depth_map)} files across {max_depth + 1} depth levels")
+        
+        # 3. Check if rolling summary already exists (resume capability)
+        existing_summary = self._get_rolling_summary(repo_id, entry_point, max_depth)
+        if existing_summary:
+            print(f"  Found existing rolling summary at depth {max_depth}, using it")
+            return existing_summary
+        
+        # 4. Iterate through depths, enriching at each level
+        rolling_summary = None
+        
+        for depth in range(max_depth + 1):
+            print(f"  Processing depth {depth}/{max_depth}")
+            
+            # Check if we have a summary for this depth already
+            existing = self._get_rolling_summary(repo_id, entry_point, depth)
+            if existing:
+                print(f"    Using cached rolling summary for depth {depth}")
+                rolling_summary = existing
+                continue
+            
+            # Get files at current depth
+            current_files = files_by_depth.get(depth, [])
+            
+            # Get files at next depth (dependencies of current files)
+            next_files = files_by_depth.get(depth + 1, [])
+            
+            if not current_files:
+                print(f"    No files at depth {depth}, skipping")
+                continue
+            
+            # Fetch BRIEF_FILE_OVERVIEW for current and next depth
+            current_briefs = self._fetch_briefs_batch(repo_id, current_files)
+            next_briefs = self._fetch_briefs_batch(repo_id, next_files) if next_files else []
+            
+            # Enrich rolling summary
+            rolling_summary = await self._enrich_rolling_summary(
+                rolling_summary=rolling_summary,
+                current_depth=depth,
+                current_briefs=current_briefs,
+                next_briefs=next_briefs,
+                is_entry_point=(depth == 0),
+                entry_point_path=entry_point
+            )
+            
+            # Store in DB
+            self._store_rolling_summary(repo_id, entry_point, depth, rolling_summary)
+        
+        return rolling_summary or f"Entry point {entry_point}"
+
+    def _build_depth_map(self, repo_id: str, entry_point: str) -> Dict[str, int]:
+        """
+        BFS from entry point to assign depth to each reachable file.
+        Returns dict of {file_path: depth}
+        """
+        depth_map = {entry_point: 0}
+        queue = [(entry_point, 0)]
+        visited = {entry_point}
+        
+        while queue:
+            file_path, depth = queue.pop(0)
+            
+            # Get downstream dependencies
             try:
-                up, down = neo.file_dependencies(repo_id=repo_id, file_path=fp)
-            except Exception:
-                up, down = [], []
-            dep_up[fp] = up
-            dep_down[fp] = down
+                _, downstream = self.neo.file_dependencies(
+                    file_path=file_path,
+                    repo_id=repo_id
+                )
+                
+                for child in downstream:
+                    if child not in visited:
+                        visited.add(child)
+                        depth_map[child] = depth + 1
+                        queue.append((child, depth + 1))
+            except Exception as e:
+                print(f"    Warning: Could not fetch dependencies for {file_path}: {e}")
+                continue
+        
+        return depth_map
 
-        retrieval_context = (
-            f"REPO_ID: {repo_id}\n"
-            f"ENTRY_POINTS: {json.dumps(entry_points)}\n"
-            f"TRAVERSAL_ORDER: {json.dumps(traversal_order)}\n"
-            f"DEPENDENCY_UPSTREAM: {json.dumps(dep_up)}\n"
-            f"DEPENDENCY_DOWNSTREAM: {json.dumps(dep_down)}\n"
-            f"PARTIAL_SUMMARIES: {json.dumps(summaries)}\n"
-            f"EXISTING_HUMAN_OVERVIEW: {architecture_text}\n"
-        )
+    def _fetch_briefs_batch(self, repo_id: str, file_paths: List[str]) -> List[Dict[str, str]]:
+        """
+        Fetch BRIEF_FILE_OVERVIEW for a batch of files.
+        Returns list of {file_path, brief_text} dicts.
+        """
+        result = []
+        for file_path in file_paths:
+            doc = self.mental.find_one(
+                {
+                    "repo_id": repo_id,
+                    "document_type": "BRIEF_FILE_OVERVIEW",
+                    "file_path": file_path
+                },
+                {"_id": 0, "data": 1}
+            )
+            brief = (doc or {}).get("data", "")
+            if brief:
+                result.append({
+                    "file_path": file_path,
+                    "brief": brief
+                })
+        return result
 
-        # NOTE: This is intentionally formatted like the human-readable overview (no strict markdown sections),
-        # but it adds explicit pointers (exact file paths and dependency hints) inline to aid an LLM Q/A agent.
-        retrieval_system_prompt = (
-            "You are producing a human-readable architecture overview intended to help an LLM Q/A agent route queries.\n"
-            "Write in the same narrative style as a normal architecture overview (short paragraphs and brief bullet points only if helpful), "
-            "NOT a rigid index and NOT strict markdown sections.\n"
-            "Enrich the text with precise pointers to where things live:\n"
-            "- Always mention exact file paths in parentheses when referring to components (e.g., (see: api/server.py)).\n"
-            "- Call out entry points explicitly using the provided list.\n"
-            "- When useful, note simple dependency hints like 'reads from X' or 'invokes Y', referencing file paths.\n"
-            "Constraints: Be factual; do not invent files or components beyond the provided context."
-            "Also include a brief summary of the repo at the top."
-        )
-        retrieval_user_prompt = (
-            "Using ONLY the context below, write a human-readable architecture overview that mirrors the tone and structure of the standard overview, "
-            "but adds inline pointers (exact file paths and simple dependency hints) so a Q/A agent can quickly jump to the right places.\n\n"
-            f"{retrieval_context}\n"
-        )
+    async def _enrich_rolling_summary(
+        self,
+        rolling_summary: Optional[str],
+        current_depth: int,
+        current_briefs: List[Dict[str, str]],
+        next_briefs: List[Dict[str, str]],
+        is_entry_point: bool,
+        entry_point_path: str
+    ) -> str:
+        """
+        Enrich the rolling summary with information from current and next depth.
+        This is ENRICHMENT, not summarization - we keep ALL details.
+        """
+        system_prompt = """You are building a cumulative, enriched understanding of a codebase.
 
-        retrieval_text = await llm.generate_async(
-            prompt=retrieval_user_prompt,
-            system_prompt=retrieval_system_prompt,
-            reasoning_effort="medium",
-            temperature=0.0,
-        )
-        retrieval_text = (retrieval_text or "").strip()
+            CRITICAL: This is NOT summarization. This is ENRICHMENT.
 
-        doc_retrieval_text = {
+            Your job:
+            - Keep ALL details from the rolling summary (if provided)
+            - Add details about how current files use their dependencies
+            - Explain connections and interactions clearly
+            - Include specific file paths in backticks
+            - Be thorough - don't drop any information
+
+            Think of it like adding layers to a painting - each layer adds detail without removing what's underneath.
+
+            Your output will become the new rolling summary for the next iteration.
+            Remember, the output should clearly explain what the components do and how they interact.
+            """
+
+        # Build context for current depth files
+        current_context = "\n\n".join([
+            f"### {item['file_path']}\n{item['brief']}"
+            for item in current_briefs
+        ])
+        
+        # Build context for next depth files (dependencies)
+        next_context = ""
+        if next_briefs:
+            next_context = "\n\n".join([
+                f"### {item['file_path']}\n{item['brief']}"
+                for item in next_briefs
+            ])
+        
+        # Construct user prompt
+        if is_entry_point:
+            user_prompt = f"""This is the FIRST iteration - we're analyzing the entry point.
+
+                ENTRY POINT: `{entry_point_path}`
+                {current_context}
+
+                """
+            if next_briefs:
+                user_prompt += f"""IMMEDIATE DEPENDENCIES:
+                    {next_context}
+
+                    """
+            user_prompt += f"""Task: Create the initial understanding. Explain:
+                - What does the entry point `{entry_point_path}` do?
+                - How does it use its immediate dependencies?
+                - Include ALL relevant details with file paths in backticks."""
+        
+        else:
+            user_prompt = f"""ROLLING SUMMARY SO FAR (keep ALL of this):
+                {rolling_summary}
+
+                ---
+
+                DETAILED OVERVIEW OF THE CURRENT FILES:
+                {current_context}
+
+                """
+            if next_briefs:
+                user_prompt += f"""---
+
+                    DETAILED OVERVIEW OF DEPENDENCIES:
+                    {next_context}
+
+                    """
+            user_prompt += f"""---
+
+                Task: Enrich the understanding by adding details about:
+                - What current files do
+                - How they use their dependencies
+                - Connections between files
+
+                Keep ALL information from rolling summary and add new context.
+                Remember, the purpose is to clearly explain how the codebase works and how components interact."""
+
+        try:
+            output = await self.llm.generate_async(
+                prompt=user_prompt,
+                system_prompt=system_prompt,
+                temperature=0.0,
+                reasoning_effort="medium",
+            )
+            return output.strip()
+        except Exception as e:
+            print(f"    Error enriching rolling summary at depth {current_depth}: {e}")
+            # Fallback: concatenate what we have
+            if rolling_summary:
+                return rolling_summary + f"\n\n(Depth {current_depth} enrichment failed)"
+            else:
+                return f"Entry point at depth {current_depth} (enrichment failed)"
+
+    def _get_rolling_summary(self, repo_id: str, entry_point: str, depth: int) -> Optional[str]:
+        """Get rolling summary for a specific depth from DB."""
+        doc = self.mental.find_one(
+            {
+                "repo_id": repo_id,
+                "document_type": ROLLING_SUMMARY,
+                "entry_point": entry_point,
+                "depth": depth
+            },
+            {"_id": 0}
+        )
+        return doc.get("summary") if doc else None
+
+    def _store_rolling_summary(self, repo_id: str, entry_point: str, depth: int, summary: str) -> None:
+        """Store rolling summary for a specific depth in DB."""
+        doc = {
             "repo_id": repo_id,
-            "document_type": "REPO_ARCHITECTURE_RETRIEVAL",
-            "entry_points": entry_points,
-            "architecture": retrieval_text,
-            "num_chunks": len(chunks),
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "max_depth": max_depth,
-            "source": "repo_arch_service.build_repo_architecture:retrieval-prose-v2",
+            "document_type": ROLLING_SUMMARY,
+            "entry_point": entry_point,
+            "depth": depth,
+            "summary": summary,
+            "generated_at": now_iso()
         }
-        mental.update_one(
-            {"repo_id": repo_id, "document_type": "REPO_ARCHITECTURE_RETRIEVAL"},
-            {"$set": doc_retrieval_text},
-            upsert=True,
-        )
+        
+        key = {
+            "repo_id": repo_id,
+            "document_type": ROLLING_SUMMARY,
+            "entry_point": entry_point,
+            "depth": depth
+        }
+        
+        self.mental.update_one(key, {"$set": doc}, upsert=True)
 
-    # Return the (existing or newly generated) human-readable doc
-    if existing_human:
-        return existing_human
+    # ---- Final Organization ---------------------------------------------------
+
+    async def _organize_final_document(
+        self,
+        repo_id: str,
+        entry_point: str,
+        rolling_summary: str,
+        doc_type: str,
+        retrieval_mode: bool
+    ) -> Dict[str, Any]:
+        """
+        Organize the final rolling summary into a structured document.
+        This is ORGANIZATION only - no compression.
+        """
+        if retrieval_mode:
+            system_prompt = """You are organizing a detailed codebase understanding into a retrieval-optimized document.
+
+            CRITICAL: The rolling summary contains ALL the details. DO NOT compress or lose information.
+            Your job: Organize into a structured format for AI agent navigation.
+
+            Required sections:
+            1. **Overview** - High-level purpose (2-3 paragraphs from the rolling summary)
+            2. **Architecture Components** - Identify and list logical components with their files
+            3. **Architecture Patterns** - What patterns are evident in the structure
+            4. **Key Flows** - Trace important execution paths with file sequences
+            5. **Data & External Systems** - Databases, APIs, queues, config
+
+            Style:
+            - Dense, path-heavy format with many inline file paths in backticks
+            - Use lists and short paragraphs
+            - Include navigation markers (what invokes what, what reads/writes what)
+            - Keep ALL technical details from the rolling summary
+
+            Output clean, well-structured markdown."""
+        else:
+            system_prompt = """You are organizing a detailed codebase understanding into a human-friendly document.
+
+            CRITICAL: The rolling summary contains ALL the details. DO NOT compress or lose information.
+            Your job: Organize into a structured format that helps newcomers understand.
+
+            Required sections:
+            1. **Overview** - High-level purpose (2-3 paragraphs from the rolling summary)
+            2. **Architecture Components** - Identify and describe logical components
+            3. **Architecture Patterns** - What patterns are evident in the structure
+            4. **Key Flows** - Trace important execution paths as narratives
+            5. **Data & External Systems** - Databases, APIs, queues, config
+
+            Style:
+            - Clear narrative that tells the story of how the code works
+            - Include file paths in backticks for reference
+            - Use proper markdown with sections and subsections
+            - Keep ALL technical details from the rolling summary
+
+            Output clean, well-structured markdown."""
+
+        user_prompt = f"""Entry Point: {entry_point}
+
+            Here is the complete, enriched understanding of this codebase:
+
+            {rolling_summary}
+
+            ---
+
+            Organize this into the required 5-section structure. 
+            Keep all details - just add structure and organization."""
+
+        try:
+            architecture = await self.llm.generate_async(
+                prompt=user_prompt,
+                system_prompt=system_prompt,
+                temperature=0.0,
+                reasoning_effort="medium",
+            )
+        except Exception as e:
+            print(f"  Error organizing final document: {e}")
+            # Fallback: use rolling summary as-is with basic structure
+            architecture = f"# {entry_point}\n\n## Complete Understanding\n\n{rolling_summary}"
+        
+        # Create and persist document
+        doc = {
+            "repo_id": repo_id,
+            "document_type": doc_type,
+            "entry_point": entry_point,
+            "architecture": architecture.strip(),
+            "generated_at": now_iso(),
+        }
+        
+        key = {
+            "repo_id": repo_id,
+            "document_type": doc_type,
+            "entry_point": entry_point
+        }
+        
+        self.mental.update_one(key, {"$set": doc}, upsert=True)
+        
+        return doc
+
+
+# === Convenience Functions =====================================================
+
+async def build_repo_architecture_v2(repo_id: str) -> Dict[str, Any]:
+    """Build architecture overviews using rolling summary approach."""
+    builder = RepoArchBuilderRolling()
+    return await builder.build(repo_id)
+
+
+async def get_repo_architecture(repo_id: str, entry_point: str = None) -> Dict[str, Any]:
+    """
+    Get human-friendly architecture overview.
+    If entry_point is None, returns all entry points.
+    """
+    mongo = get_mongo_client()
+    mental = mongo[MENTAL_MODEL_COL]
+    
+    if entry_point:
+        doc = mental.find_one(
+            {
+                "repo_id": repo_id,
+                "document_type": DOC_HUMAN,
+                "entry_point": entry_point
+            },
+            {"_id": 0}
+        )
+        if not doc:
+            raise ValueError(f"No architecture found for {repo_id}:{entry_point}")
+        return doc
     else:
-        # We just generated and stored it above
-        return mental.find_one(
-            {"repo_id": repo_id, "document_type": "REPO_ARCHITECTURE"},
-            {"_id": 0},
+        docs = list(mental.find(
+            {"repo_id": repo_id, "document_type": DOC_HUMAN},
+            {"_id": 0}
+        ))
+        if not docs:
+            raise ValueError(f"No architecture found for repo {repo_id}")
+        return {"entry_points": docs}
+
+
+async def get_repo_architecture_retrieval(repo_id: str, entry_point: str = None) -> Dict[str, Any]:
+    """
+    Get retrieval-optimized architecture overview.
+    If entry_point is None, returns all entry points.
+    """
+    mongo = get_mongo_client()
+    mental = mongo[MENTAL_MODEL_COL]
+    
+    if entry_point:
+        doc = mental.find_one(
+            {
+                "repo_id": repo_id,
+                "document_type": DOC_RETR,
+                "entry_point": entry_point
+            },
+            {"_id": 0}
         )
-
-
-async def get_repo_architecture(repo_id: str) -> Dict[str, Any]:
-    """Retrieve the stored human-readable architecture overview for a given repo_id."""
-    mongo = get_mongo_client()
-    mental = mongo[MENTAL_MODEL_COL]
-    doc = mental.find_one(
-        {"repo_id": repo_id, "document_type": "REPO_ARCHITECTURE"},
-        {"_id": 0},
-    )
-    if not doc:
-        raise ValueError(f"No architecture overview found for repo {repo_id}")
-    return doc
-
-
-async def get_repo_architecture_retrieval(repo_id: str) -> Dict[str, Any]:
-    """
-    Retrieve the stored retrieval-optimized architecture for a given repo_id.
-
-    NOTE: This text is formatted like the human-readable overview, but enriched with
-    inline pointers (exact file paths, entry points, and simple dependency hints)
-    to make downstream LLM Q/A more effective.
-    """
-    mongo = get_mongo_client()
-    mental = mongo[MENTAL_MODEL_COL]
-    doc = mental.find_one(
-        {"repo_id": repo_id, "document_type": "REPO_ARCHITECTURE_RETRIEVAL"},
-        {"_id": 0},
-    )
-    if not doc:
-        raise ValueError(f"No retrieval-optimized architecture found for repo {repo_id}")
-    return doc
+        if not doc:
+            raise ValueError(f"No retrieval doc found for {repo_id}:{entry_point}")
+        return doc
+    else:
+        docs = list(mental.find(
+            {"repo_id": repo_id, "document_type": DOC_RETR},
+            {"_id": 0}
+        ))
+        if not docs:
+            raise ValueError(f"No retrieval docs found for repo {repo_id}")
+        return {"entry_points": docs}

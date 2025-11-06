@@ -115,7 +115,7 @@ async def stream_walkthrough_next(
     repo_summary = get_repo_summary(mongo, repo_id) or ""
     file_code = fetch_code_file(file_path=file_path) or ""
     try:
-        upstream_files, downstream_files = neo4j.file_dependencies(
+        upstream_files, downstream_files = neo4j.file_dependencies_v2(
             repo_id=repo_id, file_path=file_path
         )
     except Exception:
@@ -233,6 +233,8 @@ async def build_repo_walkthrough_plan(
         # - `nodes_out`: unique nodes with MIN level encountered
         # - `edges_out`: all edges encountered (may contain duplicates if discovered via different paths; we dedupe)
         # - `sequence_out`: EVERY traversal event including multiple appearances for same file under different parents
+
+        # print(f"Building walkthrough plan for repo {repo_id} from entry point {entry_fp} with depth {depth}")
         expanded: Set[str] = set()
         nodes_out: Dict[str, dict] = {}
         edges_out: List[dict] = []
@@ -259,12 +261,14 @@ async def build_repo_walkthrough_plan(
             # Expand this node once
             if cur in expanded:
                 continue
+
             expanded.add(cur)
 
             # Fetch downstream deps (files this file references)
             try:
-                _up, downstream = neo.file_dependencies(repo_id, cur)
-            except Exception:
+                _up, downstream = neo.file_dependencies_v2(cur, repo_id)
+            except Exception as e:
+                print(f"EP {entry_fp} - failed to fetch downstream for {cur}: {e}")
                 downstream = []
 
             # Deterministic order
@@ -345,7 +349,7 @@ async def stream_walkthrough_goto(repo_id: str, file_path: str):
     file_code = fetch_code_file(file_path=file_path) or ""
 
     try:
-        upstream_files, downstream_files = neo4j.file_dependencies(repo_id=repo_id, file_path=file_path)
+        upstream_files, downstream_files = neo4j.file_dependencies_v2(repo_id=repo_id, file_path=file_path)
     except Exception:
         upstream_files, downstream_files = [], []
 

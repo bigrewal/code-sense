@@ -87,11 +87,12 @@ async def chat(req: ChatRequest):
 async def ingest_repo(repo_name: str, job_id: str = None):
     local_repo_path = Path("data") / repo_name
 
+    repo_name = f"data/{repo_name}"
     # Return HTTP status code 404 if repository not found
     if not local_repo_path.exists():
         return {"error": f"Repository not found: {local_repo_path}"}, 404
 
-    asyncio.create_task(start_ingestion_pipeline(local_repo_path, job_id))
+    asyncio.create_task(start_ingestion_pipeline(local_repo_path=local_repo_path, repo_name=repo_name, job_id=job_id))
     return {"message": f"Job {job_id} started. Check terminal for results"}
 
 
@@ -112,7 +113,7 @@ async def get_job_status(job_id: str):
 async def list_repos():
     """List all ingested code repositories."""
     # Implement logic to retrieve and return the list of repositories
-    return {"repos": ["data/dictquery", "data/xai-sdk-python", "data/fastapi", "data/nanochat"]}
+    return {"repos": ["data/dictquery", "data/xai-sdk-python", "data/fastapi", "data/nanochat", "data/the-algorithm"]}
 
 
 @app.get("/repo/architecture")
@@ -130,12 +131,12 @@ async def get_repo_arch(repo_id: str):
 async def start_walkthrough(request: WalkthroughRequest):
     db_client = get_mongo_client()
     entry_points = get_entry_point_files(db_client, request.repo_id)
-    repo_summary = get_repo_summary(db_client, request.repo_id)
+    # repo_summary = get_repo_summary(db_client, request.repo_id)
     clear_repo_walkthrough_sessions(request.repo_id)
 
     return {
         "entry_points": entry_points,
-        "repo_summary": repo_summary,
+        # "repo_summary": repo_summary,
         "repo_id": request.repo_id,
     }
 

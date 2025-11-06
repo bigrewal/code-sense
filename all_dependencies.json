@@ -1,0 +1,223 @@
+{
+  "examples/aio/image_generation.py": [],
+  "examples/aio/auth.py": [],
+  "examples/aio/models.py": [],
+  "examples/aio/telemetry.py": [],
+  "examples/aio/function_calling.py": [],
+  "examples/aio/tokenizer.py": [],
+  "examples/aio/chat.py": [],
+  "examples/aio/image_understanding.py": [],
+  "examples/aio/search.py": [],
+  "examples/aio/reasoning.py": [],
+  "examples/aio/deferred_chat.py": [],
+  "examples/aio/structured_outputs.py": [],
+  "examples/sync/image_generation.py": [],
+  "examples/sync/auth.py": [],
+  "examples/sync/models.py": [],
+  "examples/sync/telemetry.py": [],
+  "examples/sync/function_calling.py": [],
+  "examples/sync/tokenizer.py": [],
+  "examples/sync/chat.py": [],
+  "examples/sync/image_understanding.py": [],
+  "examples/sync/search.py": [],
+  "examples/sync/reasoning.py": [],
+  "examples/sync/deferred_chat.py": [],
+  "examples/sync/structured_outputs.py": [],
+  "src/xai_sdk/auth.py": [],
+  "src/xai_sdk/models.py": [],
+  "src/xai_sdk/documents.py": [],
+  "src/xai_sdk/client.py": [],
+  "src/xai_sdk/__init__.py": [
+    "src/xai_sdk/__about__.py",
+    "src/xai_sdk/aio/client.py",
+    "src/xai_sdk/sync/client.py"
+  ],
+  "src/xai_sdk/tokenizer.py": [],
+  "src/xai_sdk/chat.py": [],
+  "src/xai_sdk/__about__.py": [],
+  "src/xai_sdk/search.py": [],
+  "src/xai_sdk/image.py": [],
+  "src/xai_sdk/meta.py": [],
+  "src/xai_sdk/proto/__init__.py": [
+    "src/xai_sdk/proto/v5/auth_pb2.py",
+    "src/xai_sdk/proto/v5/auth_pb2_grpc.py",
+    "src/xai_sdk/proto/v5/chat_pb2.py",
+    "src/xai_sdk/proto/v5/chat_pb2_grpc.py",
+    "src/xai_sdk/proto/v5/deferred_pb2.py",
+    "src/xai_sdk/proto/v5/deferred_pb2_grpc.py",
+    "src/xai_sdk/proto/v5/documents_pb2.py",
+    "src/xai_sdk/proto/v5/documents_pb2_grpc.py",
+    "src/xai_sdk/proto/v5/embed_pb2.py",
+    "src/xai_sdk/proto/v5/embed_pb2_grpc.py",
+    "src/xai_sdk/proto/v5/image_pb2.py",
+    "src/xai_sdk/proto/v5/image_pb2_grpc.py",
+    "src/xai_sdk/proto/v5/models_pb2.py",
+    "src/xai_sdk/proto/v5/models_pb2_grpc.py",
+    "src/xai_sdk/proto/v5/sample_pb2.py",
+    "src/xai_sdk/proto/v5/sample_pb2_grpc.py",
+    "src/xai_sdk/proto/v5/tokenize_pb2.py",
+    "src/xai_sdk/proto/v5/tokenize_pb2_grpc.py",
+    "src/xai_sdk/proto/v5/usage_pb2.py",
+    "src/xai_sdk/proto/v6/auth_pb2.py",
+    "src/xai_sdk/proto/v6/auth_pb2_grpc.py",
+    "src/xai_sdk/proto/v6/chat_pb2.py",
+    "src/xai_sdk/proto/v6/chat_pb2_grpc.py",
+    "src/xai_sdk/proto/v6/deferred_pb2.py",
+    "src/xai_sdk/proto/v6/deferred_pb2_grpc.py",
+    "src/xai_sdk/proto/v6/documents_pb2.py",
+    "src/xai_sdk/proto/v6/documents_pb2_grpc.py",
+    "src/xai_sdk/proto/v6/embed_pb2.py",
+    "src/xai_sdk/proto/v6/embed_pb2_grpc.py",
+    "src/xai_sdk/proto/v6/image_pb2.py",
+    "src/xai_sdk/proto/v6/image_pb2_grpc.py",
+    "src/xai_sdk/proto/v6/models_pb2.py",
+    "src/xai_sdk/proto/v6/models_pb2_grpc.py",
+    "src/xai_sdk/proto/v6/sample_pb2.py",
+    "src/xai_sdk/proto/v6/sample_pb2_grpc.py",
+    "src/xai_sdk/proto/v6/tokenize_pb2.py",
+    "src/xai_sdk/proto/v6/tokenize_pb2_grpc.py",
+    "src/xai_sdk/proto/v6/usage_pb2.py"
+  ],
+  "src/xai_sdk/proto/v6/tokenize_pb2.py": [],
+  "src/xai_sdk/proto/v6/sample_pb2_grpc.py": [
+    "src/xai_sdk/proto/v6/sample_pb2.py"
+  ],
+  "src/xai_sdk/proto/v6/embed_pb2.py": [
+    "src/xai_sdk/proto/v6/image_pb2.py",
+    "src/xai_sdk/proto/v6/usage_pb2.py"
+  ],
+  "src/xai_sdk/proto/v6/models_pb2_grpc.py": [
+    "src/xai_sdk/proto/v6/models_pb2.py"
+  ],
+  "src/xai_sdk/proto/v6/auth_pb2_grpc.py": [
+    "src/xai_sdk/proto/v6/auth_pb2.py"
+  ],
+  "src/xai_sdk/proto/v6/documents_pb2.py": [],
+  "src/xai_sdk/proto/v6/deferred_pb2_grpc.py": [],
+  "src/xai_sdk/proto/v6/image_pb2_grpc.py": [
+    "src/xai_sdk/proto/v6/image_pb2.py"
+  ],
+  "src/xai_sdk/proto/v6/models_pb2.py": [],
+  "src/xai_sdk/proto/v6/chat_pb2.py": [
+    "src/xai_sdk/proto/v6/deferred_pb2.py",
+    "src/xai_sdk/proto/v6/image_pb2.py",
+    "src/xai_sdk/proto/v6/sample_pb2.py",
+    "src/xai_sdk/proto/v6/usage_pb2.py"
+  ],
+  "src/xai_sdk/proto/v6/sample_pb2.py": [
+    "src/xai_sdk/proto/v6/usage_pb2.py"
+  ],
+  "src/xai_sdk/proto/v6/usage_pb2.py": [],
+  "src/xai_sdk/proto/v6/deferred_pb2.py": [],
+  "src/xai_sdk/proto/v6/usage_pb2_grpc.py": [],
+  "src/xai_sdk/proto/v6/embed_pb2_grpc.py": [
+    "src/xai_sdk/proto/v6/embed_pb2.py"
+  ],
+  "src/xai_sdk/proto/v6/documents_pb2_grpc.py": [
+    "src/xai_sdk/proto/v6/documents_pb2.py"
+  ],
+  "src/xai_sdk/proto/v6/tokenize_pb2_grpc.py": [
+    "src/xai_sdk/proto/v6/tokenize_pb2.py"
+  ],
+  "src/xai_sdk/proto/v6/chat_pb2_grpc.py": [
+    "src/xai_sdk/proto/v6/chat_pb2.py",
+    "src/xai_sdk/proto/v6/deferred_pb2.py"
+  ],
+  "src/xai_sdk/proto/v6/image_pb2.py": [],
+  "src/xai_sdk/proto/v6/auth_pb2.py": [],
+  "src/xai_sdk/proto/v5/tokenize_pb2.py": [],
+  "src/xai_sdk/proto/v5/sample_pb2_grpc.py": [
+    "src/xai_sdk/proto/v5/sample_pb2.py"
+  ],
+  "src/xai_sdk/proto/v5/embed_pb2.py": [
+    "src/xai_sdk/proto/v5/image_pb2.py",
+    "src/xai_sdk/proto/v5/usage_pb2.py"
+  ],
+  "src/xai_sdk/proto/v5/models_pb2_grpc.py": [
+    "src/xai_sdk/proto/v5/models_pb2.py"
+  ],
+  "src/xai_sdk/proto/v5/auth_pb2_grpc.py": [
+    "src/xai_sdk/proto/v5/auth_pb2.py"
+  ],
+  "src/xai_sdk/proto/v5/documents_pb2.py": [],
+  "src/xai_sdk/proto/v5/deferred_pb2_grpc.py": [],
+  "src/xai_sdk/proto/v5/image_pb2_grpc.py": [
+    "src/xai_sdk/proto/v5/image_pb2.py"
+  ],
+  "src/xai_sdk/proto/v5/models_pb2.py": [],
+  "src/xai_sdk/proto/v5/chat_pb2.py": [
+    "src/xai_sdk/proto/v5/deferred_pb2.py",
+    "src/xai_sdk/proto/v5/image_pb2.py",
+    "src/xai_sdk/proto/v5/sample_pb2.py",
+    "src/xai_sdk/proto/v5/usage_pb2.py"
+  ],
+  "src/xai_sdk/proto/v5/sample_pb2.py": [
+    "src/xai_sdk/proto/v5/usage_pb2.py"
+  ],
+  "src/xai_sdk/proto/v5/usage_pb2.py": [],
+  "src/xai_sdk/proto/v5/deferred_pb2.py": [],
+  "src/xai_sdk/proto/v5/usage_pb2_grpc.py": [],
+  "src/xai_sdk/proto/v5/embed_pb2_grpc.py": [
+    "src/xai_sdk/proto/v5/embed_pb2.py"
+  ],
+  "src/xai_sdk/proto/v5/documents_pb2_grpc.py": [
+    "src/xai_sdk/proto/v5/documents_pb2.py"
+  ],
+  "src/xai_sdk/proto/v5/tokenize_pb2_grpc.py": [
+    "src/xai_sdk/proto/v5/tokenize_pb2.py"
+  ],
+  "src/xai_sdk/proto/v5/chat_pb2_grpc.py": [
+    "src/xai_sdk/proto/v5/chat_pb2.py",
+    "src/xai_sdk/proto/v5/deferred_pb2.py"
+  ],
+  "src/xai_sdk/proto/v5/image_pb2.py": [],
+  "src/xai_sdk/proto/v5/auth_pb2.py": [],
+  "src/xai_sdk/aio/auth.py": [],
+  "src/xai_sdk/aio/models.py": [],
+  "src/xai_sdk/aio/documents.py": [],
+  "src/xai_sdk/aio/client.py": [
+    "src/xai_sdk/aio/auth.py",
+    "src/xai_sdk/aio/chat.py",
+    "src/xai_sdk/aio/documents.py",
+    "src/xai_sdk/aio/image.py",
+    "src/xai_sdk/aio/models.py",
+    "src/xai_sdk/aio/tokenizer.py"
+  ],
+  "src/xai_sdk/aio/__init__.py": [
+    "src/xai_sdk/auth.py",
+    "src/xai_sdk/chat.py",
+    "src/xai_sdk/client.py",
+    "src/xai_sdk/image.py",
+    "src/xai_sdk/models.py",
+    "src/xai_sdk/tokenizer.py"
+  ],
+  "src/xai_sdk/aio/tokenizer.py": [],
+  "src/xai_sdk/aio/chat.py": [],
+  "src/xai_sdk/aio/image.py": [],
+  "src/xai_sdk/telemetry/config.py": [],
+  "src/xai_sdk/telemetry/__init__.py": [
+    "src/xai_sdk/telemetry/config.py"
+  ],
+  "src/xai_sdk/sync/auth.py": [],
+  "src/xai_sdk/sync/models.py": [],
+  "src/xai_sdk/sync/documents.py": [],
+  "src/xai_sdk/sync/client.py": [
+    "src/xai_sdk/sync/auth.py",
+    "src/xai_sdk/sync/chat.py",
+    "src/xai_sdk/sync/documents.py",
+    "src/xai_sdk/sync/image.py",
+    "src/xai_sdk/sync/models.py",
+    "src/xai_sdk/sync/tokenizer.py"
+  ],
+  "src/xai_sdk/sync/__init__.py": [
+    "src/xai_sdk/auth.py",
+    "src/xai_sdk/chat.py",
+    "src/xai_sdk/client.py",
+    "src/xai_sdk/image.py",
+    "src/xai_sdk/models.py",
+    "src/xai_sdk/tokenizer.py"
+  ],
+  "src/xai_sdk/sync/tokenizer.py": [],
+  "src/xai_sdk/sync/chat.py": [],
+  "src/xai_sdk/sync/image.py": []
+}
