@@ -96,7 +96,7 @@ class ASTProcessorStage():
             #     f"{len(all_edges)} edges created"
             # )
 
-            all_nodes, all_edges = self._prune_graph(all_nodes, all_edges)
+            # all_nodes, all_edges = self._prune_graph(all_nodes, all_edges)
 
             # all_nodes.extend(file_nodes)
             # all_edges.extend(file_edges)

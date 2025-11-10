@@ -9,7 +9,7 @@ from .languages.rust_analyser import RustAnalyzer
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 class CodeAnalyzer:
-    ANALYZERS = {"rust": RustAnalyzer}
+    ANALYZERS = {"scala": ScalaAnalyzer, "python": PythonAnalyzer, "java": JavaAnalyzer, "rust": RustAnalyzer}
 
     def __init__(self, repo: Path, repo_id: str):
         self.repo = repo.resolve()
@@ -33,6 +33,6 @@ class CodeAnalyzer:
         
         
 
-        with open("mappings.json", "w", encoding="utf-8") as f:
-            json.dump(all_maps, f, indent=2)
+        # with open("mappings.json", "w", encoding="utf-8") as f:
+        #     json.dump(all_maps, f, indent=2)
         return all_maps

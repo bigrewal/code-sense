@@ -123,7 +123,7 @@ class MentalModelStage():
             # repo_summary = await self.generate_repo_summary(insights, repo_id)
             # await self.find_entry_points(repo_id)
             await self._set_potential_entry_points(insights, repo_id)
-            await build_repo_architecture_v2(repo_id)
+            # await build_repo_architecture_v2(repo_id)
         
         except Exception as e:
             traceback.print_exc()
@@ -264,46 +264,28 @@ class MentalModelStage():
     async def _set_potential_entry_points(self, insights: List[dict], repo_id: str) -> List[str]:
         """Get potential entry points for the repo based on insights."""
         potential_entry_points = set()
-        cross_file_ref_counts = {}
+        insights_files = {i.get("file_path") for i in insights if i.get("file_path")}
+        
+        for i in insights:
+            fp = i.get("file_path")
+            if fp:
+                potential_entry_points.add(fp)
 
-        insights_files = {insight.get("file_path") for insight in insights}
-        # print(f"Insights files: {insights_files}")
-        # Initially add all files to potential_entry_counts
-        for insight in insights:
-            file_path = insight.get("file_path")
-            potential_entry_points.add(file_path)
+        for i in insights:
+            fp = i.get("file_path")
+            if fp == "data/xai-sdk-python/src/xai_sdk/sync/__init__.py":
+                print(f"Checking file: {fp} with upstream deps: {i.get('upstream_dep_files')}")
 
-        # insight["downstream_dep_files"] = file_dependencies["downstream_files"]
-        # insight["upstream_dep_files"] = file_dependencies["upstream_files"]
-        for insight in insights:
-            # Extract file paths from insights
-            file_path = insight.get("file_path")
-            upstream_dep_files = insight.get("upstream_dep_files", [])
-            # print(f"File: {file_path}, Upstream deps: {upstream_dep_files}")
-
-            # cross_file_ref_counts[file_path] = len(cross_file_paths)
-
-            for upstream_file in upstream_dep_files:
-                if upstream_file in insights_files and file_path in potential_entry_points:
-                    potential_entry_points.remove(file_path)
+            if not fp:
+                continue
+            ups = i.get("upstream_dep_files") or []
+            for u in ups:
+                if u in insights_files:
+                    potential_entry_points.discard(fp)
+                    break
 
         print(f"Potential entry points after upstream dependency check: {potential_entry_points}")
 
-            # for cross_file_path in cross_file_paths :
-            #     if cross_file_path in potential_entry_points and cross_file_path not in insights_files:
-            #         potential_entry_points.remove(cross_file_path)
-
-        # print(f"Potential entry points: {potential_entry_points}")
-        # print(f"Cross-file reference counts: {cross_file_ref_counts}")
-        # if not potential_entry_points:
-        #     if cross_file_ref_counts:
-        #         # Find the minimum number of references
-        #         min_refs = min(cross_file_ref_counts.values())
-        #         # Add files with the minimum number of references to potential entry points
-        #         potential_entry_points.update(
-        #             file_path for file_path, ref_count in cross_file_ref_counts.items()
-        #             if ref_count == min_refs
-        #         )
         
         # Add potential entry points to the DB
         for file_path in potential_entry_points:
