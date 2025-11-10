@@ -27,6 +27,16 @@ class JavaAnalyzer(BaseLSPAnalyzer):
 
     def get_language_id(self) -> str:
         return "java"
+    
+    def needs_did_open(self) -> bool:
+        return True
+
+    def get_max_concurrency(self) -> int:
+        import os
+        return min(32, max(8, (os.cpu_count() or 8)))
+
+    def get_warmup_seconds(self) -> float:
+        return 120.0
 
     def ref_pos_extractor(self, text: str, path: Path) -> List[Tuple[int, int]]:
         lang = get_language("java")

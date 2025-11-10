@@ -28,7 +28,8 @@ from bson import ObjectId
 
 from ..db import Neo4jClient, get_neo4j_client, get_mongo_client
 from ..llm import GroqLLM
-from ..repo_arch_service import build_repo_architecture_v2
+# from ..repo_arch_service import build_repo_architecture_v2
+from ..repo_arch_service_me import build_repo_architecture_v2
 
 
 # --- add this helper anywhere in the class/file (module-level is fine) ---
@@ -354,7 +355,7 @@ class MentalModelStage():
 
             system_prompt = (
                 "Your task is to analyze the provided code file and determine if it is critical to the core functionality of the repository. "
-                "If the file is critical, provide a summary of its purpose and functionality."
+                "If the file is identified as critical, explain in detail: (1) the overall purpose of the file, and (2) what each component in the file does and how they interact with one another and with any external dependencies"
                 "Simply output \"IGNORE\" if the file is not critical.\n\n"
                 "Ignore:\n"
                 "- tutorial example files,\n"

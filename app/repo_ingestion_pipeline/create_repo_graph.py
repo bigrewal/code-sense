@@ -14,7 +14,7 @@ from ..models.data_model import (
     ReferenceResolutionResult, CodeFile, 
     ASTNode, CodeGraph
 )
-from ..parse_dependencies import parse_dependencies
+# from ..parse_dependencies import parse_dependencies
 from ..db import get_neo4j_client
 
 LANGUAGE_DEFINITION_MAP = {

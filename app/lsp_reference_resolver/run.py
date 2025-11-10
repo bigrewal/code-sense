@@ -3,11 +3,13 @@ from pathlib import Path
 from .core.base_analyser import BaseLSPAnalyzer
 from .languages.python_analyser import PythonAnalyzer
 from .languages.scala_analyser import ScalaAnalyzer
+from .languages.java_analyser import JavaAnalyzer
+from .languages.rust_analyser import RustAnalyzer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 class CodeAnalyzer:
-    ANALYZERS = {"scala": ScalaAnalyzer, "python": PythonAnalyzer}
+    ANALYZERS = {"rust": RustAnalyzer}
 
     def __init__(self, repo: Path, repo_id: str):
         self.repo = repo.resolve()

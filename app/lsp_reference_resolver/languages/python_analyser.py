@@ -79,8 +79,8 @@ class PythonAnalyzer(BaseLSPAnalyzer):
 
             # Exclude any identifier that sits in a binding slot (parent, field)
             field = _field_name_in_parent(node)
-            if (p.type, field) in BINDING_SLOTS or (p.type, None) in BINDING_SLOTS:
-                continue
+            # if (p.type, field) in BINDING_SLOTS or (p.type, None) in BINDING_SLOTS:
+            #     continue
 
             # Also skip keyword_identifier nodes (rare edge in some grammars)
             if p.type == "keyword_identifier":

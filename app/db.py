@@ -469,6 +469,76 @@ class Neo4jClient:
                 out[def_id] = {"upstream": upstream, "downstream": downstream}
         return out
 
+    def cross_file_interactions_in_file(self, file_path: str, repo_id: str):
+        """Infer cross-file interactions for a given file by finding references to and from definitions in other files."""
+
+        # Downstream: file_path → other files
+        downstream_query = """
+        MATCH (ref:ASTNode {repo_id: $repo_id, file_path: $file_path, is_reference: true})
+        -[:REFERENCES]->(ident:ASTNode)
+        WHERE ident.file_path <> $file_path
+        MATCH (def:ASTNode)
+        WHERE def.node_id = ident.parent_id
+        RETURN DISTINCT ref.name AS ref_name, def.node_type AS node_type, def.file_path AS def_file_path
+        """
+
+        # Upstream: other files → file_path
+        upstream_query = """
+        MATCH (ref:ASTNode {repo_id: $repo_id, is_reference: true})
+        -[:REFERENCES]->(ident:ASTNode {file_path: $file_path})
+        MATCH (def:ASTNode)
+        WHERE def.node_id = ident.parent_id
+        RETURN DISTINCT ref.file_path AS ref_file_path, ref.name AS ref_name, def.node_type AS node_type
+        """
+
+        with self.driver.session() as session:
+            # Downstream
+            downstream_result = list(session.run(downstream_query, repo_id=repo_id, file_path=file_path))
+            # downstream_interactions = [
+            #     f"{record['ref_name']} REFERENCES {record['node_type']} IN {record['def_file_path']}"
+            #     for record in downstream_result
+            # ]
+            downstream_interactions = {}
+            for record in downstream_result:
+                def_file = record['def_file_path']
+                interaction = f"{record['ref_name']} REFERENCES {record['node_type']} IN {def_file}"
+                if def_file not in downstream_interactions:
+                    downstream_interactions[def_file] = []
+                downstream_interactions[def_file].append(interaction)
+
+            downstream_files = {
+                record['def_file_path'] for record in downstream_result if record['def_file_path'] != file_path
+            }
+
+            # Upstream
+            upstream_result = list(session.run(upstream_query, repo_id=repo_id, file_path=file_path))
+            # upstream_interactions = [
+            #     f"{record['ref_name']} IN {record['ref_file_path']} REFERENCES {record['node_type']} IN {file_path}"
+            #     for record in upstream_result
+            # ]
+            upstream_interactions = {}
+            for record in upstream_result:
+                ref_file = record['ref_file_path']
+                interaction = f"{record['ref_name']} IN {ref_file} REFERENCES {record['node_type']} IN {file_path}"
+                if ref_file not in upstream_interactions:
+                    upstream_interactions[ref_file] = []
+                upstream_interactions[ref_file].append(interaction)
+
+
+            upstream_files = {
+                record['ref_file_path'] for record in upstream_result if record['ref_file_path'] != file_path
+            }
+
+            return {
+                "downstream": {
+                    "interactions": downstream_interactions,
+                    "files": downstream_files,
+                },
+                "upstream": {
+                    "interactions": upstream_interactions,
+                    "files": upstream_files,
+                },
+            }
 
     def close(self):
         """Close the Neo4j connection."""
@@ -525,6 +595,23 @@ def get_repo_summary(db_client, repo_id: str) -> str:
     if doc:
         return doc.get("data", "")  
     return ""
+
+def get_brief_file_overviews(db_client, repo_id: str, file_paths: List[str]) -> List[Dict[str, str]]:
+        """
+        Fetch BRIEF_FILE_OVERVIEW for a batch of files.
+        Returns list of {file_path, brief} dicts.
+        """
+        collection = db_client["mental_model"]
+        result = []
+        for file_path in file_paths:
+            doc = collection.find_one(
+                {"repo_id": repo_id, "document_type": "BRIEF_FILE_OVERVIEW", "file_path": file_path},
+                {"_id": 0, "data": 1},
+            )
+            brief = (doc or {}).get("data", "")
+            if brief:
+                result.append({"file_path": file_path, "brief": brief})
+        return result
 
 # Global shared client
 neo4j_client: Neo4jClient = None

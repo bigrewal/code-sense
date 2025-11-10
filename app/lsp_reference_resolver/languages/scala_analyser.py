@@ -30,7 +30,6 @@ class ScalaAnalyzer(BaseLSPAnalyzer):
         return 120.0
 
     def get_max_concurrency(self) -> int:
-        # keep previous behavior for Scala
         import os
         return min(32, max(8, (os.cpu_count() or 8)))
 
