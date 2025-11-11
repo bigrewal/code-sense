@@ -123,7 +123,7 @@ class MentalModelStage():
             # repo_summary = await self.generate_repo_summary(insights, repo_id)
             # await self.find_entry_points(repo_id)
             await self._set_potential_entry_points(insights, repo_id)
-            # await build_repo_architecture_v2(repo_id)
+            await build_repo_architecture_v2(repo_id)
         
         except Exception as e:
             traceback.print_exc()
@@ -337,7 +337,7 @@ class MentalModelStage():
 
             system_prompt = (
                 "Your task is to analyze the provided code file and determine if it is critical to the core functionality of the repository. "
-                "If the file is identified as critical, explain in detail: (1) the overall purpose of the file, and (2) what each component in the file does and how they interact with one another and with any external dependencies"
+                "If the file is identified as critical, explain 2-3 lines why it is important, focusing on its role and impact within the codebase. "
                 "Simply output \"IGNORE\" if the file is not critical.\n\n"
                 "Ignore:\n"
                 "- tutorial example files,\n"

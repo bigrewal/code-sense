@@ -68,14 +68,7 @@ class ASTProcessorStage():
             
             # Discover code files
             code_files = await self._discover_code_files(repo_path)
-            # print(f"Job {self.job_id}: Found {len(code_files)} code files to process")
-
-            # Resolve file dependencies
-            # code_file_dependencies: Dict[str, List[str]] = parse_dependencies(repo_path)
-            # file_nodes, file_edges = await self._process_file_deps(code_file_dependencies)
-
-            # Process each file and create AST
-            # Create shared lookup dictionary
+            
             global_leaf_lookup = {}
             all_nodes = []
             all_edges = []
@@ -91,15 +84,12 @@ class ASTProcessorStage():
             reference_edges = self._create_reference_edges(all_nodes, reference_results, global_leaf_lookup)
             all_edges.extend(reference_edges)
 
-            # print(
-            #     f"Job {self.job_id}: Pre-Pruning: {len(all_nodes)} nodes, "
-            #     f"{len(all_edges)} edges created"
-            # )
+            print(
+                f"Job {self.job_id}: Pre-Pruning: {len(all_nodes)} nodes, "
+                f"{len(all_edges)} edges created"
+            )
 
-            # all_nodes, all_edges = self._prune_graph(all_nodes, all_edges)
-
-            # all_nodes.extend(file_nodes)
-            # all_edges.extend(file_edges)
+            all_nodes, all_edges = self._prune_graph(all_nodes, all_edges)
 
 
             print(f"Job {self.job_id}: Created {len(all_edges)} edges")
@@ -171,81 +161,6 @@ class ASTProcessorStage():
                 print(f"Job {self.job_id}: Failed to read file {file_path}: {str(e)}")
         
         return code_files
-    
-    # This only creates file-to-file dependency nodes and edges for code files where Stack graphs fail us.
-    async def _process_file_deps(self, file_dependencies: Dict[str, List[str]]) -> Tuple[List[ASTNode], List[dict]]:
-        """
-        Build a lightweight AST/graph for file-to-file dependencies.
-
-        Given a mapping of {source_file: [target_file, ...]}, this method:
-        - Creates one ASTNode per unique file (node_type="file").
-        - Creates directed edges from each source file to each target file.
-        - Uses edge type "DEPENDS_ON" to distinguish from structural "CONTAINS" edges.
-
-        Returns:
-            (nodes, edges): A tuple where `nodes` is a list of ASTNode instances,
-                            and `edges` is a list of edge dicts like in _process_file_ast.
-        """
-        nodes: List[ASTNode] = []
-        edges: List[dict] = []
-
-        if not file_dependencies:
-            return nodes, edges
-
-        # Collect all unique files (both sources and targets)
-        unique_files: set[str] = set()
-        for src, tgts in file_dependencies.items():
-            if src:
-                unique_files.add(src)
-            for tgt in tgts or []:
-                if tgt:
-                    unique_files.add(tgt)
-
-        # Create a node per unique file
-        file_node_map: Dict[str, str] = {}  # file_path -> node_id
-        for file_path in sorted(unique_files):
-            # Construct a stable node_id. We don't have repo_id here, so namespace with job_id and "scala"
-            node_id = f"{self.job_id}:scala:{file_path}:0:0:file"
-
-            node = ASTNode(
-                node_id=node_id,
-                node_type="file",
-                start_line=0,
-                start_column=0,
-                end_line=0,
-                end_column=0,
-                parent_id=None,
-                children_ids=[],
-                is_definition=True,
-                file_path=str(file_path),
-            )
-            # Optional metadata, in line with how _process_file_ast adds dynamic fields
-            node.name = str(file_path)
-
-            nodes.append(node)
-            file_node_map[file_path] = node_id
-
-        # Create dependency edges: source_file --DEPENDS_ON--> target_file
-        for src, tgts in file_dependencies.items():
-            if not src or src not in file_node_map:
-                continue
-
-            src_id = file_node_map[src]
-            sequence = 1
-            for tgt in tgts or []:
-                tgt_id = file_node_map.get(tgt)
-                if not tgt_id:
-                    continue
-
-                edges.append({
-                    "source": src_id,
-                    "target": tgt_id,
-                    "type": "DEPENDS_ON",
-                    "sequence": sequence,
-                })
-                sequence += 1
-
-        return nodes, edges
 
     async def _process_file_ast(self, code_file: CodeFile, repo_id: str, global_leaf_lookup: dict = None) -> tuple[List[ASTNode], List[dict]]:
         """Process a single file and create AST nodes and edges."""
