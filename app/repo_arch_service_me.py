@@ -173,7 +173,7 @@ class RepoArchService:
         - Do NOT list code line by line or describe syntax.
         - Do NOT use headings like "Depth" or mention how the summary was built.
         - Keep the explanation technically accurate and logically organized.
-        - Preserve all important details from earlier summaries; integrate new ones naturally.
+        - Make sure to keep ALL details that are critical to understanding the behaviour of the system. 
         - If information is missing, use an em dash (—).
 
         OVERALL STRUCTURE (keep this stable in every iteration):

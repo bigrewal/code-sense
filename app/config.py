@@ -6,7 +6,8 @@ load_dotenv(".env.local")
 
 class Config:
     GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-    LLM_MODEL = "openai/gpt-oss-20b"
+    GPT_OSS_20GB_MODEL = "openai/gpt-oss-20b"
+    GPT_OSS_120GB_MODEL = "openai/gpt-oss-120b"
     LLM_TEMPERATURE = 0.7
     LLM_MAX_TOKENS = 10240
 

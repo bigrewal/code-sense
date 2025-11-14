@@ -91,9 +91,10 @@ class GroqLLM:
         temperature: Optional[float] = None,
         response_format: Optional[Dict[str, any]] = None,
         reasoning_effort: Optional[str] = None,
+        model: str = Config.GPT_OSS_20GB_MODEL,
     ) -> any:
         kwargs = {
-            "model": Config.LLM_MODEL,
+            "model": model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},

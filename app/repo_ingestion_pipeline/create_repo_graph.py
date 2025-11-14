@@ -18,23 +18,20 @@ from ..models.data_model import (
 from ..db import get_neo4j_client
 
 LANGUAGE_DEFINITION_MAP = {
-    "python": {"function_definition", "class_definition"},
-    "javascript": {
-        "function_declaration", "class_declaration", "method_definition",
-        "arrow_function", "generator_function", "variable_declarator"
+    "python": {"function_definition", "class_definition", "assignment"},
+    "rust": {
+        "struct_item", "enum_item", "union_item", "type_item",
+        "function_item", "trait_item", "mod_item", "macro_definition"
     },
-    "typescript": {
-        "function_declaration", "class_declaration", "method_definition",
-        "arrow_function", "variable_declarator",
-        "interface_declaration", "type_alias_declaration",
-        "enum_declaration", "abstract_class_declaration",
-        "module_declaration"
+    "scala": {
+        "package_clause", "trait_definition", "enum_definition",
+        "simple_enum_case", "full_enum_case", "class_definition",
+        "object_definition", "function_definition", "val_definition",
+        "given_definition", "var_definition", "val_declaration",
+        "var_declaration", "type_definition", "class_parameter"
     },
     "java": {
-        "class_declaration", "interface_declaration", "enum_declaration",
-        "annotation_type_declaration", "method_declaration",
-        "constructor_declaration", "field_declaration",
-        "record_declaration"
+        "class_declaration", "method_declaration", "interface_declaration"
     }
 }
 

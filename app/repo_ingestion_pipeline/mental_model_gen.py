@@ -30,6 +30,7 @@ from ..db import Neo4jClient, get_neo4j_client, get_mongo_client
 from ..llm import GroqLLM
 # from ..repo_arch_service import build_repo_architecture_v2
 from ..repo_arch_service_me import build_repo_architecture_v2
+from ..reverse_eng_service import reverse_engineer
 
 
 # --- add this helper anywhere in the class/file (module-level is fine) ---
@@ -123,7 +124,8 @@ class MentalModelStage():
             # repo_summary = await self.generate_repo_summary(insights, repo_id)
             # await self.find_entry_points(repo_id)
             await self._set_potential_entry_points(insights, repo_id)
-            await build_repo_architecture_v2(repo_id)
+            # await build_repo_architecture_v2(repo_id)
+            await reverse_engineer(repo_id)
         
         except Exception as e:
             traceback.print_exc()
