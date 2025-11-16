@@ -124,8 +124,8 @@ class MentalModelStage():
             # repo_summary = await self.generate_repo_summary(insights, repo_id)
             # await self.find_entry_points(repo_id)
             await self._set_potential_entry_points(insights, repo_id)
-            # await build_repo_architecture_v2(repo_id)
-            await reverse_engineer(repo_id)
+            await build_repo_architecture_v2(repo_id)
+            # await reverse_engineer(repo_id)
         
         except Exception as e:
             traceback.print_exc()
@@ -275,8 +275,6 @@ class MentalModelStage():
 
         for i in insights:
             fp = i.get("file_path")
-            if fp == "data/xai-sdk-python/src/xai_sdk/sync/__init__.py":
-                print(f"Checking file: {fp} with upstream deps: {i.get('upstream_dep_files')}")
 
             if not fp:
                 continue

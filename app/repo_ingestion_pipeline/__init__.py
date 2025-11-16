@@ -12,6 +12,6 @@ async def start_ingestion_pipeline(local_repo_path: Path, repo_name: str, job_id
 
     config = Config()
     # resolved_refs: Dict[str, Any] = await ReferenceResolver({"job_id": job_id, **config.RESOLVER_CONFIG}).run(repo_path=local_repo_path, repo_id=repo_name)
-    # # print(f"Resolved References")
-    # await ASTProcessorStage({"job_id": job_id, **config.AST_CONFIG}).run(local_path=local_repo_path, repo_id=repo_name, reference_results=resolved_refs)
-    await MentalModelStage({"job_id": job_id}).run(repo_id=repo_name, local_repo_path=local_repo_path)
+    # print(f"Resolved References")
+    await ASTProcessorStage({"job_id": job_id, **config.AST_CONFIG}).run(local_path=local_repo_path, repo_id=repo_name)
+    # await MentalModelStage({"job_id": job_id}).run(repo_id=repo_name, local_repo_path=local_repo_path)

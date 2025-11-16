@@ -26,6 +26,7 @@ class GroqLLM:
         temperature: Optional[float] = None,
         response_format: Optional[Dict[str, any]] = None,
         reasoning_effort: Optional[str] = "low",
+        model: str = Config.GPT_OSS_20GB_MODEL,
         stream: bool = False,
         tools: Optional[list] = None,
         tool_choice: str = None,
@@ -42,7 +43,7 @@ class GroqLLM:
             convo = messages
 
         kwargs = {
-            "model": Config.LLM_MODEL,
+            "model": model,
             "messages": convo,
             "temperature": temperature if temperature is not None else Config.LLM_TEMPERATURE,
             "max_tokens": max_tokens if max_tokens is not None else Config.LLM_MAX_TOKENS,

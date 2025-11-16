@@ -1,10 +1,12 @@
 from .db import get_mongo_client, get_neo4j_client, get_potential_entry_points, get_brief_file_overviews
 from .llm import GroqLLM
+from .config import Config
 
 MENTAL_MODEL_COL = "mental_model"
 
 DOC_HUMAN = "REPO_ARCHITECTURE"
-DOC_ROLLING_SUMMARY = "ROLLING_SUMMARY"
+DOC_FILE_SUMMARY = "FILE_SUMMARY"
+
 
 class RepoArchService:
     def __init__(self, repo_id: str):
@@ -15,260 +17,414 @@ class RepoArchService:
         self.mental = self.mongo_client[MENTAL_MODEL_COL]
         self.llm = GroqLLM()
 
-    def get_repo_architecture(self):
+    def get_repo_architecture(self) -> dict[str, str]:
+        """
+        Build architecture overviews by doing a bottom-up DFS from each entry point.
+
+        For each file:
+        - If a FILE_SUMMARY exists in MongoDB, reuse it.
+        - Otherwise, recursively summarize children (downstream dependencies) first,
+          then create this file's summary by merging its own behaviour with the
+          summaries of its immediate children and its upstream/downstream interactions.
+
+        The REPO_ARCHITECTURE document for an entry point is simply the summary of
+        the entry point file (which itself incorporates its subtree).
+        """
         entry_points = get_potential_entry_points(self.mongo_client, self.repo_id) or []
         if not entry_points:
             raise ValueError(f"No entry points found for repo {self.repo_id}")
-        
+
+        results: dict[str, str] = {}
+
         for ep in entry_points:
             print(f"Creating repo overview for entry point: {ep}")
-            self.ep_analyse(entry_point=ep)
+            summary = self.ep_analyse(entry_point=ep)
+            results[ep] = summary
 
+        return results
 
     def ep_analyse(self, entry_point: str) -> str:
-        # ---------- 1) Build depth layers (BFS) ----------
-        from collections import defaultdict, deque
+        """
+        Build (or reuse) a bottom-up summary rooted at `entry_point`.
 
-        files_by_depth = defaultdict(list)
-        visited = set([entry_point])
-        all_files = set([entry_point])
-        queue = deque([(entry_point, 0)])
+        This uses DFS to ensure children are summarized before parents.
+        """
+        visited: set[str] = set()
+        visiting: set[str] = set()
 
-        while queue:
-            file_path, depth = queue.popleft()
-            files_by_depth[depth].append(file_path)
+        entry_summary = self._summarize_file_dfs(
+            file_path=entry_point,
+            visited=visited,
+            visiting=visiting,
+        )
 
-            cfi = self.neo4j_client.cross_file_interactions_in_file(
-                file_path=file_path,
-                repo_id=self.repo_id
-            )
-            downstream_files = cfi["downstream"]["files"]
-            # downstream_files may be a set; normalize to iteration-safe
-            for dep in list(downstream_files):
-                if dep not in visited:
-                    visited.add(dep)
-                    all_files.add(dep)
-                    queue.append((dep, depth + 1))
+        total_files = len(visited)
 
-        max_depth = max(files_by_depth.keys()) if files_by_depth else 0
-
-        # ---------- 2) Iteratively merge per depth ----------
-        rolling_summary = ""  # this accumulates the merged overview
-
-        for depth in range(0, max_depth + 1):
-            layer_files = files_by_depth.get(depth, [])
-            if not layer_files:
-                continue
-
-            # Collect code for the current layer
-            layer_code_map = self.get_code_for_file(layer_files)  # {path: code}
-
-            # Aggregate observed interactions for this layer (restricted to discovered graph)
-            downstream_interactions = []
-            upstream_interactions = []
-
-            for path in layer_files:
-                cfi = self.neo4j_client.cross_file_interactions_in_file(
-                    file_path=path,
-                    repo_id=self.repo_id
-                )
-
-                # Only keep interactions that involve files we actually discovered (all_files)
-                for fname, interactions in cfi.get("downstream", {}).get("interactions", {}).items():
-                    if fname in all_files:
-                        downstream_interactions.extend(interactions)
-
-                for fname, interactions in cfi.get("upstream", {}).get("interactions", {}).items():
-                    if fname in all_files:
-                        upstream_interactions.extend(interactions)
-
-            # Check for an existing cached rolling summary at this depth (resume capability)
-            existing = self.mental.find_one({
-                "repo_id": self.repo_id,
-                "document_type": DOC_ROLLING_SUMMARY,
-                "entry_point": entry_point,
-                "depth": depth
-            })
-
-            if existing and existing.get("rolling_summary"):
-                rolling_summary = existing["rolling_summary"]
-            else:
-                # ---------- LLM merge step ----------
-                # NOTE: llm_summarize will be updated next to accept these arguments
-                rolling_summary = self.llm_summarize(
-                    previous_summary=rolling_summary,            # merged overview so far (string)
-                    entry_point=entry_point,                     # hinge for coherence
-                    depth=depth,                                  # current depth
-                    layer_file_paths=layer_files,                # list[str]
-                    layer_file_codes=layer_code_map,             # dict[str, str]
-                    downstream_interactions=downstream_interactions,
-                    upstream_interactions=upstream_interactions
-                )
-
-                # Persist per-depth rolling summary for resumability
-                key = {
-                    "repo_id": self.repo_id,
-                    "document_type": DOC_ROLLING_SUMMARY,
-                    "entry_point": entry_point,
-                    "depth": depth,
-                    "rolling_summary": rolling_summary
-                }
-                self.mental.update_one(key, {"$set": key}, upsert=True)
-
-        # ---------- 3) Persist the final merged overview ----------
+        # Persist the final merged overview as the human-facing architecture doc
         final_doc = {
             "repo_id": self.repo_id,
             "document_type": DOC_HUMAN,
             "entry_point": entry_point,
-            "architecture_summary": rolling_summary
+            "architecture_summary": entry_summary,
+            "total_files": total_files,
         }
         self.mental.update_one(
             {"repo_id": self.repo_id, "document_type": DOC_HUMAN, "entry_point": entry_point},
             {"$set": final_doc},
-            upsert=True
+            upsert=True,
         )
 
-        return rolling_summary
+        return entry_summary
 
+    # -------------------------------------------------------------------------
+    # DFS + per-file summarization
+    # -------------------------------------------------------------------------
 
-    def llm_summarize(
+    def _summarize_file_dfs(
         self,
-        *,
-        previous_summary: str,
-        entry_point: str,
-        depth: int,
-        layer_file_paths: list[str],
-        layer_file_codes: dict[str, str],
-        downstream_interactions: list[str],
-        upstream_interactions: list[str],
+        file_path: str,
+        visited: set[str],
+        visiting: set[str],
     ) -> str:
         """
-        Rolling merge summarizer:
-        - Takes the existing merged overview (previous_summary)
-        - Integrates the current depth's files + interactions
-        - Returns a single, coherent, comprehensive overview
+        DFS helper that ensures we summarize children before parents.
 
-        Keep this SIMPLE and iterative: each call expands/refines without losing detail.
+        For a given file:
+        1. DFS into downstream dependencies (children) first.
+        2. Reuse existing FILE_SUMMARY from MongoDB if present.
+        3. Otherwise, call the LLM to create a new summary, merging:
+           - This file's own code
+           - Summaries of its immediate children
+           - Upstream and downstream interactions
         """
+        # If we already fully processed this file, reuse its summary from Mongo (if any)
+        if file_path in visited:
+            existing = self.mental.find_one({
+                "repo_id": self.repo_id,
+                "document_type": DOC_FILE_SUMMARY,
+                "file_path": file_path,
+            })
+            if existing and existing.get("summary"):
+                return existing["summary"]
+            # Fall through and recompute if somehow visited but no summary stored
 
-        # Build compact, deterministic blocks for the new layer
-        files_block = "\n\n".join(
-            f"- `{p}`\n```\n{(layer_file_codes.get(p) or '').strip()}\n```"
-            for p in layer_file_paths
+        # Cycle protection
+        if file_path in visiting:
+            # We avoid infinite recursion; give a minimal note so the parent still gets something.
+            return f"A cycle was detected involving `{file_path}`. This file participates in a circular dependency; see its callers and callees in the graph for details."
+
+        visiting.add(file_path)
+
+        # Get cross-file interactions for this file
+        cfi = self.neo4j_client.cross_file_interactions_in_file(
+            file_path=file_path,
+            repo_id=self.repo_id,
+        )
+        downstream_info = cfi.get("downstream", {}) or {}
+        upstream_info = cfi.get("upstream", {}) or {}
+
+        downstream_files = list(downstream_info.get("files", []) or [])
+
+        # First, summarize all children (downstream dependencies)
+        child_summaries: dict[str, str] = {}
+        for child_path in downstream_files:
+            child_summary = self._summarize_file_dfs(child_path, visited, visiting)
+            if child_summary:
+                child_summaries[child_path] = child_summary
+
+        visiting.remove(file_path)
+
+        # Check if a summary for this file already exists
+        existing = self.mental.find_one({
+            "repo_id": self.repo_id,
+            "document_type": DOC_FILE_SUMMARY,
+            "file_path": file_path,
+        })
+
+        if existing and existing.get("summary"):
+            summary = existing["summary"]
+        else:
+            # Gather code for this file
+            file_code_map = self.get_code_for_file([file_path])
+            file_code = (file_code_map.get(file_path) or "").strip()
+
+            # Flatten interactions into simple text lists for the prompt
+            downstream_interactions: list[str] = []
+            for dep_file, interactions in (downstream_info.get("interactions", {}) or {}).items():
+                for inter in interactions or []:
+                    downstream_interactions.append(f"{file_path} → {dep_file}: {inter}")
+
+            upstream_interactions: list[str] = []
+            for src_file, interactions in (upstream_info.get("interactions", {}) or {}).items():
+                for inter in interactions or []:
+                    upstream_interactions.append(f"{src_file} → {file_path}: {inter}")
+
+            summary = self.llm_summarize_file(
+                file_path=file_path,
+                file_code=file_code,
+                child_summaries=child_summaries,
+                upstream_interactions=upstream_interactions,
+                downstream_interactions=downstream_interactions,
+            )
+
+            doc = {
+                "repo_id": self.repo_id,
+                "document_type": DOC_FILE_SUMMARY,
+                "file_path": file_path,
+                "summary": summary,
+            }
+            self.mental.update_one(
+                {
+                    "repo_id": self.repo_id,
+                    "document_type": DOC_FILE_SUMMARY,
+                    "file_path": file_path,
+                },
+                {"$set": doc},
+                upsert=True,
+            )
+
+        visited.add(file_path)
+        return summary
+
+    # -------------------------------------------------------------------------
+    # LLM summarization for a single file (bottom-up)
+    # -------------------------------------------------------------------------
+
+    def llm_summarize_file(
+        self,
+        *,
+        file_path: str,
+        file_code: str,
+        child_summaries: dict[str, str],
+        upstream_interactions: list[str],
+        downstream_interactions: list[str],
+    ) -> str:
+        """
+        Create a dense but readable summary for a single file, using a fixed structure:
+
+        - Overall purpose: what this file is responsible for, in the context of the system.
+        - How it works (Step 1, Step 2, ...): a clear, newcomer-friendly walkthrough.
+        - Final output / effect: what comes out of this file (side effects, return values, state changes).
+
+        The summary:
+        - Should reference functions/methods and the file path using backticks (e.g. `process_payment` in `payments/service.py`).
+        - Should explain what the parent uses its children for AND what upstream callers use this file for.
+        - Should be information-dense but not cryptic; it must stay easy to read.
+        """
+        children_block = "\n\n".join(
+            f"Child file: `{child_path}`\nExisting summary:\n{summary}"
+            for child_path, summary in (child_summaries or {}).items()
         ) or "—"
 
-        downstream_block = "\n".join(f"- {i}" for i in (downstream_interactions or [])) or "—"
         upstream_block = "\n".join(f"- {i}" for i in (upstream_interactions or [])) or "—"
+        downstream_block = "\n".join(f"- {i}" for i in (downstream_interactions or [])) or "—"
 
         system_prompt = """
-        You are an expert software engineer and technical writer. 
-        Your goal is to create a clear, accurate, and easy-to-read architecture overview 
-        that helps a newcomer quickly understand how this repository works.
+            You are an expert software engineer and technical writer.
 
-        CRITICAL REQUIREMENTS
-        - Audience: developers new to the repository who need to understand its structure and flow.
-        - Focus on clarity, coherence, and practical understanding.
-        - Style: neutral, explanatory, and instructional. Avoid unnecessary jargon or repetition.
-        - Always include file names and component names (functions, classes, methods) in backticks.
-        - Do NOT list code line by line or describe syntax.
-        - Do NOT use headings like "Depth" or mention how the summary was built.
-        - Keep the explanation technically accurate and logically organized.
-        - Make sure to keep ALL details that are critical to understanding the behaviour of the system. 
-        - If information is missing, use an em dash (—).
+            Your task is to produce a clear and newcomer-friendly explanation
+            of how a **single source file** works AND how the entire subtree of files
+            beneath it works.
 
-        OVERALL STRUCTURE (keep this stable in every iteration):
+            This summary may eventually represent the *entire repository architecture*
+            when the root entry point is summarized, so your output must integrate and
+            compress all relevant behaviour from the file’s direct children and their
+            children (through their summaries).
 
-        # Repository Architecture Overview
+            ---------------------------------------------------------------------------
+            CRITICAL REQUIREMENTS
+            ---------------------------------------------------------------------------
 
-        ## Overview
-        Start with a few paragraphs describing what this repository or system does overall, 
-        its main purpose, and the core problem it solves. 
-        Then, give a brief sense of how the different parts fit together.
+            AUDIENCE
+            - Developers new to the repository who need to understand how the system
+            works end-to-end by reading *only this summary*.
 
-        ## Key Components
-        List and describe the major files, modules, classes, and functions. 
-        For each, explain what it does and how it fits into the broader system.
-        Be concise but specific — what data it handles, what tasks it performs, and how it interacts with other components.
-        Reference other files or functions by name (wrapped in backticks).
+            OVERALL GOAL
+            - Each parent summary must **merge** and **absorb** the important behaviour of
+            its children.
+            - A reader should NOT need to read the child summaries separately; all
+            essential behaviour must be pulled upward and restated in this file’s
+            summary.
 
-        ## Control Flow and Interactions
-        Explain how control and data move through the system in a logical order.
-        Use directional arrows (→) to show who calls whom and for what purpose.
-        Example:
-        `main.py` → `parser.py` — parses configuration and input data.
-        `parser.py` → `executor.py` — runs tasks based on parsed instructions.
-        Focus on the "story" of execution from start to finish — what happens first, what follows, and why.
+            STYLE
+            - Concise but NOT cryptic. Use short, complete sentences and small paragraphs.
+            - High information density without reducing readability.
+            - Don't miss any important behaviour in parents or children.
+            - Avoid repetition, filler, or listing code line-by-line.
+            - Focus entirely on behaviour, flow, and responsibilities.
+            - Always refer to functions, methods, classes, and files using backticks.
 
-        ## Data and External Systems
-        Describe how the repository interacts with databases, APIs, configuration files, message queues, or external tools.
-        Clarify which modules handle these interactions and how data moves between them.
+            ---------------------------------------------------------------------------
+            WHAT “MERGE” MEANS — VERY IMPORTANT
+            ---------------------------------------------------------------------------
 
-        ## Design Patterns and Principles
-        Briefly mention any architectural patterns or design choices (e.g., visitor pattern, MVC, pipeline).
-        Explain why they exist and how they help organize the system.
+            When this file depends on child files:
 
-        ## Error Handling and Edge Cases
-        Highlight any notable error handling strategies, recovery mechanisms, or constraints.
+            1. **Pull essential behaviour upward**
+            - For each child, extract the key responsibilities, major steps, and
+                important logic described in its summary.
+            - Integrate these into THIS file’s explanation of how it works.
+            - Do not merely reference the child — *explain what it does*.
+            - Don't miss any important behaviour; the goal is to make the entire subtree
+                understandable from this summary alone.
 
-        ## Summary
-        End with a short recap that ties everything together — 
-        what the repo accomplishes, how its pieces collaborate, and what a new contributor should explore first to gain deeper understanding.
+            2. **Explain what the parent uses each child for**
+            - Be explicit about HOW and WHY this file calls into each child.
+            - Describe the role each child plays in the overall flow.
 
-        Your task:
-        - Merge new information naturally into this structure.
-        - Expand and clarify the existing understanding without repeating or compressing it.
-        - The final output should feel like a well-written walkthrough of how the repository works.
+            3. **Explain what upstream callers rely on this file for**
+            - What service does this file provide to its callers?
+            - What data or side effects does it produce for them?
+
+            4. **If this file is an entry point**, your summary becomes the
+            **repository architecture overview**.
+            - Give a clear, coherent, top-down explanation of the entire system.
+            - Include all significant behaviours drawn from the full subtree.
+
+            ---------------------------------------------------------------------------
+            STRUCTURE (use this exact structure for every file)
+            ---------------------------------------------------------------------------
+
+            # File Overview
+
+            ## Overall Purpose
+            - 1–2 paragraphs describing what this file (`<file_path>`) is responsible for.
+            - Summarize how it fits into the system and how its children contribute to its job.
+            - Integrate high-level behaviour from child summaries where relevant.
+
+            ## How It Works (Step by Step)
+            - A numbered list: Step 1, Step 2, Step 3, …
+            - Describe the main flow of this file AND key steps happening inside children.
+            Examples:
+            - “The `run` function in `<file>` calls `parse_payload` in `utils/parser.py`
+                to validate the incoming data…”
+            - “Next, it delegates business logic to `process_invoice` in `billing/core.py`,
+                which performs …”
+            - Ensure the reader can understand the entire workflow from this summary alone.
+
+            ## Final Output and Effects
+            - Describe the data or side effects produced by this file and its subtree.
+            - Explain what upstream callers rely on it for.
+            - Summarize the practical outcome of the entire flow.
+
+            ---------------------------------------------------------------------------
+            TONE AND DENSITY
+            ---------------------------------------------------------------------------
+            - High information density, minimal fluff.
+            - But maintain readability and natural flow.
+            - The final document should feel like a guided tour of how this part of the
+            system works, not a compressed index.
         """.strip()
 
-        
         user_prompt = f"""
-            Here is the current architecture overview (if any). 
-            Preserve all important details and integrate new information naturally:
-            {previous_summary or "(none yet)"}
+            You are summarizing a single file in a repository.
 
-            New source material to integrate:
-            Files and their code:
-            {files_block}
+            Your output MUST integrate both:
+            1. The behaviour of this file itself, and  
+            2. The essential behaviour of all its immediate children (downstream dependencies),  
+            whose summaries are provided below.
 
-            Observed interactions involving these files:
-            - Upstream (callers):
+            Do NOT assume the reader will ever look at the children’s summaries.  
+            Your summary must fully absorb their important responsibilities and restate them
+            inside this file’s own explanation.
+
+            ---------------------------------------------------------------------------
+            FILE BEING SUMMARIZED
+            ---------------------------------------------------------------------------
+            File path:
+            `{file_path}`
+
+            File code:
+            ```
+            {file_code}   
+            ```
+            ---------------------------------------------------------------------------
+            CHILD FILE SUMMARIES (MUST BE MERGED INTO THE PARENT SUMMARY)
+            ---------------------------------------------------------------------------
+            Below are the existing summaries of this file’s immediate children.
+            You MUST pull their essential behaviour upward and integrate it naturally
+            into this file’s “Overall Purpose” and “How It Works” explanations.
+
+            {children_block}
+
+            ---------------------------------------------------------------------------
+            OBSERVED INTERACTIONS
+            ---------------------------------------------------------------------------
+            Upstream interactions (who calls this file and how):
             {upstream_block}
 
-            - Downstream (callees):
+            Downstream interactions (how this file calls others):
             {downstream_block}
 
-            Your task:
-            - Expand and refine the architecture overview using the structure described in the system prompt.
-            - Do NOT remove existing useful information — integrate and clarify it.
-            - Add new explanations for the files, components, and interactions provided above.
-            - Keep the final document coherent, accurate, and easy to follow for newcomers.
-            - Mention file paths and component names in backticks.
-            - Maintain the existing section structure (Overview, Key Components, Control Flow, etc.).
-            - Write in a natural, explanatory tone that feels like a guided tour of how the repository works.
-            - The entry point is `{entry_point}` — keep it as the conceptual anchor of the explanation.
-            """.strip()
-        
+            ---------------------------------------------------------------------------
+            YOUR TASK
+            ---------------------------------------------------------------------------
+
+            Produce a full, self-contained summary for `{file_path}` using the exact
+            section structure defined in the system prompt.
+
+            MANDATORY REQUIREMENTS:
+
+            1. **Merging child behaviour**
+            - Extract the key ideas, responsibilities, and steps from each child
+                summary and incorporate them directly into your explanation of this file.
+            - Do NOT merely reference children — *explain what they do* and how
+                they fit into this file’s workflow.
+            - By the end, this summary must make the entire subtree understandable
+                even without reading the child summaries.
+
+            2. **Explain how the parent uses its children**
+            - Be explicit about why this file calls each child and what the child
+                contributes to the overall flow.
+
+            3. **Explain what upstream callers rely on this file for**
+            - Clarify what capability this file provides to others.
+
+            4. **Use code pointers cleanly**
+            - Refer to important functions, classes, and methods like:
+                “The `process_event` function in `{file_path}`…”
+            - Keep the writing readable — not cluttered.
+
+            5. **Tone & clarity**
+            - High information density, but still easy for a newcomer to read.
+            - Clear paragraphs and a numbered “How It Works” section.
+            - Avoid low-level syntax descriptions and avoid repetition.
+
+            When you’re done, the reader should understand the behaviour of:
+            - this file,
+            - its immediate children,
+            - and the entire subtree rooted here —
+            from this single summary alone.
+
+        """.strip()
+
         return self.llm.generate(
+            model=Config.GPT_OSS_20GB_MODEL,
             system_prompt=system_prompt,
             prompt=user_prompt,
             reasoning_effort="medium",
         )
 
+    # -------------------------------------------------------------------------
+    # Code loading
+    # -------------------------------------------------------------------------
 
     def get_code_for_file(self, file_paths: list[str]) -> dict[str, str]:
-        """Fetch the full code content for a given file from MongoDB."""
-
-        codes = {}
+        """Fetch the full code content for each given file path from the local filesystem."""
+        codes: dict[str, str] = {}
         for file_path in file_paths:
-            with open(file_path, "r", encoding="utf-8") as f:
-                code = f.read()
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    code = f.read()
+            except FileNotFoundError:
+                code = ""
             codes[file_path] = code
-
         return codes
+
 
 # === Convenience Functions =====================================================
 
-async def build_repo_architecture_v2(repo_id: str) -> dict[str, any]:
-    """Build architecture overviews using bottom-up component cards."""
+async def build_repo_architecture_v2(repo_id: str) -> dict[str, str]:
+    """Build architecture overviews using bottom-up per-file summaries."""
     builder = RepoArchService(repo_id=repo_id)
     return builder.get_repo_architecture()

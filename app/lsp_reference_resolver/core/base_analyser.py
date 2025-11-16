@@ -1,9 +1,11 @@
-import asyncio, logging, os
+import asyncio, logging, os, hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Iterable, Set
 from urllib.parse import urlparse, unquote
+
 from .lsp_client import LSPClient
+from .cache import Cache
 
 try:
     from tqdm import tqdm
@@ -27,8 +29,10 @@ class Location:
 
 class BaseLSPAnalyzer:
     """
-    Streaming analyzer:
-      - Reads files sequentially and immediately enqueues positions
+    Streaming analyzer with caching:
+      - Reads files sequentially
+      - Only sends definition requests for files whose SHA-1 has changed
+      - Unchanged files are served from a SQLite cache
       - Bounded asyncio.Queue provides backpressure
       - Workers resolve definitions concurrently
       - For languages like Python, didOpen/didClose per file
@@ -39,6 +43,7 @@ class BaseLSPAnalyzer:
         self.base_repo_path = base_repo_path
         self.client: Optional[LSPClient] = None
         self.show_progress = show_progress and (tqdm is not None)
+        self.cache: Optional[Cache] = None
 
     # --- required by subclasses ---
     def get_server_command(self) -> List[str]: raise NotImplementedError
@@ -56,6 +61,10 @@ class BaseLSPAnalyzer:
             return 4.0
         if lang == "python":
             return 8.0
+        if lang == "rust":
+            return 8.0
+        if lang == "java":
+            return 12.0
         return 1.0
 
     def get_max_concurrency(self) -> int:
@@ -63,10 +72,20 @@ class BaseLSPAnalyzer:
         lang = self.get_language_id().lower()
         if lang == "python":
             return 4
+        if lang in ("rust", "java"):
+            return min(16, max(6, cpu))
         return min(32, max(8, cpu))
 
     def get_initialize_options(self) -> Dict:
         return {}
+
+    def get_cache_namespace(self) -> str:
+        """
+        Namespace for the SQLite cache so different analyzers/servers/options
+        don’t collide.
+        """
+        cmd = " ".join(self.get_server_command())
+        return f"{self.__class__.__name__}:{cmd}"
 
     # --- lifecycle ---
     async def start_server(self):
@@ -95,9 +114,12 @@ class BaseLSPAnalyzer:
                     files.append(f)
         return files
 
-
-    # --- analyze (streaming) ---
+    # --- analyze (streaming + cache) ---
     async def analyze(self) -> List[Dict]:
+        # init cache
+        if self.cache is None:
+            self.cache = Cache(self.repo_path, self.get_cache_namespace())
+
         files = self.get_files()
         logger.info("Found %d source files", len(files))
         await self.start_server()
@@ -114,7 +136,8 @@ class BaseLSPAnalyzer:
         # queue of (file_uri, file_path, position_dict)
         q: asyncio.Queue = asyncio.Queue(maxsize=2000)  # backpressure
         mappings: List[Dict] = []
-        cache: Dict[Tuple[str, int, int], Optional[Dict]] = {}
+        # per-position memo within this run
+        pos_cache: Dict[Tuple[str, int, int], Optional[Dict]] = {}
         max_conc = self.get_max_concurrency()
         sem = asyncio.Semaphore(max_conc)
 
@@ -135,14 +158,14 @@ class BaseLSPAnalyzer:
                 uri, path, pos = item
                 k = (uri, pos["line"], pos["character"])
                 try:
-                    if k in cache:
-                        r = cache[k]
+                    if k in pos_cache:
+                        r = pos_cache[k]
                     else:
                         r = await self._query_def_streaming(uri, path, pos, sem, timeout=timeout_primary)
                         if not r:
                             await asyncio.sleep(timeout_backoff)
                             r = await self._query_def_streaming(uri, path, pos, sem, timeout=timeout_retry)
-                        cache[k] = r
+                        pos_cache[k] = r
                     if r:
                         mappings.append(r)
                 finally:
@@ -155,64 +178,94 @@ class BaseLSPAnalyzer:
         workers = [asyncio.create_task(worker()) for _ in range(max_conc)]
         logger.info("Dispatching definition queries with concurrency=%d (streaming)...", max_conc)
 
-        # stream files → enqueue positions per file (and didOpen/didClose around the file)
-        for fpath in files:
-            # read file text
-            try:
-                text = fpath.read_text(encoding="utf-8")
-            except Exception:
-                logger.warning("Failed to read %s", fpath)
-                if files_bar: files_bar.update(1)
-                continue
+        try:
+            # stream files → either serve from cache or enqueue positions per file
+            for fpath in files:
+                rel_path = f"{self.base_repo_path}/{str(fpath.relative_to(self.repo_path))}"
 
-            if self.needs_did_open():
-                await self.client.send_notification(
-                    "textDocument/didOpen",
-                    {
-                        "textDocument": {
-                            "uri": fpath.as_uri(),
-                            "languageId": self.get_language_id(),
-                            "version": 1,
-                            "text": text,
-                        }
-                    },
-                )
-
-            # extract and enqueue positions for this file (dedupe within file)
-            seen_local: Set[Tuple[int, int]] = set()
-            for (line, col) in self.ref_pos_extractor(text, fpath):
-                key_local = (line, col)
-                if key_local in seen_local:
+                # read file text
+                try:
+                    text = fpath.read_text(encoding="utf-8")
+                except Exception:
+                    logger.warning("Failed to read %s", fpath)
+                    if files_bar: files_bar.update(1)
                     continue
-                seen_local.add(key_local)
-                await q.put((fpath.as_uri(), fpath, {"line": line, "character": col}))
 
-            if self.needs_did_open():
-                # close after enqueue, workers operate on saved URI
-                await self.client.send_notification(
-                    "textDocument/didClose",
-                    {"textDocument": {"uri": fpath.as_uri()}},
-                )
+                # compute SHA-1 and check cache
+                sha1 = hashlib.sha1(text.encode("utf-8")).hexdigest()
+                cached_sha = self.cache.get_file_sha(rel_path) if self.cache else None
 
-            if files_bar:
-                files_bar.update(1)
+                if cached_sha == sha1:
+                    # unchanged file → load cached mappings and skip LSP work
+                    if self.cache:
+                        cached_maps = self.cache.load_mappings_for_file(rel_path)
+                        if cached_maps:
+                            mappings.extend(cached_maps)
+                    if files_bar:
+                        files_bar.update(1)
+                    continue
 
-        # finished producing; send sentinels
-        for _ in workers:
-            await q.put(None)
+                # changed/new file → drop old mappings, update SHA
+                if self.cache:
+                    self.cache.delete_mappings_for_file(rel_path)
+                    self.cache.update_file_sha(rel_path, sha1)
 
-        # wait for all tasks
-        await q.join()
+                if self.needs_did_open():
+                    await self.client.send_notification(
+                        "textDocument/didOpen",
+                        {
+                            "textDocument": {
+                                "uri": fpath.as_uri(),
+                                "languageId": self.get_language_id(),
+                                "version": 1,
+                                "text": text,
+                            }
+                        },
+                    )
 
-        # stop workers
-        for w in workers:
-            await w
+                # extract and enqueue positions for this file (dedupe within file)
+                seen_local: Set[Tuple[int, int]] = set()
+                for (line, col) in self.ref_pos_extractor(text, fpath):
+                    key_local = (line, col)
+                    if key_local in seen_local:
+                        continue
+                    seen_local.add(key_local)
+                    await q.put((fpath.as_uri(), fpath, {"line": line, "character": col}))
 
-        if files_bar: files_bar.close()
-        if defs_bar: defs_bar.close()
+                if self.needs_did_open():
+                    # close after enqueue, workers operate on saved URI
+                    await self.client.send_notification(
+                        "textDocument/didClose",
+                        {"textDocument": {"uri": fpath.as_uri()}},
+                    )
 
-        await self.shutdown()
-        logger.info("Got %d mappings", len(mappings))
+                if files_bar:
+                    files_bar.update(1)
+
+            # finished producing; send sentinels
+            for _ in workers:
+                await q.put(None)
+
+            # wait for all tasks
+            await q.join()
+
+        finally:
+            # stop workers
+            for w in workers:
+                try:
+                    await w
+                except Exception:
+                    logger.exception("Worker task failed")
+
+            if files_bar: files_bar.close()
+            if defs_bar: defs_bar.close()
+
+            if self.cache:
+                self.cache.commit()
+
+            await self.shutdown()
+            logger.info("Got %d mappings", len(mappings))
+
         return mappings
 
     async def _query_def_streaming(
@@ -271,8 +324,6 @@ class BaseLSPAnalyzer:
                 if not p.exists():
                     continue
                 try:
-                    # rel = p.relative_to(self.repo_path)
-                    # rel = p
                     rel = f"{self.base_repo_path}/{str(p.relative_to(self.repo_path))}"
                 except ValueError:
                     continue
@@ -288,10 +339,22 @@ class BaseLSPAnalyzer:
                 return None
 
             ref = Location(
-                # f"{self.base_repo_path}/{str(file_path)}",
                 f"{self.base_repo_path}/{str(file_path.relative_to(self.repo_path))}",
                 position["line"],
                 position["character"],
             )
             valid = [d for d in valid if (d.file_path, d.line, d.column) != (ref.file_path, ref.line, ref.column)]
-            return {"reference": ref.to_dict(), "definitions": [d.to_dict() for d in valid]} if valid else None
+
+            if not valid:
+                return None
+
+            result = {"reference": ref.to_dict(), "definitions": [d.to_dict() for d in valid]}
+
+            # persist in SQLite cache
+            if self.cache:
+                try:
+                    self.cache.store_mapping(result)
+                except Exception:
+                    logger.exception("Failed to store mapping in cache")
+
+            return result
