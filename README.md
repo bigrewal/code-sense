@@ -44,3 +44,108 @@ source ~/.zprofile
 cs setup -y
 cs install metals
 metals -v
+
+
+
+Here’s the simplest way to do it in **MongoDB Compass → Aggregation tab**.
+
+If you want to list **all distinct `document_type` values for a given `repo_id`**, you can add these stages:
+
+---
+
+## ✅ **1. `$match` stage**
+
+Filters to only the repo you care about.
+
+Example:
+
+```json
+{
+  "repo_id": 12345
+}
+```
+
+Add this stage in Compass:
+
+1. Click **"Add Stage"**
+2. Select **`$match`**
+3. Paste the filter:
+
+```json
+{
+  "repo_id": 12345
+}
+```
+
+---
+
+## ✅ **2. `$group` stage**
+
+Groups everything by repo and collects all unique document types.
+
+Add another stage:
+
+1. Click **"Add Stage"**
+2. Select **`$group`**
+3. Use:
+
+```json
+{
+  "_id": "$repo_id",
+  "document_types": { "$addToSet": "$document_type" }
+}
+```
+
+---
+
+## ✔️ Result you get:
+
+```json
+{
+  "_id": 12345,
+  "document_types": [
+    "typeA",
+    "typeB",
+    "typeC"
+  ]
+}
+```
+
+---
+
+## Optional: **Sort document types alphabetically**
+
+Add another stage:
+
+### `$project`:
+
+```json
+{
+  "_id": 0,
+  "document_types": {
+    "$sortArray": { "input": "$document_types", "sortBy": 1 }
+  }
+}
+```
+
+---
+
+## Final pipeline (copy/paste into Compass)
+
+```json
+[
+  {
+    "$match": { "repo_id": 12345 }
+  },
+  {
+    "$group": {
+      "_id": "$repo_id",
+      "document_types": { "$addToSet": "$document_type" }
+    }
+  }
+]
+```
+
+---
+
+If you want the documents grouped differently (e.g., list repo_ids with all document types), let me know!
