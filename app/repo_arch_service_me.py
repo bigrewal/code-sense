@@ -1,6 +1,6 @@
 from collections import deque
 
-from .db import get_mongo_client, get_neo4j_client, get_potential_entry_points, get_brief_file_overviews
+from .db import get_mongo_client, get_neo4j_client, get_potential_entry_points, get_brief_file_overviews, get_critical_file_paths
 from .llm import GroqLLM
 from .config import Config
 
@@ -34,6 +34,7 @@ class RepoArchService:
 
         # Choose the smallest set of entry points that covers all reachable files
         selected_entry_points = self._select_min_entry_points(entry_points)
+        print(f"Selected MIN entry points for repo {self.repo_id}: {selected_entry_points}")
 
         results: dict[str, str] = {}
         for ep in selected_entry_points:
@@ -55,10 +56,11 @@ class RepoArchService:
 
         # Precompute coverage for each entry point
         coverage: dict[str, set[str]] = {}
-        universe: set[str] = set()
+        critical_files = set(get_critical_file_paths(self.mongo_client, self.repo_id))
+        universe = critical_files
         for ep in entry_points:
             files = self._reachable_files_from(ep)
-            coverage[ep] = files
+            coverage[ep] = files & critical_files
             universe.update(files)
 
         uncovered: set[str] = set(universe)
@@ -87,7 +89,6 @@ class RepoArchService:
         return selected
 
 
-
     def _reachable_files_from(self, entry_point: str) -> set[str]:
         """
         Return all files reachable from `entry_point` following downstream (DEPENDS_ON) edges.
@@ -113,7 +114,6 @@ class RepoArchService:
                     queue.append(child_path)
 
         return visited
-
 
 
     def ep_analyse(self, entry_point: str) -> str:

@@ -773,6 +773,14 @@ def get_brief_file_overviews(db_client, repo_id: str, file_paths: List[str]) -> 
                 result.append({"file_path": file_path, "brief": brief})
         return result
 
+def get_critical_file_paths(db_client, repo_id: str) -> List[str]:
+    collection = db_client["mental_model"]
+    
+    #Get all file_path in collection that have "document_type": "BRIEF_FILE_OVERVIEW"
+    result = collection.find({"repo_id": repo_id, "document_type": "BRIEF_FILE_OVERVIEW"})
+    critical_files = [doc.get("file_path") for doc in result if doc.get("file_path")]
+    return critical_files
+
 # Global shared client
 neo4j_client: Neo4jClient = None
 mongo_client: MyMongoClient = None
