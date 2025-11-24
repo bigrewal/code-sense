@@ -32,9 +32,9 @@ class CodeAnalyzer:
             all_maps.extend(maps)
         
         
-        print(f"Writing mappings.json with {len(all_maps)} entries")
-        with open("mappings.json", "w", encoding="utf-8") as f:
-            json.dump(all_maps, f, indent=2)
+        # print(f"Writing mappings.json with {len(all_maps)} entries")
+        # with open("mappings.json", "w", encoding="utf-8") as f:
+        #     json.dump(all_maps, f, indent=2)
 
-        print(f"Finished writing mappings.json with {len(all_maps)} entries")
-        return all_maps
+        # print(f"Finished writing mappings.json with {len(all_maps)} entries")
+        # return all_maps

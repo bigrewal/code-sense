@@ -1,6 +1,6 @@
 from collections import deque
 
-from .db import get_mongo_client, get_neo4j_client, get_potential_entry_points, get_brief_file_overviews, get_critical_file_paths
+from .db import get_mongo_client, get_neo4j_client, get_potential_entry_points, get_brief_file_overview, get_critical_file_paths
 from .llm import GroqLLM
 from .config import Config
 
@@ -29,64 +29,88 @@ class RepoArchService:
           - Chunking the concatenated summary into <=100k-character chunks and storing them.
         """
         entry_points = get_potential_entry_points(self.mongo_client, self.repo_id) or []
-        if not entry_points:
-            raise ValueError(f"No entry points found for repo {self.repo_id}")
 
-        # Choose the smallest set of entry points that covers all reachable files
-        selected_entry_points = self._select_min_entry_points(entry_points)
-        print(f"Selected MIN entry points for repo {self.repo_id}: {selected_entry_points}")
+        self.create_repo_contxt(entry_points)
+        # if not entry_points:
+        #     raise ValueError(f"No entry points found for repo {self.repo_id}")
 
-        results: dict[str, str] = {}
-        for ep in selected_entry_points:
-            print(f"Creating repo overview for entry point: {ep}")
-            summary = self.ep_analyse(entry_point=ep)
-            results[ep] = summary
+        # # Choose the smallest set of entry points that covers all reachable files
+        # selected_entry_points = self._select_min_entry_points(entry_points)
+        # print(f"Selected MIN entry points for repo {self.repo_id}: {selected_entry_points}")
 
-        return results
+        # results: dict[str, str] = {}
+        # for ep in selected_entry_points:
+        #     print(f"Creating repo overview for entry point: {ep}")
+        #     summary = self.ep_analyse(entry_point=ep)
+        #     results[ep] = summary
+
+        # return results
 
 
-    def _select_min_entry_points(self, entry_points: list[str]) -> list[str]:
+    def create_repo_contxt(self, entry_points: list[str]):
         """
-        Greedy set-cover:
-        - Each entry point covers the set of files reachable from it.
-        - Select the smallest subset of entry points whose union covers all reachable files.
+        Build REPO_CONTEXT by concatenating brief file overviews.
+
+        - Visit each entry point in order.
+        - For each entry point, do a BFS over its downstream dependencies.
+        - For each critical file (has BRIEF_FILE_OVERVIEW) encountered for the first time:
+        - Append its brief overview to the context (separated by two newlines).
+        - Store the final concatenated string as a REPO_CONTEXT document in MongoDB.
         """
         if not entry_points:
             return []
 
-        # Precompute coverage for each entry point
-        coverage: dict[str, set[str]] = {}
         critical_files = set(get_critical_file_paths(self.mongo_client, self.repo_id))
-        universe = critical_files
+        already_included: set[str] = set()
+        context_parts: list[str] = []
+
         for ep in entry_points:
-            files = self._reachable_files_from(ep)
-            coverage[ep] = files & critical_files
-            universe.update(files)
+            # BFS from this entry point
+            queue: deque[str] = deque()
+            local_visited: set[str] = set()
 
-        uncovered: set[str] = set(universe)
-        remaining: set[str] = set(entry_points)
-        selected: list[str] = []
+            queue.append(ep)
+            local_visited.add(ep)
 
-        while uncovered and remaining:
-            # Pick the entry point that covers the most still-uncovered files
-            best_ep = max(
-                remaining,
-                key=lambda ep: len(coverage[ep] & uncovered),
-            )
-            best_cover = coverage[best_ep] & uncovered
-            if not best_cover:
-                # No progress; break to avoid infinite loop
-                break
+            while queue:
+                file_path = queue.popleft()
 
-            selected.append(best_ep)
-            uncovered -= best_cover
-            remaining.remove(best_ep)
+                # If this is a critical file and not yet included, append its brief overview
+                if file_path in critical_files and file_path not in already_included:
+                    brief = get_brief_file_overview(self.mongo_client, self.repo_id, file_path) or ""
+                    if brief:
+                        context_parts.append(brief)
+                        already_included.add(file_path)
 
-        # Fallback: if somehow nothing selected, pick at least one
-        if not selected and entry_points:
-            selected.append(entry_points[0])
+                # Traverse downstream dependencies
+                cfi = self.neo4j_client.cross_file_interactions_in_file(
+                    file_path=file_path,
+                    repo_id=self.repo_id,
+                )
+                downstream_info = cfi.get("downstream", {}) or {}
+                downstream_files = list(downstream_info.get("files", []) or [])
 
-        return selected
+                for child_path in downstream_files:
+                    if child_path not in local_visited:
+                        local_visited.add(child_path)
+                        queue.append(child_path)
+
+        repo_context = "\n\n".join(context_parts)
+
+        # Store as REPO_CONTEXT document
+        doc = {
+            "repo_id": self.repo_id,
+            "document_type": "REPO_CONTEXT",
+            "context": repo_context,
+        }
+        self.mental.update_one(
+            {"repo_id": self.repo_id, "document_type": "REPO_CONTEXT"},
+            {"$set": doc},
+            upsert=True,
+        )
+
+        # Keep return type unchanged (if callers still expect a list of entry points)
+        return entry_points
 
 
     def _reachable_files_from(self, entry_point: str) -> set[str]:

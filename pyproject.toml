@@ -15,9 +15,11 @@ dependencies = [
     "pymongo==4.13.0",
     "python-dotenv>=1.1.1",
     "python-lsp-server[jedi]>=1.13.1",
+    "tiktoken>=0.12.0",
     "tree-sitter==0.21.3",
     "tree-sitter-languages==1.10.2",
     "uvicorn>=0.35.0",
+    "xai-sdk>=1.4.0",
 ]
 
 [tool.uv.sources]

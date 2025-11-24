@@ -773,6 +773,24 @@ def get_brief_file_overviews(db_client, repo_id: str, file_paths: List[str]) -> 
                 result.append({"file_path": file_path, "brief": brief})
         return result
 
+
+def get_brief_file_overview(db_client, repo_id: str, file_path: str) -> str:
+        """
+        Fetch BRIEF_FILE_OVERVIEW for a batch of files.
+        Returns list of {file_path, brief} dicts.
+        """
+        collection = db_client["mental_model"]
+        
+        doc = collection.find_one(
+            {"repo_id": repo_id, "document_type": "BRIEF_FILE_OVERVIEW", "file_path": file_path},
+            {"_id": 0, "data": 1},
+        )
+        brief = (doc or {}).get("data", "")
+
+        return brief
+            
+
+
 def get_critical_file_paths(db_client, repo_id: str) -> List[str]:
     collection = db_client["mental_model"]
     

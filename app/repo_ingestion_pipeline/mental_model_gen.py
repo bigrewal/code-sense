@@ -22,12 +22,14 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Set, Any
 import re
 import ast
+import tiktoken
 
 
 from bson import ObjectId
 
 from ..db import Neo4jClient, get_neo4j_client, get_mongo_client
 from ..llm import GroqLLM
+from ..llm_grok import GrokLLM
 # from ..repo_arch_service import build_repo_architecture_v2
 from ..repo_arch_service_me import build_repo_architecture_v2
 from ..reverse_eng_service import reverse_engineer
@@ -103,7 +105,8 @@ class MentalModelStage():
     def __init__(self, config: dict = None):
         self.mongo_client = get_mongo_client()
         self.mental_model_collection = self.mongo_client["mental_model"]
-        self.llm_client = GroqLLM()
+        # self.llm_client = GroqLLM()
+        self.llm_client = GrokLLM()
         # Set LLM params for determinism (assuming LLMClient supports it)
         # self.llm_client.set_params(temperature=0, max_tokens=1024)
         self.job_id = config.get("job_id", "unknown")
@@ -119,7 +122,7 @@ class MentalModelStage():
             # Step 1: Build directory tree from file paths
             dir_tree = self._build_dir_tree(repo_id)
             
-            insights, ignored_files = await self.identify_critical_files(dir_tree, repo_id)
+            insights, ignored_files = await self.identify_critical_files_2(dir_tree, repo_id)
             print(f"Job {self.job_id}: GENERATED repo overview with {len(insights)} insights, ignoring {len(ignored_files)} files")
             # repo_summary = await self.generate_repo_summary(insights, repo_id)
             # await self.find_entry_points(repo_id)
@@ -284,7 +287,7 @@ class MentalModelStage():
                     potential_entry_points.discard(fp)
                     break
 
-        print(f"Potential entry points after upstream dependency check: {potential_entry_points}")
+        # print(f"Potential entry points after upstream dependency check: {potential_entry_points}")
 
         
         # Add potential entry points to the DB
@@ -402,35 +405,6 @@ class MentalModelStage():
         
         pbar.close()
 
-        # Add insights to the mental model mongodb collection
-        # for insight in insights:
-        #     document = {
-        #         "repo_id": repo_id,
-        #         "file_path": insight["file_path"],
-        #         "document_type": "BRIEF_FILE_OVERVIEW",
-        #         "data": insight["summary"]
-        #     }
-        #     self.mental_model_collection.update_one(
-        #         {"repo_id": repo_id, "file_path": insight["file_path"], "document_type": "BRIEF_FILE_OVERVIEW"},
-        #         {"$set": document},
-        #         upsert=True
-        #     )
-
-        # Add ignored files to the mental model mongodb collection
-        # for file_path in ignored:
-        #     document = {
-        #         "repo_id": repo_id,
-        #         "file_path": file_path,
-        #         "document_type": "IGNORED_FILE",
-        #         "data": "IGNORE"
-        #     }
-        #     self.mental_model_collection.update_one(
-        #         {"repo_id": repo_id, "file_path": file_path, "document_type": "IGNORED_FILE"},
-        #         {"$set": document},
-        #         upsert=True
-        #     )
-        
-        # Add _cross_file_interactions_in_file in insights
         for insight in insights:
             file_path = insight["file_path"]
             dependency_info = self._cross_file_interactions_in_file(file_path, repo_id)
@@ -438,17 +412,212 @@ class MentalModelStage():
             insight["downstream_dep_files"] = list(dependency_info["downstream"]["files"])
             insight["upstream_dep_interactions"] = dependency_info["upstream"]["interactions"]
             insight["upstream_dep_files"] = list(dependency_info["upstream"]["files"])
-        
-        # for insight in insights:
-        #     file_path = insight["file_path"]
-        #     file_dependencies = self._get_file_dependencies(file_path, repo_id)
-
-        #     insight["downstream_dep_files"] = file_dependencies["downstream_files"]
-        #     insight["upstream_dep_files"] = file_dependencies["upstream_files"]
+    
 
         return insights, ignored
 
-    def _build_dir_tree(self, repo_id: str) -> Dict:
+    async def identify_critical_files_2(self, dir_tree: List[str], repo_id: str) -> Tuple[Dict[str, str], Set[str]]:
+        """Generate a comprehensive overview of the repo by summarizing critical files, ignoring non-critical ones."""
+
+        def count_tokens(text: str, model: str = "gpt-4o") -> int:
+            # Load the encoding for the given model
+            encoding = tiktoken.encoding_for_model(model)
+            
+            # Encode the text into tokens
+            tokens = encoding.encode(text)
+            
+            # Return number of tokens
+            return len(tokens)
+        
+        def get_all_files(node: Dict, path: str = "") -> list[str]:
+            files = []
+
+            # Add files in the current directory
+            for file in node.get("files", []):
+                fp = str(Path(path) / file) if path else file
+                files.append(fp)
+
+            # Recurse into subdirectories
+            for subdir, subnode in node.get("subdirs", {}).items():
+
+                # Skip hidden dirs or special dirs starting with "."
+                if subdir.startswith("."):
+                    continue
+
+                subpath = str(Path(path) / subdir) if path else subdir
+                files.extend(get_all_files(subnode, subpath))
+
+            return files
+
+        async def summarize_file(file_path: str) -> tuple[str, str]:
+
+            # Check mongoDB if we already have file_path in the mental_model_collections BRIEF_FILE_OVERVIEW or IGNORED_FILE document type
+            existing_doc = self.mental_model_collection.find_one(
+                {
+                    "repo_id": repo_id,
+                    "file_path": file_path,
+                    "document_type": {"$in": ["BRIEF_FILE_OVERVIEW", "IGNORED_FILE"]}
+                },
+                {"_id": 0, "data": 1}
+            )
+            if existing_doc:
+                return file_path, existing_doc["data"]
+
+            code = None
+            with open(file_path, "r", encoding="utf-8") as f:
+                code = f.read()
+            
+
+            cfi = self.neo4j_client.cross_file_interactions_in_file(
+                    file_path=file_path,
+                    repo_id=repo_id,
+                )
+            
+            downstream_info = cfi.get("downstream", {}) or {}
+            upstream_info = cfi.get("upstream", {}) or {}
+
+            downstream_interactions: list[str] = []
+            for dep_file, interactions in (downstream_info.get("interactions", {}) or {}).items():
+                for inter in interactions or []:
+                    downstream_interactions.append(f"{file_path} → {dep_file}: {inter}")
+
+            upstream_interactions: list[str] = []
+            for src_file, interactions in (upstream_info.get("interactions", {}) or {}).items():
+                for inter in interactions or []:
+                    upstream_interactions.append(f"{src_file} → {file_path}: {inter}")
+            
+            upstream_block = "\n".join(f"- {i}" for i in (upstream_interactions or [])) or "—"
+            downstream_block = "\n".join(f"- {i}" for i in (downstream_interactions or [])) or "—"
+
+
+            system_prompt = (
+                "Your task is to analyze the provided code file and determine if it is critical to the core functionality of the repository. "
+                "If the file is identified as critical, do the following:\n"
+                "- Write a very brief, clear description of what a single source file does and how it fits into the codebase. 1–3 sentences, plain English, newcomer-friendly, no fluff.\n\n"
+                "In the description, mention:\n"
+                "- main components (important functions/classes) and their purpose,\n"
+                "- what the file is used for overall,\n"
+                "- which other files it interacts with (if any).\n\n"
+                "Simply output \"IGNORE\" if the file is not identified as critical.\n\n"
+                "Ignore:\n"
+                "- tutorial example files,\n"
+                "- tests,\n"
+                "- docs.\n\n"
+                "While analyzing the code, also consider where in the repository the file is located."
+            )
+
+            user_prompt = f"""
+                Repo name: 
+                {repo_id}
+
+                File path:
+                `{file_path}`
+
+                File code:
+                {code}
+
+                Upstream interactions (who calls this file and how):
+                {upstream_block}
+
+                Downstream interactions (who this file calls and how):
+                {downstream_block}
+
+                If the file is identified as critical, write 1–3 sentences like:
+                "`{file_path}` defines <key components> to <main responsibilities>, and interacts with <other files> to <reason>."
+                Otherwise, simply output "IGNORE".
+
+                Be concise but readable.
+            """.strip()
+
+            #Calculate 
+            # print(f" Token count for file {file_path} :: USER-PROMPT: {count_tokens(user_prompt)}, SYSTEM-PROMPT: {count_tokens(system_prompt)}")
+
+            # total_tokens = count_tokens(user_prompt) + count_tokens(system_prompt)
+            # if total_tokens > 100000:
+            #     print(f" Job {self.job_id}: Skipping file {file_path} due to token limit ({total_tokens} tokens)")
+
+            #     msg = f"""
+            #         `{file_path}` is too large process please use the tools to read the code for this file.
+
+            #         Upstream interactions (who calls this file and how):
+            #         {upstream_block}
+
+            #         Downstream interactions (who this file calls and how):
+            #         {downstream_block}
+
+            #         Be concise but readable.
+            #     """.strip()
+
+            #     return file_path, msg
+
+            response = await self.llm_client.generate_async(
+                prompt=user_prompt,
+                system_prompt=system_prompt,
+                # reasoning_effort="low",
+                temperature=0.0
+            )
+            return file_path, response.strip()
+
+        # all_files = get_all_files(dir_tree)
+        all_files = dir_tree
+
+        #Make insights like {"file_path": <file_path>, "summary": <summary>}
+        insights = []
+        ignored: Set[str] = set()
+        
+        batch_size = 20
+        pbar = tqdm(total=len(all_files), desc="Processing files")
+        
+        for i in range(0, len(all_files), batch_size):
+            batch = all_files[i:i + batch_size]
+            tasks = [summarize_file(fp) for fp in batch]
+            results = await asyncio.gather(*tasks)
+            
+            for fp, summary in results:
+                # if summary.startswith("IGNORE"):
+                if summary == "IGNORE":
+                    ignored.add(fp)
+                    document = {
+                        "repo_id": repo_id,
+                        "file_path": fp,
+                        "document_type": "IGNORED_FILE",
+                        "data": "IGNORE"
+                    }
+                    self.mental_model_collection.update_one(
+                        {"repo_id": repo_id, "file_path": fp, "document_type": "IGNORED_FILE"},
+                        {"$set": document},
+                        upsert=True
+                    )
+                else:
+                    insights.append({"file_path": fp, "summary": summary})
+                    document = {
+                        "repo_id": repo_id,
+                        "file_path": fp,
+                        "document_type": "BRIEF_FILE_OVERVIEW",
+                        "data": summary
+                    }
+                    self.mental_model_collection.update_one(
+                        {"repo_id": repo_id, "file_path": fp, "document_type": "BRIEF_FILE_OVERVIEW"},
+                        {"$set": document},
+                        upsert=True
+                    )
+
+            pbar.update(len(batch))
+        
+        pbar.close()
+
+        for insight in insights:
+            file_path = insight["file_path"]
+            dependency_info = self._cross_file_interactions_in_file(file_path, repo_id)
+            insight["downstream_dep_interactions"] = dependency_info["downstream"]["interactions"]
+            insight["downstream_dep_files"] = list(dependency_info["downstream"]["files"])
+            insight["upstream_dep_interactions"] = dependency_info["upstream"]["interactions"]
+            insight["upstream_dep_files"] = list(dependency_info["upstream"]["files"])
+    
+
+        return insights, ignored
+
+    def _build_dir_tree(self, repo_id: str) -> List[str]:
         """Build a nested dict representing the directory tree from file paths in Neo4j or MongoDB."""
         # Query Neo4j for all unique file_paths
         query = """
@@ -459,20 +628,22 @@ class MentalModelStage():
             result = session.run(query, repo_id=repo_id)
             file_paths = [record["file_path"] for record in result]
         
-        # Build nested dict: {dir: {subdir: {...}, files: [file1, file2]}}
-        def make_node():
-            return {'subdirs': defaultdict(make_node), 'files': []}
-
-        tree = make_node()
-        for fp in file_paths:
-            parts = Path(fp).parts
-            current = tree
-            for part in parts[:-1]:  # Dirs
-                current = current['subdirs'][part]
-            current['files'].append(parts[-1])  # File
+        return file_paths
         
-        print(f"Job {self.job_id}: Built dir tree with {len(file_paths)} files")
-        return tree
+        # Build nested dict: {dir: {subdir: {...}, files: [file1, file2]}}
+        # def make_node():
+        #     return {'subdirs': defaultdict(make_node), 'files': []}
+
+        # tree = make_node()
+        # for fp in file_paths:
+        #     parts = Path(fp).parts
+        #     current = tree
+        #     for part in parts[:-1]:  # Dirs
+        #         current = current['subdirs'][part]
+        #     current['files'].append(parts[-1])  # File
+        
+        # print(f"Job {self.job_id}: Built dir tree with {len(file_paths)} files")
+        # return tree
 
     def _cross_file_interactions_in_file(self, file_path: str, repo_id: str):
         """Infer cross-file interactions for a given file by finding references to and from definitions in other files."""
