@@ -1,7 +1,10 @@
 import json
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime
 import asyncio
+from typing import List, Optional
+from bson import ObjectId
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -71,14 +74,175 @@ class GotoRequest(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    repo_id: str
+    conversation_id: str
     message: str
 
+class ConversationCreateRequest(BaseModel):
+    repo_id: str
+
+
+class ConversationCreateResponse(BaseModel):
+    conversation_id: str
+    repo_id: str
+    created_at: datetime
+
+
+class ConversationSummary(BaseModel):
+    conversation_id: str
+    repo_id: str
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+    title: Optional[str] = None
+
+
+class MessageModel(BaseModel):
+    role: str
+    content: str
+    created_at: datetime
+
+
+class ConversationMessagesResponse(BaseModel):
+    conversation_id: str
+    messages: List[MessageModel]
+
+
+@app.post("/conversations", response_model=ConversationCreateResponse)
+async def create_conversation(req: ConversationCreateRequest):
+    """
+    Create a new chat conversation for a given repo.
+    Frontend calls this once when the user clicks 'New Chat'.
+    """
+    mongo = get_mongo_client()
+    conversations = mongo["conversations"]
+
+    now = datetime.utcnow()
+
+    doc = {
+        "repo_id": req.repo_id,
+        "created_at": now,
+        "updated_at": now,
+        "type": "REPO_CHAT",
+    }
+
+    result = conversations.insert_one(doc)
+
+    return ConversationCreateResponse(
+        conversation_id=str(result.inserted_id),
+        repo_id=req.repo_id,
+        created_at=now,
+    )
+
+
+@app.get("/conversations", response_model=List[ConversationSummary])
+async def list_conversations(
+    repo_id: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+):
+    """
+    List conversations, optionally filtered by repo_id.
+    Used by the UI to populate the 'chat sidebar'.
+    """
+    mongo = get_mongo_client()
+    conversations = mongo["conversations"]
+
+    query: dict = {}
+    if repo_id:
+        query["repo_id"] = repo_id
+
+    cursor = (
+        conversations.find(query)
+        .sort("updated_at", -1)
+        .skip(offset)
+        .limit(limit)
+    )
+
+    results: List[ConversationSummary] = []
+    for doc in cursor:
+        results.append(
+            ConversationSummary(
+                conversation_id=str(doc["_id"]),
+                repo_id=doc["repo_id"],
+                created_at=doc.get("created_at"),
+                updated_at=doc.get("updated_at"),
+                title=doc.get("title"),
+            )
+        )
+
+    return results
+
+
+@app.get("/conversations/{conversation_id}/messages",response_model=ConversationMessagesResponse)
+async def list_conversation_messages(conversation_id: str, limit: int = 200):
+    """
+    Return all messages for a given conversation_id (up to `limit`).
+    Used by the UI to reload an existing chat.
+    """
+    mongo = get_mongo_client()
+    conversations = mongo["conversations"]
+    messages_col = mongo["messages"]
+
+    # Ensure the conversation exists
+    try:
+        conv = conversations.find_one({"_id": ObjectId(conversation_id)})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid conversation id")
+
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    cursor = (
+        messages_col.find({"conversation_id": conversation_id})
+        .sort("created_at", 1)
+        .limit(limit)
+    )
+
+    messages: List[MessageModel] = []
+    for m in cursor:
+        messages.append(
+            MessageModel(
+                role=m["role"],
+                content=m["content"],
+                created_at=m.get("created_at"),
+            )
+        )
+
+    return ConversationMessagesResponse(
+        conversation_id=conversation_id,
+        messages=messages,
+    )
+
+
+@app.delete("/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str):
+    """
+    Delete a conversation and all its messages.
+    """
+    mongo = get_mongo_client()
+    conversations = mongo["conversations"]
+    messages_col = mongo["messages"]
+
+    # Ensure the conversation exists
+    try:
+        conv = conversations.find_one({"_id": ObjectId(conversation_id)})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid conversation id")
+
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    # Delete messages
+    messages_col.delete_many({"conversation_id": conversation_id})
+
+    # Delete conversation
+    conversations.delete_one({"_id": ObjectId(conversation_id)})
+
+    return {"message": "Conversation deleted"}
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
     return StreamingResponse(
-        stream_chat(repo_id=req.repo_id, user_message=req.message),
+        stream_chat(conversation_id=req.conversation_id, user_message=req.message),
         media_type="text/markdown"
     )
 

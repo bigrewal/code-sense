@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 import sys
 from typing import Any, Dict, List, Optional
 
+from bson import ObjectId
+
 from .db import get_mongo_client
 from .llm import GroqLLM
 from .llm_grok import GrokLLM
@@ -15,33 +17,39 @@ from .tools import fetch_code_file
 import tiktoken
 
 MENTAL_MODEL_COL = "mental_model"
-
-# ~20k tokens ≈ 80k chars; keep headroom for prompts
-MAX_CONTEXT_CHARS = 75000
-# Hard caps for code ingestion
-MAX_FILES_TO_READ = 6
-MAX_CHARS_PER_FILE = 8000
-MIN_CHARS_PER_FILE = 2000
+CONVERSATIONS_COL = "conversations"
+MESSAGES_COL = "messages"
 
 
 # ---------------------------
 # Public API
 # ---------------------------
 
-async def stream_chat(repo_id: str, user_message: str):
+async def stream_chat(conversation_id: str, user_message: str):
     """
-    Agentic Q&A over a repository:
-      1) Load repo architecture (system prompt seed).
-      2) Ask LLM to PLAN which files to open (JSON).
-      3) Fetch code for those files (bounded by budget).
-      4) Ask LLM to ANSWER, streaming tokens.
-
-    Yields markdown text chunks for streaming (async generator).
+    Stream a reply for a given conversation_id, ChatGPT-style.
+    - Loads conversation → repo_id
+    - Loads repo architecture (system seed)
+    - Loads prior messages as history
+    - Appends new user message
+    - Streams assistant reply and saves both turns
     """
     mongo = get_mongo_client()
     mental = mongo[MENTAL_MODEL_COL]
+    conversations = mongo[CONVERSATIONS_COL]
+    messages_col = mongo[MESSAGES_COL]
 
-    # 1) Load repo architecture (seed for system prompt)
+    # 1) Look up conversation to get repo_id
+    conv = conversations.find_one({"_id": ObjectId(conversation_id)})
+    if not conv:
+        # You could also raise an HTTPException at the route level,
+        # but for now we just stream an error message.
+        yield "Conversation not found.\n"
+        return
+
+    repo_id = conv["repo_id"]
+
+    # 2) Load repo architecture (seed for system prompt)
     arch_doc = mental.find_one(
         {"repo_id": repo_id, "document_type": "REPO_CONTEXT"},
         {"_id": 0, "context": 1},
@@ -50,22 +58,61 @@ async def stream_chat(repo_id: str, user_message: str):
 
     system_seed = _make_system_seed(repo_arch, repo_id=repo_id)
 
-    # def count_tokens(text: str, model: str = "gpt-4o") -> int:
-    #     # Load the encoding for the given model
-    #     encoding = tiktoken.encoding_for_model(model)
-        
-    #     # Encode the text into tokens
-    #     tokens = encoding.encode(text)
-        
-    #     # Return number of tokens
-    #     return len(tokens)
-    
-    # token_count = count_tokens(repo_arch)
-    # print(f"Repository architecture token count: {token_count}")
+    # 3) Load previous messages for this conversation
+    history_cursor = messages_col.find(
+        {"conversation_id": conversation_id}
+    ).sort("created_at", 1)
 
-    # yield f"**Repository Architecture Loaded.**\n\n"
-    async for chunk in _stream_final_answer_grok(repo_id, user_message, system_seed):
+    messages_for_llm: List[Dict[str, str]] = [
+        {"role": "system", "content": system_seed}
+    ]
+
+    for m in history_cursor:
+        messages_for_llm.append(
+            {
+                "role": m["role"],       # "user" or "assistant"
+                "content": m["content"],
+            }
+        )
+
+    # 4) Store this new user message in DB
+    now = datetime.now(timezone.utc)
+    messages_col.insert_one(
+        {
+            "conversation_id": conversation_id,
+            "role": "user",
+            "content": user_message,
+            "created_at": now,
+        }
+    )
+
+    # 5) Append new user message to LLM messages
+    messages_for_llm.append(
+        {
+            "role": "user",
+            "content": user_message,
+        }
+    )
+
+    # 6) Stream assistant reply, capturing content so we can save it at the end
+    captured: List[str] = []
+    async for chunk in _stream_final_answer_grok(
+        messages=messages_for_llm,
+        captured=captured,
+    ):
         yield chunk
+
+    # 7) Save assistant message after streaming completes
+    assistant_content = "".join(captured)
+    messages_col.insert_one(
+        {
+            "conversation_id": conversation_id,
+            "role": "assistant",
+            "content": assistant_content,
+            "created_at": datetime.now(timezone.utc),
+        }
+    )
+
 
 # ---------------------------
 # Internal helpers
@@ -88,22 +135,18 @@ def _make_system_seed(file_summaries: str, repo_id: str) -> str:
     return seed
 
 async def _stream_final_answer_grok(
-    repo_id: str,
-    user_message: str,
-    system_seed: str,
+    messages: List[Dict[str, str]],
+    captured: List[str],
 ):
+    """
+    Stream the final answer using the full message history.
+    `captured` is a mutable list passed in so the caller can
+    persist the final assistant message after streaming.
+    """
     llm = GrokLLM()
 
-    user_prompt = (
-        f"User Question:\n{user_message}\n\n"
-        "Now produce the final answer."
-        "Answer what is asked, nothing more nothing less."
-    )
-
-    captured: List[str] = []
     stream = llm.generate(
-        prompt=user_prompt,
-        system_prompt=system_seed,
+        messages=messages,
         temperature=0.0,
         stream=True,
     )
@@ -112,8 +155,10 @@ async def _stream_final_answer_grok(
         content = getattr(chunk, "content", None)
         if content:
             captured.append(content)
-            print(content, end="", flush=True)  # or file=sys.stderr
+            # print(content, end="", flush=True, file=sys.stderr)
             yield content
 
+    # Ensure a final newline is sent to the client
     yield "\n"
+
 
