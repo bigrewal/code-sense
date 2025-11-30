@@ -54,6 +54,9 @@ class BaseLSPAnalyzer:
     # --- overridable knobs ---
     def needs_did_open(self) -> bool:
         return self.get_language_id().lower() == "python"
+    
+    def is_excluded_definition_path(self, path: Path) -> bool: 
+        return False
 
     def get_warmup_seconds(self) -> float:
         lang = self.get_language_id().lower()
@@ -323,13 +326,23 @@ class BaseLSPAnalyzer:
                 p = Path(unquote(urlparse(uri).path)).resolve()
                 if not p.exists():
                     continue
+                # try:
+                #     rel = f"{self.base_repo_path}/{str(p.relative_to(self.repo_path))}"
+                # except ValueError:
+                #     continue
+
                 try:
-                    rel = f"{self.base_repo_path}/{str(p.relative_to(self.repo_path))}"
+                    rel_path = p.relative_to(self.repo_path)  # repo-relative
                 except ValueError:
                     continue
+
+                if self.is_excluded_definition_path(rel_path):
+                    continue
+
+                rel_str = f"{self.base_repo_path}/{str(rel_path)}"
                 valid.append(
                     Location(
-                        rel,
+                        rel_str,
                         rng["start"]["line"],
                         rng["start"]["character"],
                     )

@@ -59,6 +59,14 @@ class PythonAnalyzer(BaseLSPAnalyzer):
     def get_initialize_options(self) -> dict:
         # Tweak for pyright: enable indexing to improve definition perf
         return {"python": {"analysis": {"indexing": True}}}
+    
+    def is_excluded_definition_path(self, path: Path) -> bool:
+        parts = set(path.parts)
+        exclude = {
+            "venv", ".venv", "__pycache__", "site-packages",
+            ".mypy_cache", ".pytest_cache", ".ruff_cache",
+        }
+        return not parts.isdisjoint(exclude)
 
     def ref_pos_extractor(self, text: str, path: Path) -> List[Tuple[int, int]]:
         lang = get_language("python")

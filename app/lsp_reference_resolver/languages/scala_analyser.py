@@ -32,6 +32,14 @@ class ScalaAnalyzer(BaseLSPAnalyzer):
     def get_max_concurrency(self) -> int:
         import os
         return min(32, max(8, (os.cpu_count() or 8)))
+    
+    def is_excluded_definition_path(self, path: Path) -> bool:
+        parts = set(path.parts)
+        # Ignore Metals / build junk inside repo
+        exclude = {
+            ".metals", ".bloop", "project", "target",
+        }
+        return not parts.isdisjoint(exclude)
 
     def ref_pos_extractor(self, text: str, path: Path) -> List[Tuple[int, int]]:
         lang = get_language("scala")

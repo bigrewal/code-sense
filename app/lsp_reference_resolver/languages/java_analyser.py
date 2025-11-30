@@ -38,6 +38,17 @@ class JavaAnalyzer(BaseLSPAnalyzer):
     def get_warmup_seconds(self) -> float:
         return 120.0
 
+    def is_excluded_definition_path(self, path: Path) -> bool:
+        # Exclude generated files or specific directories if needed
+        return False
+
+    def is_excluded_definition_path(self, path: Path) -> bool:
+        parts = set(path.parts)
+        exclude = {
+            "build", "target", ".gradle", ".idea", "out",
+        }
+        return not parts.isdisjoint(exclude)
+
     def ref_pos_extractor(self, text: str, path: Path) -> List[Tuple[int, int]]:
         lang = get_language("java")
         parser = get_parser("java")

@@ -71,6 +71,13 @@ class RustAnalyzer(BaseLSPAnalyzer):
 
     def get_max_concurrency(self) -> int:
         return min(16, max(6, (os.cpu_count() or 8)))
+    
+    def is_excluded_definition_path(self, path: Path) -> bool:
+        parts = set(path.parts)
+        exclude = {
+            "target", ".git",
+        }
+        return not parts.isdisjoint(exclude)
 
     # ---------- Adaptive project discovery ----------
     def _skip_dir(self, p: Path) -> bool:

@@ -123,14 +123,14 @@ def _make_system_seed(file_summaries: str, repo_id: str) -> str:
         "Your task is to answer questions accurately about the given file summaries of the repo.\n"
         "Don't assume anything, Only answer from the information provided in the summaries. "
         " If a question warrants information that's not present say what file you need more information from.\n"
-        "Use the repository architecture below to reason about *where* to look and how things fit together.\n"
+        "Use the file summaries below to reason about *where* to look and how things fit together.\n"
         "When needed, you may inspect specific files (we will provide code). Be accurate, cite which files informed your answer.\n"
         f"REPOSITORY ID: {repo_id}\n\n"
         "FILE SUMMARIES:\n"
         "------------------------------------------------------------\n"
         f"{file_summaries.strip()}\n"
         "------------------------------------------------------------\n"
-        "Answer clearly and precisely. If something is ambiguous, state assumptions or ask for a path to inspect."
+        "Answer what is asked, nothing more nothing less. If something is ambiguous, state assumptions or ask for a path to inspect."
     )
     return seed
 
