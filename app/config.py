@@ -28,9 +28,34 @@ class Config:
     # MongoDB Configuration
     MONGO_URI: str = os.getenv("MONGO_URI", "mongodb://localhost:27017")
     MONGO_DB_NAME: str = "code_comprehension"
-    CHUNK_SUMMARIES_COLLECTION: str = "chunk_summaries"
-    JOB_STATUS_COLLECTION: str = "job_status"
+    # JOB_STATUS_COLLECTION: str = "job_status"
+    # INGESTED_REPOS_COLLECTION: str = "ingested_repos"
 
+    IGNORE_FOLDERS: dict = {
+        "test", 
+        "tests", 
+        "docs", 
+        "examples", 
+        ".git",
+        ".hg",
+        ".svn",
+        "node_modules",
+        "dist",
+        "build",
+        "target",
+        ".venv",
+        "venv",
+        "__pycache__"
+    }
+    
+    SUPPORTED_LANGUAGES: dict = {
+        ".py": "python",
+        ".java": "java",
+        ".scala": "scala",
+        ".rs": "rust"
+    }
+
+    min_supported_ratio: float = 0.5
 
     # Pipeline Stage Configurations
     @property

@@ -7,17 +7,17 @@ import uuid
 import sqlite3
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from collections import deque
 import tree_sitter as ts
 from tree_sitter_languages import get_parser, get_language
+from ..config import Config
 import traceback
 
-from ..models.data_model import (
-    ReferenceResolutionResult, CodeFile,
+from ..models.data_model import (CodeFile,
     ASTNode, CodeGraph
 )
-from ..db import get_neo4j_client
+from ..db import get_neo4j_client, get_mongo_client
 
 try:
     from tqdm import tqdm
@@ -50,6 +50,7 @@ class ASTProcessorStage():
         self.config = config or {}
         # We now treat lang_map as the source of truth; supported_languages is mostly legacy
         self.neo4j_client = get_neo4j_client()
+        self.mongo_client = get_mongo_client()
 
         self.max_file_size = self.config.get("max_file_size", 1024 * 1024)  # 1MB
         self.job_id = self.config.get("job_id", "unknown")
@@ -61,7 +62,7 @@ class ASTProcessorStage():
         # File content cache for definition-name extraction
         self._file_content_cache: Dict[str, List[str]] = {}
 
-    async def run(self, local_path: Path, repo_id: str) -> None:
+    async def run(self, local_path: Path, repo_id: str, changed_files: Optional[List[str]] = None) -> None:
         """
         Process AST and create graph in Neo4j.
 
@@ -70,13 +71,26 @@ class ASTProcessorStage():
             repo_id: repo identifier
         """
         conn = None
+
+        self.mongo_client.upsert_ingestion_job(
+            job_id=self.job_id,
+            repo_name=repo_id,
+            status="running",
+            current_stage="ast",
+            stage_status={"ast": {"status": "running"}},
+        )
+
         try:
+
             repo_path = local_path
+            is_incremental = bool(changed_files)
+            changed_set = set(changed_files or [])
 
             print(f"Job {self.job_id}: Starting AST processing for repository: {repo_id}")
 
             # Clear existing graph state for this repo
-            await self.neo4j_client.init_graph_for_repo(repo_id)
+            if not is_incremental:
+                await self.neo4j_client.init_graph_for_repo(repo_id)
 
             # Discover code files
             code_files = await self._discover_code_files(repo_path)
@@ -114,27 +128,44 @@ class ASTProcessorStage():
                 file_bar.close()
 
             # Second pass: For each file, fetch its reference mappings from SQLite and build reference edges
+                        # Second pass: Fetch reference mappings from SQLite once and build reference edges
             if conn:
                 print(f"Job {self.job_id}: Creating reference edges from SQLite cache")
-                # We could filter files to only those that appear in mappings, but you
-                # explicitly want ASTs for every file, so we just iterate all.
+
+                # Load all mappings once and group by ref_path
+                cursor.execute("SELECT ref_path, data FROM mappings")
+                refs_by_file: Dict[str, List[Dict]] = {}
+                for ref_path, data in cursor.fetchall():
+                    refs_by_file.setdefault(ref_path, []).append(json.loads(data))
+
+                # Decide which ref_paths we will actually attach references for
+                if not is_incremental:
+                    # Full rebuild: all files that have mappings
+                    target_ref_paths = list(refs_by_file.keys())
+                else:
+                    # Incremental: only files whose mappings were recomputed
+                    target_ref_paths = [p for p in refs_by_file.keys() if p in changed_set]
+
                 ref_bar = None
                 if tqdm is not None:
-                    ref_bar = tqdm(total=len(code_files), desc="Attaching references", leave=True)
-
-                for code_file in code_files:
-                    ref_path = str(code_file.relative_path)  # must match reference["file_path"]
-                    cursor.execute(
-                        "SELECT data FROM mappings WHERE ref_path = ?",
-                        (ref_path,),
+                    ref_bar = tqdm(
+                        total=len(target_ref_paths),
+                        desc="Attaching references",
+                        leave=True
                     )
-                    rows = cursor.fetchall()
-                    if rows:
-                        refs_for_file = [json.loads(row[0]) for row in rows]
-                        reference_edges = self._create_reference_edges(
-                            all_nodes, refs_for_file, global_leaf_lookup
-                        )
-                        all_edges.extend(reference_edges)
+
+                for ref_path in target_ref_paths:
+                    refs_for_file = refs_by_file.get(ref_path, [])
+                    if not refs_for_file:
+                        if ref_bar:
+                            ref_bar.update(1)
+                        continue
+
+                    reference_edges = self._create_reference_edges(
+                        all_nodes, refs_for_file, global_leaf_lookup
+                    )
+                    all_edges.extend(reference_edges)
+
                     if ref_bar:
                         ref_bar.update(1)
 
@@ -150,16 +181,39 @@ class ASTProcessorStage():
 
             print(f"Job {self.job_id}: After pruning: {len(all_nodes)} nodes, {len(all_edges)} edges")
 
+            # --- Decide which nodes/edges to write (full vs incremental) ---
+            if not is_incremental:
+                nodes_to_write = all_nodes
+                edges_to_write = all_edges
+            else:
+                # Only write graph slices for changed_files
+                changed_paths = changed_set
+                nodes_to_write = [n for n in all_nodes if n.file_path in changed_paths]
+                node_ids = {n.node_id for n in nodes_to_write}
+                # Keep edges that touch at least one changed node
+                edges_to_write = [
+                    e for e in all_edges
+                    if e.get("source") in node_ids or e.get("target") in node_ids
+                ]
+
+            print(
+                f"Job {self.job_id}: Writing {len(nodes_to_write)} nodes and "
+                f"{len(edges_to_write)} edges to Neo4j "
+                f"({'incremental' if is_incremental else 'full'} mode)"
+            )
+
             # --- Batched writes to Neo4j with progress bars ---
             # Nodes
+            nodes_bar = None
             if tqdm is not None:
-                nodes_bar = tqdm(total=len(all_nodes), desc="Writing nodes to Neo4j", leave=True)
-            else:
-                nodes_bar = None
+                nodes_bar = tqdm(
+                    total=len(nodes_to_write),
+                    desc="Writing nodes to Neo4j",
+                    leave=True,
+                )
 
-            for chunk in self._chunk_list(all_nodes, 5000):
-                # neo4j_client handles the details internally
-                await self.neo4j_client._batch_create_nodes(chunk, repo_id)
+            for chunk in self._chunk_list(nodes_to_write, 5000):
+                await self.neo4j_client.batch_create_nodes(chunk, repo_id)
                 if nodes_bar:
                     nodes_bar.update(len(chunk))
 
@@ -167,13 +221,16 @@ class ASTProcessorStage():
                 nodes_bar.close()
 
             # Edges
+            edges_bar = None
             if tqdm is not None:
-                edges_bar = tqdm(total=len(all_edges), desc="Writing edges to Neo4j", leave=True)
-            else:
-                edges_bar = None
+                edges_bar = tqdm(
+                    total=len(edges_to_write),
+                    desc="Writing edges to Neo4j",
+                    leave=True,
+                )
 
-            for chunk in self._chunk_list(all_edges, 5000):
-                await self.neo4j_client._batch_create_edges(chunk, repo_id)
+            for chunk in self._chunk_list(edges_to_write, 5000):
+                await self.neo4j_client.batch_create_edges(chunk, repo_id)
                 if edges_bar:
                     edges_bar.update(len(chunk))
 
@@ -182,7 +239,26 @@ class ASTProcessorStage():
 
             print(f"Job {self.job_id}: Finished writing graph to Neo4j")
 
+            self.mongo_client.upsert_ingestion_job(
+                job_id=self.job_id,
+                repo_name=repo_id,
+                status="running",
+                stage_status={"ast": {"status": "completed"}},
+            )
+
         except Exception as e:
+            self.mongo_client.upsert_ingestion_job(
+                job_id=self.job_id,
+                repo_name=repo_id,
+                status="failed",
+                stage_status={
+                    "ast": {
+                        "status": "failed",
+                        "error": str(e),
+                    }
+                },
+            )
+
             traceback.print_exc()
             print(f"Job {self.job_id}: AST processing error: {str(e)}")
         finally:
@@ -198,34 +274,25 @@ class ASTProcessorStage():
         """Discover and classify code files in the repository."""
         code_files = []
 
-        # File extension to language mapping
-        lang_map = {
-            ".py": "python",
-            ".java": "java",
-            ".scala": "scala",
-            ".rs": "rust",
-        }
-
         for file_path in repo_path.rglob("*"):
             if not file_path.is_file():
                 continue
 
             suffix = file_path.suffix.lower()
-            language = lang_map.get(suffix)
+            language = Config.SUPPORTED_LANGUAGES.get(suffix)
             # Only process languages we know about in lang_map
             if not language:
                 continue
 
             # Check if the file is in a test directory
-            if "tests" in file_path.parts or "test" in file_path.parts:
+            # if "tests" in file_path.parts or "test" in file_path.parts:
+            #     continue
+
+            rel_parts = file_path.relative_to(repo_path).parts
+            if any(marker in rel_parts for marker in Config.IGNORE_FOLDERS):
                 continue
 
             try:
-                # Check file size
-                if file_path.stat().st_size > self.max_file_size:
-                    print(f"Job {self.job_id}: Skipping large file: {file_path}")
-                    continue
-
                 # Read file content
                 content = file_path.read_text(encoding='utf-8', errors='ignore')
 

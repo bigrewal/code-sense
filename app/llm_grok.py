@@ -3,6 +3,7 @@
 import logging
 import time
 import asyncio
+import traceback
 from typing import Optional, Dict, List, Any
 
 import grpc
@@ -151,6 +152,12 @@ class GrokLLM:
             if prompt:
                 message_objs.append(user_message(prompt))
 
+        total_chars = 0
+        for m in message_objs:
+            total_chars += len(m.content or "")
+        
+        print(f"Total input tokens for GrokLLM: {total_chars // 4}")
+
         # Build kwargs for chat.create
         kwargs: Dict[str, Any] = {
             "model": model,
@@ -201,6 +208,7 @@ class GrokLLM:
         - If `stream=False` (default), returns a string (or raw response if return_raw=True).
         - If `stream=True`, returns the xai-sdk chat.stream() iterator.
         """
+
         max_attempts = 3
 
         for attempt in range(max_attempts):
@@ -231,6 +239,7 @@ class GrokLLM:
                 return (response.content or "").strip()
 
             except Exception as e:
+                traceback.print_exc()
                 if not _is_rate_limit_error(e):
                     logger.error(f"xAI Grok API error: {str(e)}")
                     raise RuntimeError(f"xAI Grok API error: {str(e)}")
@@ -246,6 +255,13 @@ class GrokLLM:
                     f"before retry {attempt + 1}/{max_attempts}"
                 )
                 time.sleep(wait_time)
+
+    def count_tokens(self, text: str) -> int:
+        tokens = self.client.tokenize.tokenize_text(
+            model=Config.GROK_4_NON_REASONING_MODEL, text=text
+        )
+
+        return len(tokens)
 
     async def generate_async(
         self,

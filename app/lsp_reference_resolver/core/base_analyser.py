@@ -1,7 +1,7 @@
 import asyncio, logging, os, hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple, Iterable, Set
+from typing import List, Dict, Optional, Tuple, Set
 from urllib.parse import urlparse, unquote
 
 from .lsp_client import LSPClient
@@ -29,13 +29,16 @@ class Location:
 
 class BaseLSPAnalyzer:
     """
-    Streaming analyzer with caching:
-      - Reads files sequentially
-      - Only sends definition requests for files whose SHA-1 has changed
-      - Unchanged files are served from a SQLite cache
-      - Bounded asyncio.Queue provides backpressure
-      - Workers resolve definitions concurrently
-      - For languages like Python, didOpen/didClose per file
+    Streaming analyzer with caching and cross-file invalidation:
+
+      - Computes SHA-1 per file.
+      - If content changed: re-resolve that file's references.
+      - Also invalidates mappings for any references whose definitions
+        point into changed files, and re-resolves those reference files.
+      - Unchanged & unaffected files are served from SQLite cache.
+      - Bounded asyncio.Queue provides backpressure.
+      - Workers resolve definitions concurrently.
+      - For languages like Python, didOpen/didClose per file.
     """
 
     def __init__(self, repo_path: Path, base_repo_path: str, show_progress: bool = True):
@@ -44,6 +47,8 @@ class BaseLSPAnalyzer:
         self.client: Optional[LSPClient] = None
         self.show_progress = show_progress and (tqdm is not None)
         self.cache: Optional[Cache] = None
+        # files whose mappings were recomputed in this run (ref files)
+        self.changed_files: Set[str] = set()
 
     # --- required by subclasses ---
     def get_server_command(self) -> List[str]: raise NotImplementedError
@@ -54,9 +59,6 @@ class BaseLSPAnalyzer:
     # --- overridable knobs ---
     def needs_did_open(self) -> bool:
         return self.get_language_id().lower() == "python"
-    
-    def is_excluded_definition_path(self, path: Path) -> bool: 
-        return False
 
     def get_warmup_seconds(self) -> float:
         lang = self.get_language_id().lower()
@@ -90,6 +92,15 @@ class BaseLSPAnalyzer:
         cmd = " ".join(self.get_server_command())
         return f"{self.__class__.__name__}:{cmd}"
 
+    def is_excluded_definition_path(self, path: Path) -> bool:
+        """
+        Hook for language-specific exclusion of definition paths.
+
+        `path` is repo-relative (no base_repo_prefix).
+        Default: keep everything.
+        """
+        return False
+
     # --- lifecycle ---
     async def start_server(self):
         self.client = LSPClient(self.get_server_command())
@@ -108,16 +119,26 @@ class BaseLSPAnalyzer:
     def get_files(self) -> List[Path]:
         skip = {
             "node_modules", "__pycache__", "venv", ".venv", "build", "dist",
-            "target", ".tox", ".eggs", "site-packages", "tests", "test", ".*"
+            "target", ".tox", ".eggs", "site-packages", "tests", "test",
         }
+
         files: List[Path] = []
         for ext in self.get_file_extensions():
             for f in self.repo_path.rglob(f"*{ext}"):
-                if not any(s in f.parts for s in skip) and not any(part.startswith('.') for part in f.parts):
-                    files.append(f)
+                rel_parts = f.relative_to(self.repo_path).parts
+
+                if any(part in skip for part in rel_parts):
+                    continue
+
+                if any(part.startswith(".") for part in rel_parts):
+                    continue
+
+                files.append(f)
+
         return files
 
-    # --- analyze (streaming + cache) ---
+
+    # --- analyze (streaming + cache + cross-file invalidation) ---
     async def analyze(self) -> List[Dict]:
         # init cache
         if self.cache is None:
@@ -149,9 +170,67 @@ class BaseLSPAnalyzer:
         timeout_backoff = 0.2
 
         # progress bars
-        files_bar = tqdm(total=len(files), desc="Reading files", leave=True) if self.show_progress else None
-        defs_bar  = tqdm(total=0, desc="Querying definitions", leave=True) if self.show_progress else None
+        scan_bar = tqdm(total=len(files), desc="Scanning files", leave=True) if self.show_progress else None
+        defs_bar = tqdm(total=0, desc="Querying definitions", leave=True) if self.show_progress else None
 
+        # Phase 1: scan files, compute SHA, detect content-changed files
+        file_infos: Dict[str, Dict] = {}
+        content_changed_files: Set[str] = set()
+
+        for fpath in files:
+            # repo-relative path with base_repo_path prefix (same format used in mappings)
+            rel_path = f"{self.base_repo_path}/{str(fpath.relative_to(self.repo_path))}"
+
+            try:
+                text = fpath.read_text(encoding="utf-8")
+            except Exception:
+                logger.warning("Failed to read %s", fpath)
+                if scan_bar:
+                    scan_bar.update(1)
+                continue
+
+            sha1 = hashlib.sha1(text.encode("utf-8")).hexdigest()
+            cached_sha = self.cache.get_file_sha(rel_path) if self.cache else None
+
+            if cached_sha != sha1:
+                content_changed_files.add(rel_path)
+
+            file_infos[rel_path] = {
+                "path": fpath,
+                "uri": fpath.as_uri(),
+                "text": text,
+                "sha1": sha1,
+                "cached_sha": cached_sha,
+            }
+
+            if scan_bar:
+                scan_bar.update(1)
+
+        if scan_bar:
+            scan_bar.close()
+
+        # Phase 1.5: cross-file invalidation based on definitions
+        # For each file whose content changed, invalidate mappings that
+        # point into it as a definition target.
+        impacted_ref_files: Set[str] = set()
+        if self.cache and content_changed_files:
+            for def_path in content_changed_files:
+                impacted = self.cache.invalidate_by_definition_file(def_path)
+                impacted_ref_files.update(impacted)
+
+        # Files whose mappings must be recomputed this run (as reference files)
+        files_to_recompute: Set[str] = set(content_changed_files) | set(impacted_ref_files)
+        self.changed_files = set(files_to_recompute)
+
+        if files_to_recompute:
+            logger.info(
+                "Files to recompute mappings for (content-changed=%d, impacted=%d, total=%d)",
+                len(content_changed_files),
+                len(impacted_ref_files),
+                len(files_to_recompute),
+            )
+
+        # Prepare worker tasks for definition queries
         async def worker():
             while True:
                 item = await q.get()
@@ -182,43 +261,42 @@ class BaseLSPAnalyzer:
         logger.info("Dispatching definition queries with concurrency=%d (streaming)...", max_conc)
 
         try:
-            # stream files → either serve from cache or enqueue positions per file
-            for fpath in files:
-                rel_path = f"{self.base_repo_path}/{str(fpath.relative_to(self.repo_path))}"
+            # Phase 2: reload from cache vs. enqueue for recomputation
+            process_bar = tqdm(total=len(file_infos), desc="Enqueueing refs", leave=True) if self.show_progress else None
 
-                # read file text
-                try:
-                    text = fpath.read_text(encoding="utf-8")
-                except Exception:
-                    logger.warning("Failed to read %s", fpath)
-                    if files_bar: files_bar.update(1)
-                    continue
+            for rel_path, info in file_infos.items():
+                fpath: Path = info["path"]
+                uri: str = info["uri"]
+                text: str = info["text"]
+                sha1: str = info["sha1"]
+                cached_sha: Optional[str] = info["cached_sha"]
 
-                # compute SHA-1 and check cache
-                sha1 = hashlib.sha1(text.encode("utf-8")).hexdigest()
-                cached_sha = self.cache.get_file_sha(rel_path) if self.cache else None
-
-                if cached_sha == sha1:
-                    # unchanged file → load cached mappings and skip LSP work
-                    if self.cache:
+                if rel_path not in files_to_recompute:
+                    # Unchanged and not impacted: load cached mappings and skip LSP
+                    if self.cache and cached_sha is not None:
                         cached_maps = self.cache.load_mappings_for_file(rel_path)
                         if cached_maps:
                             mappings.extend(cached_maps)
-                    if files_bar:
-                        files_bar.update(1)
+                    if process_bar:
+                        process_bar.update(1)
                     continue
 
-                # changed/new file → drop old mappings, update SHA
+                # This file's mappings must be recomputed.
                 if self.cache:
+                    # Drop any remaining mappings for this file as reference
                     self.cache.delete_mappings_for_file(rel_path)
-                    self.cache.update_file_sha(rel_path, sha1)
+                    # If content changed, update its SHA; if not, keep existing SHA
+                    final_sha = sha1 if cached_sha != sha1 else cached_sha
+                    if final_sha is None:
+                        final_sha = sha1
+                    self.cache.update_file_sha(rel_path, final_sha)
 
                 if self.needs_did_open():
                     await self.client.send_notification(
                         "textDocument/didOpen",
                         {
                             "textDocument": {
-                                "uri": fpath.as_uri(),
+                                "uri": uri,
                                 "languageId": self.get_language_id(),
                                 "version": 1,
                                 "text": text,
@@ -233,17 +311,19 @@ class BaseLSPAnalyzer:
                     if key_local in seen_local:
                         continue
                     seen_local.add(key_local)
-                    await q.put((fpath.as_uri(), fpath, {"line": line, "character": col}))
+                    await q.put((uri, fpath, {"line": line, "character": col}))
 
                 if self.needs_did_open():
-                    # close after enqueue, workers operate on saved URI
                     await self.client.send_notification(
                         "textDocument/didClose",
-                        {"textDocument": {"uri": fpath.as_uri()}},
+                        {"textDocument": {"uri": uri}},
                     )
 
-                if files_bar:
-                    files_bar.update(1)
+                if process_bar:
+                    process_bar.update(1)
+
+            if process_bar:
+                process_bar.close()
 
             # finished producing; send sentinels
             for _ in workers:
@@ -260,8 +340,8 @@ class BaseLSPAnalyzer:
                 except Exception:
                     logger.exception("Worker task failed")
 
-            if files_bar: files_bar.close()
-            if defs_bar: defs_bar.close()
+            if defs_bar:
+                defs_bar.close()
 
             if self.cache:
                 self.cache.commit()
@@ -326,16 +406,12 @@ class BaseLSPAnalyzer:
                 p = Path(unquote(urlparse(uri).path)).resolve()
                 if not p.exists():
                     continue
-                # try:
-                #     rel = f"{self.base_repo_path}/{str(p.relative_to(self.repo_path))}"
-                # except ValueError:
-                #     continue
-
                 try:
                     rel_path = p.relative_to(self.repo_path)  # repo-relative
                 except ValueError:
                     continue
 
+                # language-specific exclusions
                 if self.is_excluded_definition_path(rel_path):
                     continue
 
@@ -363,7 +439,7 @@ class BaseLSPAnalyzer:
 
             result = {"reference": ref.to_dict(), "definitions": [d.to_dict() for d in valid]}
 
-            # persist in SQLite cache
+            # persist in SQLite cache (mappings + def_index)
             if self.cache:
                 try:
                     self.cache.store_mapping(result)

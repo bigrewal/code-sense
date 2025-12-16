@@ -7,8 +7,6 @@ import time
 from typing import Any, Dict
 from pathlib import Path
 
-from ..models.data_model import ReferenceResolutionResult
-# import tree_sitter_reference_resolver as tsrr
 from ..lsp_reference_resolver.run import CodeAnalyzer
 
 

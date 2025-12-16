@@ -23,16 +23,6 @@ class S3StorageInfo:
     repo_info: UploadedRepository
 
 @dataclass
-class ReferenceResolutionResult:
-    """Result from tree-sitter reference resolution."""
-    repo_path: Path
-    references: Dict[str, List[tuple]]  # Mapping from file path to list of references
-    total_references: int
-    resolved_count: int
-    unresolved_count: int
-    processing_time: float
-
-@dataclass
 class CodeFile:
     """Information about a single code file."""
     file_path: Path

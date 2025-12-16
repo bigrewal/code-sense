@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import asyncio
-import json
 from datetime import datetime, timezone
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from bson import ObjectId
 
