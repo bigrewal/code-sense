@@ -1,12 +1,13 @@
+import asyncio
 import logging
+import time
+from typing import Any, Dict, List
+
 from neo4j import GraphDatabase
 from pymongo import MongoClient
-from .config import Config
-from .models.data_model import CodeGraph, ASTNode
 
-from typing import Dict, Tuple
-from typing import List, Dict, Any
-import time
+from .config import Config
+from .models.data_model import ASTNode
 logger = logging.getLogger(__name__)
 
 ## Silence WARNING:neo4j.notifications: 
@@ -51,19 +52,17 @@ class Neo4jClient:
             logger.error("Neo4j driver not initialized")
             raise Exception("Neo4j driver not initialized")
 
-        try:
-            logger.info(f"Initialising graph for repo: {repo_id}")
+        async def _initialise():
+            try:
+                logger.info("Initialising graph for repo: %s", repo_id)
+                with self.driver.session() as session:
+                    self._create_indexes(session)
+                    self.clear_repo_data(session, repo_id)
+            except Exception as exc:
+                logger.error("Neo4j initialisation failed: %s", exc)
+                raise
 
-            with self.driver.session() as session:
-                # Create indexes if they don't exist
-                self._create_indexes(session)
-
-                # Optional: Clear existing data for this repo
-                self.clear_repo_data(session, repo_id)
-
-        except Exception as exc:
-            logger.error(f"Neo4j initialisation failed: {exc}")
-            raise
+        await asyncio.to_thread(_initialise)
 
     def _create_indexes(self, session):
         """Create necessary indexes for performance."""
@@ -101,56 +100,59 @@ class Neo4jClient:
 
         total_batches = (len(nodes) + self.batch_size - 1) // self.batch_size
 
-        with self.driver.session() as session:
-            for i in range(0, len(nodes), self.batch_size):
-                batch_num = (i // self.batch_size) + 1
-                batch = nodes[i:i + self.batch_size]
+        for i in range(0, len(nodes), self.batch_size):
+            batch_num = (i // self.batch_size) + 1
+            batch = nodes[i:i + self.batch_size]
 
-                # Convert nodes to dictionaries
-                node_dicts = []
-                for node in batch:
-                    node_dict = {
-                        'node_id': node.node_id,
-                        'node_type': node.node_type,
-                        'start_line': node.start_line,
-                        'start_column': node.start_column,
-                        'end_line': node.end_line,
-                        'end_column': node.end_column,
-                        'parent_id': node.parent_id,
-                        'file_path': node.file_path,
-                        'is_definition': node.is_definition,
-                        'is_reference': node.is_reference,
-                        'repo_id': repo_id,
-                        'name': node.name,
-                    }
-                    node_dicts.append(node_dict)
+            # Convert nodes to dictionaries
+            node_dicts = []
+            for node in batch:
+                node_dict = {
+                    'node_id': node.node_id,
+                    'node_type': node.node_type,
+                    'start_line': node.start_line,
+                    'start_column': node.start_column,
+                    'end_line': node.end_line,
+                    'end_column': node.end_column,
+                    'parent_id': node.parent_id,
+                    'file_path': node.file_path,
+                    'is_definition': node.is_definition,
+                    'is_reference': node.is_reference,
+                    'repo_id': repo_id,
+                    'name': node.name,
+                }
+                node_dicts.append(node_dict)
 
-                query = """
-                UNWIND $nodes AS node
-                CREATE (n:ASTNode)
-                SET n = node
-                """
+            query = """
+            UNWIND $nodes AS node
+            CREATE (n:ASTNode)
+            SET n = node
+            """
 
-                # Add Definition label if is_definition is True
-                query += """
-                WITH n, node
-                WHERE node.is_definition = true
-                SET n:Definition
-                """
+            # Add Definition label if is_definition is True
+            query += """
+            WITH n, node
+            WHERE node.is_definition = true
+            SET n:Definition
+            """
 
-                # Add Reference label if is_reference is True
-                query += """
-                WITH n, node
-                WHERE node.is_reference = true
-                SET n:Reference
-                """
+            # Add Reference label if is_reference is True
+            query += """
+            WITH n, node
+            WHERE node.is_reference = true
+            SET n:Reference
+            """
 
-                try:
+            def _write_nodes():
+                with self.driver.session() as session:
                     session.run(query, nodes=node_dicts)
-                    logger.debug(f"Created node batch {batch_num}/{total_batches} ({len(batch)} nodes)")
-                except Exception as e:
-                    logger.error(f"Failed to create node batch {batch_num}: {e}")
-                    raise
+
+            try:
+                await asyncio.to_thread(_write_nodes)
+                logger.debug("Created node batch %s/%s (%s nodes)", batch_num, total_batches, len(batch))
+            except Exception as e:
+                logger.error("Failed to create node batch %s: %s", batch_num, e)
+                raise
 
     async def batch_create_edges(self, edges: List[Dict[str, Any]], repo_id: str):
         """Create edges in batches."""
@@ -164,74 +166,71 @@ class Neo4jClient:
 
         total_batches = (len(edges) + self.batch_size - 1) // self.batch_size
 
-        with self.driver.session() as session:
-            for i in range(0, len(edges), self.batch_size):
-                batch_num = (i // self.batch_size) + 1
-                batch = edges[i:i + self.batch_size]
+        for i in range(0, len(edges), self.batch_size):
+            batch_num = (i // self.batch_size) + 1
+            batch = edges[i:i + self.batch_size]
 
-                # Group edges by type for efficient processing
-                contains_edges = []
-                references_edges = []
-                depends_on_edges = []
+            # Group edges by type for efficient processing
+            contains_edges = []
+            references_edges = []
+            depends_on_edges = []
 
-                for edge in batch:
-                    edge_data = {
-                        'source': edge['source'],
-                        'target': edge['target'],
-                        'sequence': edge.get('sequence', 1),
-                    }
+            for edge in batch:
+                edge_data = {
+                    'source': edge['source'],
+                    'target': edge['target'],
+                    'sequence': edge.get('sequence', 1),
+                }
 
-                    if edge['type'] == 'CONTAINS':
-                        contains_edges.append(edge_data)
-                    elif edge['type'] == 'REFERENCES':
-                        references_edges.append(edge_data)
-                    elif edge['type'] == 'DEPENDS_ON':
-                        depends_on_edges.append(edge_data)
+                if edge['type'] == 'CONTAINS':
+                    contains_edges.append(edge_data)
+                elif edge['type'] == 'REFERENCES':
+                    references_edges.append(edge_data)
+                elif edge['type'] == 'DEPENDS_ON':
+                    depends_on_edges.append(edge_data)
 
-                # Create CONTAINS relationships
-                if contains_edges:
-                    contains_query = """
-                    UNWIND $edges AS edge
-                    MATCH (source:ASTNode {node_id: edge.source})
-                    MATCH (target:ASTNode {node_id: edge.target})
-                    CREATE (source)-[:CONTAINS {sequence: edge.sequence}]->(target)
-                    """
-                    try:
+            def _write_edges():
+                with self.driver.session() as session:
+                    if contains_edges:
+                        contains_query = """
+                        UNWIND $edges AS edge
+                        MATCH (source:ASTNode {node_id: edge.source})
+                        MATCH (target:ASTNode {node_id: edge.target})
+                        CREATE (source)-[:CONTAINS {sequence: edge.sequence}]->(target)
+                        """
                         session.run(contains_query, edges=contains_edges)
-                        logger.debug(f"Created {len(contains_edges)} CONTAINS edges in batch {batch_num}")
-                    except Exception as e:
-                        logger.error(f"Failed to create CONTAINS edges in batch {batch_num}: {e}")
-                        raise
 
-                # Create REFERENCES relationships
-                if references_edges:
-                    references_query = """
-                    UNWIND $edges AS edge
-                    MATCH (source:ASTNode {node_id: edge.source})
-                    MATCH (target:ASTNode {node_id: edge.target})
-                    CREATE (source)-[:REFERENCES {sequence: edge.sequence}]->(target)
-                    """
-                    try:
+                    if references_edges:
+                        references_query = """
+                        UNWIND $edges AS edge
+                        MATCH (source:ASTNode {node_id: edge.source})
+                        MATCH (target:ASTNode {node_id: edge.target})
+                        CREATE (source)-[:REFERENCES {sequence: edge.sequence}]->(target)
+                        """
                         session.run(references_query, edges=references_edges)
-                        logger.debug(f"Created {len(references_edges)} REFERENCES edges in batch {batch_num}")
-                    except Exception as e:
-                        logger.error(f"Failed to create REFERENCES edges in batch {batch_num}: {e}")
-                        raise
 
-                # Create DEPENDS_ON relationships
-                if depends_on_edges:
-                    depends_on_query = """
-                    UNWIND $edges AS edge
-                    MATCH (source:ASTNode {node_id: edge.source})
-                    MATCH (target:ASTNode {node_id: edge.target})
-                    CREATE (source)-[:DEPENDS_ON {sequence: edge.sequence}]->(target)
-                    """
-                    try:
+                    if depends_on_edges:
+                        depends_on_query = """
+                        UNWIND $edges AS edge
+                        MATCH (source:ASTNode {node_id: edge.source})
+                        MATCH (target:ASTNode {node_id: edge.target})
+                        CREATE (source)-[:DEPENDS_ON {sequence: edge.sequence}]->(target)
+                        """
                         session.run(depends_on_query, edges=depends_on_edges)
-                        logger.debug(f"Created {len(depends_on_edges)} DEPENDS_ON edges in batch {batch_num}")
-                    except Exception as e:
-                        logger.error(f"Failed to create DEPENDS_ON edges in batch {batch_num}: {e}")
-                        raise
+
+            try:
+                await asyncio.to_thread(_write_edges)
+                logger.debug(
+                    "Created edges in batch %s/%s (contains=%s, references=%s, depends_on=%s)",
+                    batch_num,
+                    total_batches,
+                    len(contains_edges),
+                    len(references_edges),
+                    len(depends_on_edges),
+                )
+            except Exception as e:
+                logger.error("Failed to create edges in batch %s: %s", batch_num, e)
+                raise
 
     def cross_file_interactions_in_file(self, file_path: str, repo_id: str):
         """Infer cross-file interactions for a given file by finding references to and from definitions in other files."""

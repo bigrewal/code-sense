@@ -1,39 +1,22 @@
+import logging
 from collections import deque
 
 from .db import get_mongo_client, get_neo4j_client, MyMongoClient, Neo4jClient
-from .llm import GroqLLM
-from .config import Config
+
+logger = logging.getLogger(__name__)
 
 MENTAL_MODEL_COL = "mental_model"
 
-DOC_HUMAN = "REPO_ARCHITECTURE"
-DOC_FILE_SUMMARY = "FILE_SUMMARY"
 
-
-class RepoArchService:
+class RepoContextBuilder:
     def __init__(self, repo_id: str):
         self.repo_id = repo_id
         self.mongo_client: MyMongoClient = get_mongo_client()
         self.neo4j_client: Neo4jClient = get_neo4j_client()
 
         self.mental = self.mongo_client[MENTAL_MODEL_COL]
-        self.llm = GroqLLM()
 
-    def get_repo_architecture(self) -> dict[str, str]:
-        """
-        Build architecture overviews by:
-        - Selecting a minimal subset of entry points whose reachable files span the repo.
-        - For each selected entry point:
-          - Generating a brief, per-file summary for each reachable file.
-          - Concatenating these summaries in breadth-first order from the entry point.
-          - Chunking the concatenated summary into <=100k-character chunks and storing them.
-        """
-        entry_points = self.mongo_client.get_potential_entry_points(self.repo_id) or []
-
-        self.create_repo_contxt(entry_points)
-
-
-    def create_repo_contxt(self, entry_points: list[str]):
+    def create_repo_contxt(self) -> list[str]:
         """
         Build REPO_CONTEXT by concatenating brief file overviews.
 
@@ -43,7 +26,10 @@ class RepoArchService:
         - Append its brief overview to the context (separated by two newlines).
         - Store the final concatenated string as a REPO_CONTEXT document in MongoDB.
         """
+        entry_points = self.mongo_client.get_potential_entry_points(self.repo_id) or []
+
         if not entry_points:
+            logger.info("No entry points found for repo %s; skipping REPO_CONTEXT build", self.repo_id)
             return []
 
         critical_files = set(self.mongo_client.get_critical_file_paths(self.repo_id))
@@ -101,7 +87,7 @@ class RepoArchService:
 
 # === Convenience Functions =====================================================
 
-async def build_repo_architecture_v2(repo_id: str) -> dict[str, str]:
-    """Build architecture overviews using brief per-file summaries concatenated in BFS order."""
-    builder = RepoArchService(repo_id=repo_id)
-    return builder.get_repo_architecture()
+async def build_repo_context(repo_id: str) -> dict[str, str]:
+    """Build repository context using brief per-file summaries concatenated in BFS order."""
+    builder = RepoContextBuilder(repo_id=repo_id)
+    return builder.create_repo_contxt()

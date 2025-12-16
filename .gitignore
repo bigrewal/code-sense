@@ -10,3 +10,6 @@ wheels/
 .venv
 .*
 ../
+
+# macOS cruft
+.DS_Store

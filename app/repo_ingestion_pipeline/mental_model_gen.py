@@ -7,7 +7,7 @@ from tqdm import tqdm
 
 from ..db import Neo4jClient, get_mongo_client, get_neo4j_client
 from ..llm_grok import GrokLLM
-from ..repo_arch_service_me import build_repo_architecture_v2
+from ..repo_context_builder import build_repo_context
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +81,7 @@ class MentalModelStage:
                 len(ignored_files),
             )
             await self._set_potential_entry_points(insights, repo_id)
-            await build_repo_architecture_v2(repo_id)
+            await build_repo_context(repo_id)
             self.mongo_client.upsert_ingestion_job(
                 job_id=self.job_id,
                 repo_name=repo_id,

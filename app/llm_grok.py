@@ -108,8 +108,6 @@ def _convert_messages(messages: List[Any]) -> List[Any]:
 
 class GrokLLM:
     """
-    xAI Grok-backed LLM wrapper with the same public interface as GroqLLM.
-
     - Uses xai_sdk.Client / AsyncClient.
     - Stateless from the caller's POV (each generate() call builds a fresh chat).
     """
@@ -156,7 +154,7 @@ class GrokLLM:
         for m in message_objs:
             total_chars += len(m.content or "")
         
-        print(f"Total input tokens for GrokLLM: {total_chars // 4}")
+        logger.debug("Total input tokens for GrokLLM: %s", total_chars // 4)
 
         # Build kwargs for chat.create
         kwargs: Dict[str, Any] = {
@@ -203,8 +201,6 @@ class GrokLLM:
         return_raw: bool = False,
     ) -> Any:
         """
-        Grok-backed equivalent of GroqLLM.generate.
-
         - If `stream=False` (default), returns a string (or raw response if return_raw=True).
         - If `stream=True`, returns the xai-sdk chat.stream() iterator.
         """
@@ -227,7 +223,6 @@ class GrokLLM:
                 )
 
                 if stream:
-                    # For parity with GroqLLM, just return the stream iterator.
                     return chat.stream()
 
                 response = chat.sample()
@@ -275,7 +270,6 @@ class GrokLLM:
     ) -> str:
         """
         Async equivalent using AsyncClient + chat.sample().
-        (Note: no streaming flag here, to mirror your existing GroqLLM.generate_async.)
         """
         max_attempts = 3
 
@@ -332,5 +326,3 @@ class GrokLLM:
                     f"before retry {attempt + 1}/{max_attempts}"
                 )
                 await asyncio.sleep(wait_time)
-
-    

@@ -118,7 +118,6 @@ class PreIngestionAnalysisStage:
             "files_by_lang": files_by_lang,
             "supported_languages": sorted(Config.SUPPORTED_LANGUAGES.values()),
             "min_supported_ratio": Config.min_supported_ratio,
-            "known_extensions": sorted(Config.SUPPORTED_LANGUAGES.keys()),
             "file_count": len(file_metrics),
         }
 

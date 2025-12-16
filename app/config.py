@@ -1,8 +1,13 @@
 import os
+from pathlib import Path
 from typing import Any, Dict
-from dotenv import load_dotenv
 
-load_dotenv(".env.local")
+if Path(".env.local").exists():
+    # Optional local-only overrides; production should rely on env vars.
+    from dotenv import load_dotenv
+
+    load_dotenv(".env.local")
+
 
 class Config:
     GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -21,21 +26,19 @@ class Config:
     S3_BUCKET_NAME: str = "code-analysis-repos"
 
     # New Neo4j configs
-    NEO4J_URI: str = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-    NEO4J_USER: str = os.getenv("NEO4J_USER", "neo4j")
-    NEO4J_PASSWORD: str = os.getenv("NEO4J_PASSWORD", "llamaindex")
+    NEO4J_URI: str = os.getenv("NEO4J_URI")
+    NEO4J_USER: str = os.getenv("NEO4J_USER")
+    NEO4J_PASSWORD: str = os.getenv("NEO4J_PASSWORD")
 
     # MongoDB Configuration
     MONGO_URI: str = os.getenv("MONGO_URI", "mongodb://localhost:27017")
     MONGO_DB_NAME: str = "code_comprehension"
-    # JOB_STATUS_COLLECTION: str = "job_status"
-    # INGESTED_REPOS_COLLECTION: str = "ingested_repos"
 
     IGNORE_FOLDERS: dict = {
-        "test", 
-        "tests", 
-        "docs", 
-        "examples", 
+        "test",
+        "tests",
+        "docs",
+        "examples",
         ".git",
         ".hg",
         ".svn",
@@ -45,62 +48,26 @@ class Config:
         "target",
         ".venv",
         "venv",
-        "__pycache__"
+        "__pycache__",
     }
-    
+
     SUPPORTED_LANGUAGES: dict = {
         ".py": "python",
         ".java": "java",
         ".scala": "scala",
-        ".rs": "rust"
+        ".rs": "rust",
     }
 
     min_supported_ratio: float = 0.5
 
-    # Pipeline Stage Configurations
-    @property
-    def UPLOAD_CONFIG(self) -> Dict[str, Any]:
-        return {
-            "max_file_size": 100 * 1024 * 1024,  # 100MB
-            "allowed_extensions": [".zip", ".tar.gz", ".tar"]
-        }
-    
-    @property
-    def S3_CONFIG(self) -> Dict[str, Any]:
-        return {
-            "bucket_name": self.S3_BUCKET_NAME,
-            "aws_config": {
-                "aws_access_key_id": self.AWS_ACCESS_KEY_ID,
-                "aws_secret_access_key": self.AWS_SECRET_ACCESS_KEY,
-                "region_name": self.AWS_REGION
-            }
-        }
-    
-    @property
-    def RESOLVER_CONFIG(self) -> Dict[str, Any]:
-        return {
-            "include_unresolved": True,
-            "reuse_database": False
-        }
-    
-    @property
-    def AST_CONFIG(self) -> Dict[str, Any]:
-        return {
-            "supported_languages": ["python", "javascript", "typescript"],
-            "max_file_size": 1024 * 1024,  # 1MB per file
-        }
-    
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-
-    @classmethod
-    def validate(cls):
-        if not cls.GROQ_API_KEY:
-            raise ValueError("GROQ_API_KEY must be set in .env")
-        if not cls.NEO4J_URI:
-            raise ValueError("NEO4J_URI must be set in .env")
-        if not cls.NEO4J_USER:
-            raise ValueError("NEO4J_USER must be set in .env")
-        if not cls.NEO4J_PASSWORD:
-            raise ValueError("NEO4J_PASSWORD must be set in .env")
+def validate_required_settings() -> None:
+    """Fail fast with a clear list of missing required environment values."""
+    required = {
+        "XAI_API_KEY": Config.XAI_API_KEY,
+        "NEO4J_URI": Config.NEO4J_URI,
+        "NEO4J_USER": Config.NEO4J_USER,
+        "NEO4J_PASSWORD": Config.NEO4J_PASSWORD,
+    }
+    missing = [name for name, value in required.items() if not value]
+    if missing:
+        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")

@@ -3,6 +3,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
+from uuid import uuid4
 
 from bson import ObjectId
 from fastapi import BackgroundTasks, FastAPI, HTTPException
@@ -11,14 +12,18 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from .chat_service import stream_chat
-from .config import Config
-from .db import get_mongo_client, init_mongo_client, init_neo4j_client, get_neo4j_client
+from .config import validate_required_settings
+from .db import (
+    get_mongo_client,
+    get_neo4j_client,
+    init_mongo_client,
+    init_neo4j_client,
+)
 from .repo_ingestion_pipeline import start_ingestion_pipeline
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-Config.validate()
 app = FastAPI(title="Code Repo QA Agent")
 
 app.add_middleware(
@@ -33,6 +38,7 @@ app.add_middleware(
 @app.on_event("startup")
 async def on_startup():
     logger.info("Initializing clients")
+    validate_required_settings()
     init_neo4j_client()
     init_mongo_client()
 
@@ -97,7 +103,7 @@ async def create_conversation(req: ConversationCreateRequest):
         "type": "REPO_CHAT",
     }
 
-    result = conversations.insert_one(doc)
+    result = await asyncio.to_thread(conversations.insert_one, doc)
 
     return ConversationCreateResponse(
         conversation_id=str(result.inserted_id),
@@ -116,6 +122,7 @@ async def list_conversations(
     List conversations, optionally filtered by repo_id.
     Used by the UI to populate the 'chat sidebar'.
     """
+    limit = max(1, min(limit, 200))
     mongo = get_mongo_client()
     conversations = mongo["conversations"]
 
@@ -124,14 +131,15 @@ async def list_conversations(
         query["repo_id"] = repo_id
 
     cursor = (
-        conversations.find(query)
+        conversations.find(query, projection={"title": 1, "repo_id": 1, "created_at": 1, "updated_at": 1})
         .sort("updated_at", -1)
         .skip(offset)
         .limit(limit)
     )
 
+    docs = await asyncio.to_thread(list, cursor)
     results: List[ConversationSummary] = []
-    for doc in cursor:
+    for doc in docs:
         results.append(
             ConversationSummary(
                 conversation_id=str(doc["_id"]),
@@ -151,13 +159,16 @@ async def list_conversation_messages(conversation_id: str, limit: int = 200):
     Return all messages for a given conversation_id (up to `limit`).
     Used by the UI to reload an existing chat.
     """
+    limit = max(1, min(limit, 500))
     mongo = get_mongo_client()
     conversations = mongo["conversations"]
     messages_col = mongo["messages"]
 
     # Ensure the conversation exists
     try:
-        conv = conversations.find_one({"_id": ObjectId(conversation_id)})
+        conv = await asyncio.to_thread(
+            conversations.find_one, {"_id": ObjectId(conversation_id)}, {"_id": 1}
+        )
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid conversation id")
 
@@ -165,13 +176,14 @@ async def list_conversation_messages(conversation_id: str, limit: int = 200):
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     cursor = (
-        messages_col.find({"conversation_id": conversation_id})
+        messages_col.find({"conversation_id": conversation_id}, {"_id": 0})
         .sort("created_at", 1)
         .limit(limit)
     )
 
     messages: List[MessageModel] = []
-    for m in cursor:
+    docs = await asyncio.to_thread(list, cursor)
+    for m in docs:
         messages.append(
             MessageModel(
                 role=m["role"],
@@ -194,15 +206,15 @@ async def delete_conversation(conversation_id: str):
     messages_col = mongo["messages"]
 
     try:
-        conv = conversations.find_one({"_id": ObjectId(conversation_id)})
+        conv = await asyncio.to_thread(conversations.find_one, {"_id": ObjectId(conversation_id)}, {"_id": 1})
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid conversation id")
 
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    messages_col.delete_many({"conversation_id": conversation_id})
-    conversations.delete_one({"_id": ObjectId(conversation_id)})
+    await asyncio.to_thread(messages_col.delete_many, {"conversation_id": conversation_id})
+    await asyncio.to_thread(conversations.delete_one, {"_id": ObjectId(conversation_id)})
 
     return {"message": "Conversation deleted"}
 
@@ -229,19 +241,24 @@ async def ingest_repo(repo_name: str, background_tasks: BackgroundTasks, job_id:
     if not local_repo_path.exists():
         raise HTTPException(status_code=404, detail=f"Repository not found: {local_repo_path}")
 
+    job_identifier = job_id or str(uuid4())
+
     background_tasks.add_task(
         start_ingestion_pipeline,
         local_repo_path=local_repo_path,
         repo_name=repo_name_full,
-        job_id=job_id,
+        job_id=job_identifier,
     )
 
-    return {"message": f"Job {job_id or 'ingest'} started. Check terminal for results"}
+    return {"message": f"Job {job_identifier} started. Check terminal for results"}
 
 
 @app.delete("/repos/{repo_name}", responses={404: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
 async def delete_repo(repo_name: str, delete_files: bool = False):
     """Delete a code repository and its associated data."""
+    if Path(repo_name).name != repo_name:
+        raise HTTPException(status_code=400, detail="Invalid repository name")
+
     local_repo_path = Path("data") / repo_name
 
     if not local_repo_path.exists():
@@ -261,8 +278,18 @@ async def delete_repo(repo_name: str, delete_files: bool = False):
     neo4j = get_neo4j_client()
 
     repo_id = f"data/{repo_name}"
-    mongo.delete_repo_data(repo_id)
-    neo4j.clear_repo_data(session=neo4j.driver.session(), repo_id=repo_id)
+    try:
+        mongo.delete_repo_data(repo_id)
+    except Exception as exc:
+        logger.exception("Failed to delete repo documents", exc_info=exc)
+        raise HTTPException(status_code=500, detail="Failed to delete repo data")
+
+    try:
+        with neo4j.driver.session() as neo_session:
+            neo4j.clear_repo_data(session=neo_session, repo_id=repo_id)
+    except Exception as exc:
+        logger.exception("Failed to delete repo graph", exc_info=exc)
+        raise HTTPException(status_code=500, detail="Failed to delete graph data")
 
     return {"message": f"Repository {repo_name} and its data have been deleted."}
 

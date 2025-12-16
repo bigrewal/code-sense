@@ -3,6 +3,7 @@ Stage 4: AST Processing
 Creates AST for code files and builds graph in Neo4j.
 """
 
+import logging
 import uuid
 import sqlite3
 import json
@@ -15,7 +16,7 @@ from ..config import Config
 import traceback
 
 from ..models.data_model import (CodeFile,
-    ASTNode, CodeGraph
+    ASTNode
 )
 from ..db import get_neo4j_client, get_mongo_client
 
@@ -23,6 +24,8 @@ try:
     from tqdm import tqdm
 except Exception:
     tqdm = None
+
+logger = logging.getLogger(__name__)
 
 LANGUAGE_DEFINITION_MAP = {
     "python": {"function_definition", "class_definition", "assignment"},
@@ -46,14 +49,12 @@ LANGUAGE_DEFINITION_MAP = {
 class ASTProcessorStage():
     """Stage for AST creation and graph database population."""
 
-    def __init__(self, config: dict = None):
-        self.config = config or {}
+    def __init__(self, job_id: str):
         # We now treat lang_map as the source of truth; supported_languages is mostly legacy
         self.neo4j_client = get_neo4j_client()
         self.mongo_client = get_mongo_client()
 
-        self.max_file_size = self.config.get("max_file_size", 1024 * 1024)  # 1MB
-        self.job_id = self.config.get("job_id", "unknown")
+        self.job_id = job_id
         self.language_defs = LANGUAGE_DEFINITION_MAP
 
         # Parser cache: language -> parser
@@ -86,7 +87,7 @@ class ASTProcessorStage():
             is_incremental = bool(changed_files)
             changed_set = set(changed_files or [])
 
-            print(f"Job {self.job_id}: Starting AST processing for repository: {repo_id}")
+            logger.info("Job %s: Starting AST processing for repository: %s", self.job_id, repo_id)
 
             # Clear existing graph state for this repo
             if not is_incremental:
@@ -95,7 +96,7 @@ class ASTProcessorStage():
             # Discover code files
             code_files = await self._discover_code_files(repo_path)
             total_files = len(code_files)
-            print(f"Job {self.job_id}: Discovered {total_files} code files")
+            logger.info("Job %s: Discovered %s code files", self.job_id, total_files)
 
             # Open SQLite cache (if present)
             db_path = repo_path / ".lsp_ref_cache.sqlite"
@@ -130,7 +131,7 @@ class ASTProcessorStage():
             # Second pass: For each file, fetch its reference mappings from SQLite and build reference edges
                         # Second pass: Fetch reference mappings from SQLite once and build reference edges
             if conn:
-                print(f"Job {self.job_id}: Creating reference edges from SQLite cache")
+                logger.info("Job %s: Creating reference edges from SQLite cache", self.job_id)
 
                 # Load all mappings once and group by ref_path
                 cursor.execute("SELECT ref_path, data FROM mappings")
@@ -172,14 +173,16 @@ class ASTProcessorStage():
                 if ref_bar:
                     ref_bar.close()
 
-            print(
-                f"Job {self.job_id}: Pre-Pruning: {len(all_nodes)} nodes, "
-                f"{len(all_edges)} edges created"
+            logger.info(
+                "Job %s: Pre-Pruning: %s nodes, %s edges created",
+                self.job_id,
+                len(all_nodes),
+                len(all_edges),
             )
 
             all_nodes, all_edges = self._prune_graph(all_nodes, all_edges)
 
-            print(f"Job {self.job_id}: After pruning: {len(all_nodes)} nodes, {len(all_edges)} edges")
+            logger.info("Job %s: After pruning: %s nodes, %s edges", self.job_id, len(all_nodes), len(all_edges))
 
             # --- Decide which nodes/edges to write (full vs incremental) ---
             if not is_incremental:
@@ -196,10 +199,12 @@ class ASTProcessorStage():
                     if e.get("source") in node_ids or e.get("target") in node_ids
                 ]
 
-            print(
-                f"Job {self.job_id}: Writing {len(nodes_to_write)} nodes and "
-                f"{len(edges_to_write)} edges to Neo4j "
-                f"({'incremental' if is_incremental else 'full'} mode)"
+            logger.info(
+                "Job %s: Writing %s nodes and %s edges to Neo4j (%s mode)",
+                self.job_id,
+                len(nodes_to_write),
+                len(edges_to_write),
+                "incremental" if is_incremental else "full",
             )
 
             # --- Batched writes to Neo4j with progress bars ---
@@ -237,7 +242,7 @@ class ASTProcessorStage():
             if edges_bar:
                 edges_bar.close()
 
-            print(f"Job {self.job_id}: Finished writing graph to Neo4j")
+            logger.info("Job %s: Finished writing graph to Neo4j", self.job_id)
 
             self.mongo_client.upsert_ingestion_job(
                 job_id=self.job_id,
@@ -259,8 +264,7 @@ class ASTProcessorStage():
                 },
             )
 
-            traceback.print_exc()
-            print(f"Job {self.job_id}: AST processing error: {str(e)}")
+            logger.exception("Job %s: AST processing error", self.job_id, exc_info=e)
         finally:
             if conn is not None:
                 conn.close()
@@ -284,10 +288,6 @@ class ASTProcessorStage():
             if not language:
                 continue
 
-            # Check if the file is in a test directory
-            # if "tests" in file_path.parts or "test" in file_path.parts:
-            #     continue
-
             rel_parts = file_path.relative_to(repo_path).parts
             if any(marker in rel_parts for marker in Config.IGNORE_FOLDERS):
                 continue
@@ -295,19 +295,21 @@ class ASTProcessorStage():
             try:
                 # Read file content
                 content = file_path.read_text(encoding='utf-8', errors='ignore')
+                lines = content.splitlines(keepends=True)
+                self._file_content_cache[str(file_path)] = lines
 
                 code_file = CodeFile(
                     file_path=file_path,
                     relative_path=file_path,
                     language=language,
                     content=content,
-                    size=len(content)
+                    size=len(content),
                 )
 
                 code_files.append(code_file)
 
             except Exception as e:
-                print(f"Job {self.job_id}: Failed to read file {file_path}: {str(e)}")
+                logger.warning("Job %s: Failed to read file %s: %s", self.job_id, file_path, e)
 
         return code_files
 
@@ -396,21 +398,23 @@ class ASTProcessorStage():
 
         except Exception as e:
             traceback.print_exc()
-            print(f"Job {self.job_id}: Failed to process AST for {code_file.relative_path}: {str(e)}")
+            logger.warning("Job %s: Failed to process AST for %s: %s", self.job_id, code_file.relative_path, e)
             return [], []
 
     def _get_file_lines(self, file_path: str) -> List[str]:
         """Get file lines with a small in-memory cache to avoid re-reading."""
         if file_path in self._file_content_cache:
             return self._file_content_cache[file_path]
-        p = Path(file_path)
-        try:
-            with p.open('r', encoding='utf-8', errors='ignore') as f:
-                lines = f.readlines()
-            self._file_content_cache[file_path] = lines
-            return lines
-        except Exception:
-            return []
+        
+        return []
+        # p = Path(file_path)
+        # try:
+        #     with p.open('r', encoding='utf-8', errors='ignore') as f:
+        #         lines = f.readlines()
+        #     self._file_content_cache[file_path] = lines
+        #     return lines
+        # except Exception:
+        #     return []
 
     def _create_reference_edges(self, nodes: List[ASTNode], references_list: List[Dict],
                                 global_leaf_lookup: dict) -> List[dict]:
@@ -472,7 +476,7 @@ class ASTProcessorStage():
                                 node_content = ''.join(node_content_parts)
                             parent_node.name = node_content.strip()
                     except Exception as e:
-                        print(f"Job {self.job_id}: Failed to extract content for def_node: {str(e)}")
+                        logger.debug("Job %s: Failed to extract content for def_node: %s", self.job_id, e)
 
         return reference_edges
 
@@ -483,13 +487,6 @@ class ASTProcessorStage():
             if (line, col) >= (start_line, start_col) and (line, col) <= (end_line, end_col):
                 return node_id
         return None
-
-    def validate_config(self) -> bool:
-        """Validate stage configuration."""
-        return (
-            isinstance(self.config.get("supported_languages", []), list) and
-            isinstance(self.config.get("max_file_size", 0), int)
-        )
 
     def _prune_graph(self, nodes: List[ASTNode], edges: List[dict]) -> tuple[List[ASTNode], List[dict]]:
         """

@@ -2,17 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
-import sys
 from typing import Any, Dict, List
 
 from bson import ObjectId
 
 from .db import get_mongo_client
-from .llm import GroqLLM
 from .llm_grok import GrokLLM
-from .tools import fetch_code_file
-import tiktoken
 
 MENTAL_MODEL_COL = "mental_model"
 CONVERSATIONS_COL = "conversations"
@@ -38,7 +35,7 @@ async def stream_chat(conversation_id: str, user_message: str):
     messages_col = mongo[MESSAGES_COL]
 
     # 1) Look up conversation to get repo_id
-    conv = conversations.find_one({"_id": ObjectId(conversation_id)})
+    conv = await asyncio.to_thread(conversations.find_one, {"_id": ObjectId(conversation_id)})
     if not conv:
         # You could also raise an HTTPException at the route level,
         # but for now we just stream an error message.
@@ -48,7 +45,8 @@ async def stream_chat(conversation_id: str, user_message: str):
     repo_id = conv["repo_id"]
 
     # 2) Load repo architecture (seed for system prompt)
-    arch_doc = mental.find_one(
+    arch_doc = await asyncio.to_thread(
+        mental.find_one,
         {"repo_id": repo_id, "document_type": "REPO_CONTEXT"},
         {"_id": 0, "context": 1},
     )
@@ -65,7 +63,8 @@ async def stream_chat(conversation_id: str, user_message: str):
         {"role": "system", "content": system_seed}
     ]
 
-    for m in history_cursor:
+    history_docs = await asyncio.to_thread(list, history_cursor)
+    for m in history_docs:
         messages_for_llm.append(
             {
                 "role": m["role"],       # "user" or "assistant"
@@ -75,13 +74,14 @@ async def stream_chat(conversation_id: str, user_message: str):
 
     # 4) Store this new user message in DB
     now = datetime.now(timezone.utc)
-    messages_col.insert_one(
+    await asyncio.to_thread(
+        messages_col.insert_one,
         {
             "conversation_id": conversation_id,
             "role": "user",
             "content": user_message,
             "created_at": now,
-        }
+        },
     )
 
     # 5) Append new user message to LLM messages
@@ -102,13 +102,14 @@ async def stream_chat(conversation_id: str, user_message: str):
 
     # 7) Save assistant message after streaming completes
     assistant_content = "".join(captured)
-    messages_col.insert_one(
+    await asyncio.to_thread(
+        messages_col.insert_one,
         {
             "conversation_id": conversation_id,
             "role": "assistant",
             "content": assistant_content,
             "created_at": datetime.now(timezone.utc),
-        }
+        },
     )
 
 
@@ -158,5 +159,3 @@ async def _stream_final_answer_grok(
 
     # Ensure a final newline is sent to the client
     yield "\n"
-
-
