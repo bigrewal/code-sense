@@ -16,7 +16,8 @@ from ..config import Config
 import traceback
 
 from ..models.data_model import (CodeFile,
-    ASTNode
+    ASTNode, IngestionStage, IngestionStageStatus,
+    IngestionJobStatus
 )
 from ..db import get_neo4j_client, get_mongo_client
 
@@ -46,7 +47,7 @@ LANGUAGE_DEFINITION_MAP = {
 }
 
 
-class ASTProcessorStage():
+class CreateRepoGraphStage():
     """Stage for AST creation and graph database population."""
 
     def __init__(self, job_id: str):
@@ -72,14 +73,6 @@ class ASTProcessorStage():
             repo_id: repo identifier
         """
         conn = None
-
-        self.mongo_client.upsert_ingestion_job(
-            job_id=self.job_id,
-            repo_name=repo_id,
-            status="running",
-            current_stage="ast",
-            stage_status={"ast": {"status": "running"}},
-        )
 
         try:
 
@@ -244,25 +237,9 @@ class ASTProcessorStage():
 
             logger.info("Job %s: Finished writing graph to Neo4j", self.job_id)
 
-            self.mongo_client.upsert_ingestion_job(
-                job_id=self.job_id,
-                repo_name=repo_id,
-                status="running",
-                stage_status={"ast": {"status": "completed"}},
-            )
-
         except Exception as e:
-            self.mongo_client.upsert_ingestion_job(
-                job_id=self.job_id,
-                repo_name=repo_id,
-                status="failed",
-                stage_status={
-                    "ast": {
-                        "status": "failed",
-                        "error": str(e),
-                    }
-                },
-            )
+            logger.error("Job %s: Error during AST processing: %s", self.job_id, e)
+            traceback.print_exc()
 
             logger.exception("Job %s: AST processing error", self.job_id, exc_info=e)
         finally:
@@ -407,14 +384,6 @@ class ASTProcessorStage():
             return self._file_content_cache[file_path]
         
         return []
-        # p = Path(file_path)
-        # try:
-        #     with p.open('r', encoding='utf-8', errors='ignore') as f:
-        #         lines = f.readlines()
-        #     self._file_content_cache[file_path] = lines
-        #     return lines
-        # except Exception:
-        #     return []
 
     def _create_reference_edges(self, nodes: List[ASTNode], references_list: List[Dict],
                                 global_leaf_lookup: dict) -> List[dict]:

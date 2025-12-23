@@ -1,3 +1,6 @@
+## Install pyright
+npm install -g pyright
+
 ## Install Scala lang server
 #### Remove old binary
 rm ~/.local/bin/cs

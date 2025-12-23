@@ -12,6 +12,16 @@ PY_QUERY = r"""
 (#not-any-of? @name "self" "cls")
 """
 
+# PY_QUERY = r"""
+# (call
+#   function: [
+#     (identifier) @name
+#     (attribute attribute: (identifier) @name)
+#   ]
+# ) @reference.call
+# """
+
+
 # Parent/field pairs where an identifier is a *binding*, not a read
 BINDING_SLOTS = {
     ("function_definition", "name"),
@@ -54,10 +64,9 @@ class PythonAnalyzer(BaseLSPAnalyzer):
         return 4  # keep initial pressure low
 
     def get_warmup_seconds(self) -> float:
-        return 120.0
+        return 30.0
 
     def get_initialize_options(self) -> dict:
-        # Tweak for pyright: enable indexing to improve definition perf
         return {"python": {"analysis": {"indexing": True}}}
     
     def is_excluded_definition_path(self, path: Path) -> bool:
@@ -96,5 +105,4 @@ class PythonAnalyzer(BaseLSPAnalyzer):
 
             # At this point we consider it a "read"
             out.append((node.start_point[0], node.start_point[1]))
-
         return out

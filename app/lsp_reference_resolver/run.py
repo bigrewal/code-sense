@@ -2,6 +2,7 @@ import json, logging, asyncio
 from pathlib import Path
 
 from ..db import get_mongo_client
+from ..models.data_model import IngestionJobStatus, IngestionStage, IngestionStageStatus
 from .core.base_analyser import BaseLSPAnalyzer
 from .languages.python_analyser import PythonAnalyzer
 from .languages.scala_analyser import ScalaAnalyzer
@@ -28,34 +29,11 @@ class CodeAnalyzer:
     async def analyze(self, langs=None):
         langs = langs or self.detect()
         changed_files: List[str] = []
-        mongo = get_mongo_client()
-
-        mongo.upsert_ingestion_job(
-            job_id=self.job_id,
-            repo_name=self.base_repo_path,
-            status="running",
-            current_stage="resolve_refs",
-            stage_status={"resolve_refs": {"status": "running"}},
-        )
 
         for lang in langs:
-            mongo.upsert_ingestion_job(
-                job_id=self.job_id,
-                repo_name=self.base_repo_path,
-                status="running",
-                current_stage="resolve_refs",
-                stage_status={"resolve_refs": {"status": "running ", "language": lang}},
-            )
             analyzer: BaseLSPAnalyzer = self.ANALYZERS[lang](self.repo, self.base_repo_path)
             logging.info(f"=== Analyzing {lang} ===")
             await analyzer.analyze()
             changed_files.extend(analyzer.changed_files)
-        
-        mongo.upsert_ingestion_job(
-            job_id=self.job_id,
-            repo_name=self.base_repo_path,
-            status="running",
-            stage_status={"resolve_refs": {"status": "completed"}},
-        )
 
         return changed_files

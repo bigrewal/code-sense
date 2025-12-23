@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from pathlib import Path
+import traceback
 from typing import Dict, List, Optional, Set, Tuple
 
 from tqdm import tqdm
@@ -8,6 +9,7 @@ from tqdm import tqdm
 from ..db import Neo4jClient, get_mongo_client, get_neo4j_client
 from ..llm_grok import GrokLLM
 from ..repo_context_builder import build_repo_context
+from ..models.data_model import IngestionJobStatus, IngestionStage, IngestionStageStatus
 
 logger = logging.getLogger(__name__)
 
@@ -64,13 +66,6 @@ class MentalModelStage:
         self.neo4j_client: Neo4jClient = get_neo4j_client()
         logger.info("Job %s: starting mental model generation for %s", self.job_id, repo_id)
 
-        self.mongo_client.upsert_ingestion_job(
-            job_id=self.job_id,
-            repo_name=repo_id,
-            status="running",
-            current_stage="mental_model",
-            stage_status={"mental_model": {"status": "running"}},
-        )
         try:
             dir_tree = self._build_dir_tree(repo_id)
             insights, ignored_files = await self.identify_critical_files(dir_tree, repo_id)
@@ -81,27 +76,14 @@ class MentalModelStage:
                 len(ignored_files),
             )
             await self._set_potential_entry_points(insights, repo_id)
-            await build_repo_context(repo_id)
-            self.mongo_client.upsert_ingestion_job(
-                job_id=self.job_id,
-                repo_name=repo_id,
-                status="running",
-                stage_status={"mental_model": {"status": "completed"}},
-            )
+            repo_context_token_count = await build_repo_context(repo_id, self.llm_client)
+
+            return len(insights), len(ignored_files), repo_context_token_count
 
         except Exception as e:
-            self.mongo_client.upsert_ingestion_job(
-                job_id=self.job_id,
-                repo_name=repo_id,
-                status="failed",
-                stage_status={
-                    "mental_model": {
-                        "status": "failed",
-                        "error": str(e),
-                    }
-                },
-            )
             logger.exception("Job %s: mental model generation error", self.job_id)
+            traceback.print_exc()
+            raise e
 
     async def _set_potential_entry_points(self, insights: List[dict], repo_id: str) -> List[str]:
         """Get potential entry points for the repo based on insights."""

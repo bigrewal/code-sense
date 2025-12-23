@@ -116,7 +116,6 @@ class GrokLLM:
         # Let xai-sdk read XAI_API_KEY from env by default.
         client_kwargs: Dict[str, Any] = {}
 
-        # If you define Config.XAI_API_KEY, we’ll use it; otherwise env will be used.
         if hasattr(Config, "XAI_API_KEY"):
             client_kwargs["api_key"] = Config.XAI_API_KEY
 

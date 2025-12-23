@@ -1,18 +1,61 @@
 import asyncio
 import logging
 import time
-from typing import Any, Dict, List
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple, Union
 
+from bson import ObjectId
 from neo4j import GraphDatabase
 from pymongo import MongoClient
 
 from .config import Config
-from .models.data_model import ASTNode
+from .utils import now_ts
+from .models.data_model import ASTNode, IngestionJobStatus, IngestionStage
 logger = logging.getLogger(__name__)
 
 ## Silence WARNING:neo4j.notifications: 
 logging.getLogger("neo4j.notifications").setLevel(logging.WARNING)
 
+INGESTION_JOBS_COLLECTION = "ingestion_jobs"
+INGESTED_REPOS_COLLECTION = "ingested_repos"
+CONVERSATIONS_COLLECTION = "conversations"
+MESSAGES_COLLECTION = "messages"
+MENTAL_MODEL_COLLECTION = "mental_model"
+
+
+def _serialize_job(job_doc: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "job_id": job_doc.get("job_id"),
+        "repo_name": job_doc.get("repo_name"),
+        "status": job_doc.get("status"),
+        "current_stage": job_doc.get("current_stage"),
+        "stages": job_doc.get("stages", {}),
+        "error": job_doc.get("error"),
+        "created_at": job_doc.get("created_at"),
+        "updated_at": job_doc.get("updated_at"),
+    }
+
+def _filter_stage_metrics(job: Dict[str, Any]) -> Dict[str, Any]:
+    ALLOWED_PRECHECK_METRICS = {
+        "total_tokens",
+        "supported_tokens",
+        "supported_ratio",
+        "primary_language",
+        "language_distribution_pct",
+        "supported_file_count",
+        "unsupported_file_count",
+        "excluded_file_count",
+    }
+    stages = job.get("stages") or {}
+
+    pre = stages.get(IngestionStage.PRECHECK.value)
+    if pre and "metrics" in pre:
+        pre["metrics"] = {
+            k: v for k, v in pre["metrics"].items()
+            if k in ALLOWED_PRECHECK_METRICS
+        }
+
+    return job
 
 class Neo4jClient:
     """Neo4j database client wrapper."""
@@ -329,7 +372,7 @@ class MyMongoClient:
     # ========== Former helper functions converted to methods ==========
 
     def get_potential_entry_points(self, repo_id: str) -> List[str]:
-        collection = self._db["mental_model"]
+        collection = self._db[MENTAL_MODEL_COLLECTION]
         docs = collection.find({
             "repo_id": repo_id,
             "document_type": "POTENTIAL_ENTRY_POINTS"
@@ -337,7 +380,7 @@ class MyMongoClient:
         return [doc.get("file_path") for doc in docs if doc.get("file_path")]
 
     def get_repo_summary(self, repo_id: str) -> str:
-        collection = self._db["mental_model"]
+        collection = self._db[MENTAL_MODEL_COLLECTION]
         doc = collection.find_one({
             "repo_id": repo_id,
             "document_type": "REPO_SUMMARY"
@@ -345,7 +388,7 @@ class MyMongoClient:
         return doc.get("data", "") if doc else ""
 
     def get_brief_file_overviews(self, repo_id: str, file_paths: List[str]) -> List[Dict[str, str]]:
-        collection = self._db["mental_model"]
+        collection = self._db[MENTAL_MODEL_COLLECTION]
         result = []
 
         for file_path in file_paths:
@@ -364,7 +407,7 @@ class MyMongoClient:
         return result
 
     def get_brief_file_overview(self, repo_id: str, file_path: str) -> str:
-        collection = self._db["mental_model"]
+        collection = self._db[MENTAL_MODEL_COLLECTION]
         doc = collection.find_one(
             {
                 "repo_id": repo_id,
@@ -376,7 +419,7 @@ class MyMongoClient:
         return (doc or {}).get("data", "")
 
     def get_critical_file_paths(self, repo_id: str) -> List[str]:
-        collection = self._db["mental_model"]
+        collection = self._db[MENTAL_MODEL_COLLECTION]
         docs = collection.find({
             "repo_id": repo_id,
             "document_type": "BRIEF_FILE_OVERVIEW"
@@ -384,88 +427,233 @@ class MyMongoClient:
         return [doc.get("file_path") for doc in docs if doc.get("file_path")]
 
     def delete_repo_data(self, repo_id: str):
-        collections = ["conversations", "messages", "mental_model", "ingested_repos"]
+        collections = [CONVERSATIONS_COLLECTION, MESSAGES_COLLECTION, MENTAL_MODEL_COLLECTION, INGESTED_REPOS_COLLECTION]
         for coll_name in collections:
             collection = self._db[coll_name]
             result = collection.delete_many({"repo_id": repo_id})
             logger.info(f"Deleted {result.deleted_count} documents from '{coll_name}' for repo_id '{repo_id}'")
+    
+    def create_conversation(self, repo_id: str) -> dict:
+        collection = self._db[CONVERSATIONS_COLLECTION]
+        new_conversation_doc = {
+            "repo_id": repo_id,
+            "created_at": now_ts(),
+            "updated_at": now_ts(),
+            "type": "REPO_CHAT",
+        }
+        result = collection.insert_one(new_conversation_doc)
+        return {
+            "conversation_id": str(result.inserted_id),
+            "repo_id": repo_id,
+            "created_at": new_conversation_doc["created_at"],
+        }
+    
+    def list_conversations(
+        self,
+        *,
+        repo_id: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        limit = max(1, min(limit, 200))
+        offset = max(0, offset)
 
+        query: dict[str, Any] = {}
+        if repo_id:
+            query["repo_id"] = repo_id
+
+        projection = {"title": 1, "repo_id": 1, "created_at": 1, "updated_at": 1}
+
+        cursor = (
+            self._db[CONVERSATIONS_COLLECTION]
+            .find(query, projection=projection)
+            .sort("updated_at", -1)
+            .skip(offset)
+            .limit(limit)
+        )
+
+        return list(cursor)
     
     def add_ingested_repo(self, repo_name: str, job_id: str):
-        collection = self._db["ingested_repos"]
+        collection = self._db[INGESTED_REPOS_COLLECTION]
         existing = collection.find_one({"repo_id": repo_name})
         if existing:
             logger.info(f"Repo '{repo_name}' already marked as ingested.")
             return
-        collection.insert_one({"repo_id": repo_name, "job_id": job_id, "ingested_at": time.time()})
+        collection.insert_one({"repo_id": repo_name, "job_id": job_id, "ingested_at": datetime.now(timezone.utc).isoformat()})
         logger.info(f"Marked repo '{repo_name}' as ingested.")
 
     def upsert_ingestion_job(
         self,
-        job_id: str,
-        repo_name: str,
+        job: IngestionJobStatus,
         *,
-        status: str,
-        current_stage: str | None = None,
-        stage_status: dict | None = None,
         error: dict | None = None,
+        extra_fields: dict | None = None,
     ):
-        """
-        Create or update an ingestion job and its stage status.
-        """
-        collection = self._db["ingestion_jobs"]
+        collection = self._db[INGESTION_JOBS_COLLECTION]
 
         update: dict = {
-            "repo_name": repo_name,
-            "status": status,
-            "updated_at": time.time(),
+            "repo_name": job.repo_name,
+            "status": job.status,
+            "current_stage": job.current_stage.value,
+            "updated_at": now_ts(),
         }
 
-        if current_stage:
-            update["current_stage"] = current_stage
+        for stage, payload in job.stage_status.items():
+            update[f"stages.{stage.value}"] = payload
 
-        if stage_status:
-            # example: { "precheck": { "status": "completed", "metrics": {...} } }
-            for stage, payload in stage_status.items():
-                update[f"stages.{stage}"] = payload
-
-        if error:
+        if error is not None:
             update["error"] = error
 
+        if extra_fields:
+            update.update(extra_fields)
+
         collection.update_one(
-            {"job_id": job_id},
-            {
-                "$set": update,
-                "$setOnInsert": {
-                    "job_id": job_id,
-                    "created_at": time.time(),
-                },
-            },
+            {"job_id": job.job_id},
+            {"$set": update, "$setOnInsert": {"job_id": job.job_id, "created_at": now_ts()}},
             upsert=True,
         )
 
-    def get_job_status(self, job_id: str) -> Dict[str, Any]:
-        collection = self._db["ingestion_jobs"]
-        job_doc = collection.find_one({"job_id": job_id})
-        if not job_doc:
-            raise ValueError(f"No ingestion job found for job_id: {job_id}")
-        
-        return {
-            "job_id": job_doc.get("job_id"),
-            "repo_name": job_doc.get("repo_name"),
-            "status": job_doc.get("status"),
-            "current_stage": job_doc.get("current_stage"),
-            "stages": job_doc.get("stages", {}),
-            "error": job_doc.get("error"),
-            "created_at": job_doc.get("created_at"),
-            "updated_at": job_doc.get("updated_at"),
+
+    def get_job_status(self, job_id: str) -> Optional[Dict[str, Any]]:
+        collection = self._db[INGESTION_JOBS_COLLECTION]
+        projection = {"_id": 0}
+        job_doc = collection.find_one({"job_id": job_id}, projection)
+        job_unfiltered = _serialize_job(job_doc) if job_doc else None
+        if job_unfiltered:
+            job_filtered = _filter_stage_metrics(job_unfiltered)
+            return job_filtered
+        return None
+    
+    def list_jobs(
+        self,
+        *,
+        batch_id: Optional[str] = None,
+        status: Optional[str] = None,
+        repo_name: Optional[str] = None,
+        limit: int = 50,
+        skip: int = 0,
+        include_total: bool = False,
+    ) -> Union[List[Dict[str, Any]], Tuple[List[Dict[str, Any]], int]]:
+        q: Dict[str, Any] = {}
+        if batch_id:
+            q["batch_id"] = batch_id
+        if status:
+            q["status"] = status
+        if repo_name:
+            q["repo_name"] = repo_name
+
+        projection = {
+            "_id": 0,
+            "job_id": 1, "repo_name": 1, "status": 1,
+            "current_stage": 1, "error": 1,
+            "batch_id": 1, "batch_index": 1,
+            "created_at": 1, "updated_at": 1,
         }
 
 
+        coll = self._db[INGESTION_JOBS_COLLECTION]
+        cursor = (
+            coll.find(q, projection)
+            .sort([("updated_at", -1), ("created_at", -1)])  # stable “most recent first”
+            .skip(skip)
+            .limit(limit)
+        )
+
+        jobs = [d for d in cursor]
+
+        if include_total:
+            total = coll.count_documents(q)
+            return jobs, total
+
+        return jobs
+
+    def request_abort(self, job_id: str) -> bool:
+        res = self._db[INGESTION_JOBS_COLLECTION].update_one(
+            {"job_id": job_id},
+            {
+                "$set": {"abort_requested": True, "abort_requested_at": now_ts(), "updated_at": now_ts()}
+            },
+        )
+        return res.matched_count > 0
+
+    def is_abort_requested(self, job_id: str) -> bool:
+        doc = self._db[INGESTION_JOBS_COLLECTION].find_one({"job_id": job_id}, {"_id": 0, "abort_requested": 1})
+        return bool(doc and doc.get("abort_requested"))
+
     def list_ingested_repos(self) -> List[str]:
-        collection = self._db["ingested_repos"]
+        collection = self._db[INGESTED_REPOS_COLLECTION]
         docs = collection.find({})
         return [doc.get("repo_id") for doc in docs if doc.get("repo_id")]
+
+    def conversation_exists(self, conversation_id: str) -> bool:
+        try:
+            oid = ObjectId(conversation_id)
+        except Exception:
+            raise ValueError("Invalid conversation id")
+
+        doc = self._db[CONVERSATIONS_COLLECTION].find_one({"_id": oid}, {"_id": 1})
+        return doc is not None
+
+    def list_conversation_messages(
+        self,
+        *,
+        conversation_id: str,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        limit = max(1, min(limit, 500))
+
+        cursor = (
+            self._db[MESSAGES_COLLECTION]
+            .find({"conversation_id": conversation_id}, {"_id": 0})
+            .sort("created_at", 1)
+            .limit(limit)
+        )
+        return list(cursor)
+
+    def delete_conversation(self, conversation_id: str) -> None:
+        try:
+            oid = ObjectId(conversation_id)
+        except Exception:
+            raise ValueError("Invalid conversation id")
+
+        conv = self._db[CONVERSATIONS_COLLECTION].find_one({"_id": oid}, {"_id": 1})
+        if not conv:
+            raise KeyError("Conversation not found")
+
+        self._db[MESSAGES_COLLECTION].delete_many({"conversation_id": conversation_id})
+        self._db[CONVERSATIONS_COLLECTION].delete_one({"_id": oid})
+    
+    def get_batch_jobs(self, batch_id: str) -> List[Dict[str, Any]]:
+        cursor = (
+            self._db[INGESTION_JOBS_COLLECTION]
+            .find({"batch_id": batch_id}, {"_id": 0})
+            .sort("batch_index", 1)
+        )
+        return list(cursor)
+    
+    def get_job(self, job_id: str) -> dict | None:
+        return self._db[INGESTION_JOBS_COLLECTION].find_one({"job_id": job_id}, {"_id": 0})
+
+    def delete_job(self, job_id: str) -> bool:
+        res = self._db[INGESTION_JOBS_COLLECTION].delete_one({"job_id": job_id})
+        return res.deleted_count == 1
+    
+    def is_repo_ingested(self, repo_name: str) -> bool:
+        collection = self._db[INGESTED_REPOS_COLLECTION]
+        doc = collection.find_one({"repo_id": repo_name}, {"_id": 1})
+        return doc is not None
+    
+    def is_repo_being_ingested(self, repo_name: str) -> bool:
+        collection = self._db[INGESTION_JOBS_COLLECTION]
+        doc = collection.find_one(
+            {
+                "repo_name": repo_name,
+                "status": {"$in": ["running", "pending"]}
+            },
+            {"_id": 1}
+        )
+        return doc is not None
 
 def init_neo4j_client() -> Neo4jClient:
     """Initialise the global Neo4jClient singleton (if not already)."""

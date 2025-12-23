@@ -6,12 +6,14 @@ from typing import List, Optional
 from uuid import uuid4
 
 from bson import ObjectId
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query  
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from .chat_service import stream_chat
+from .models.data_model import JobAborted, IngestionStage, IngestionStageStatus, IngestionJobStatus
+from .utils import get_repo_path, get_repo_dir, now_ts
+from .chat_service import stream_chat, stateless_stream_chat
 from .config import validate_required_settings
 from .db import (
     get_mongo_client,
@@ -21,10 +23,12 @@ from .db import (
 )
 from .repo_ingestion_pipeline import start_ingestion_pipeline
 
+MAX_LIMIT = 200
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Code Repo QA Agent")
+app = FastAPI(title="Code Sense API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -52,6 +56,9 @@ class ChatRequest(BaseModel):
     conversation_id: str
     message: str
 
+class StatelessChatRequest(BaseModel):
+    repo_id: str
+    message: str
 
 class ErrorResponse(BaseModel):
     detail: str
@@ -84,6 +91,9 @@ class ConversationMessagesResponse(BaseModel):
     conversation_id: str
     messages: List[MessageModel]
 
+class IngestRequest(BaseModel):
+    repo_names: List[str]
+
 
 @app.post("/conversations", response_model=ConversationCreateResponse)
 async def create_conversation(req: ConversationCreateRequest):
@@ -92,129 +102,83 @@ async def create_conversation(req: ConversationCreateRequest):
     Frontend calls this once when the user clicks 'New Chat'.
     """
     mongo = get_mongo_client()
-    conversations = mongo["conversations"]
 
-    now = datetime.utcnow()
-
-    doc = {
-        "repo_id": req.repo_id,
-        "created_at": now,
-        "updated_at": now,
-        "type": "REPO_CHAT",
-    }
-
-    result = await asyncio.to_thread(conversations.insert_one, doc)
+    result = mongo.create_conversation(repo_id=req.repo_id)
 
     return ConversationCreateResponse(
-        conversation_id=str(result.inserted_id),
-        repo_id=req.repo_id,
-        created_at=now,
+        conversation_id=result["conversation_id"],
+        repo_id=result["repo_id"],
+        created_at=result["created_at"],
     )
 
 
 @app.get("/conversations", response_model=List[ConversationSummary])
 async def list_conversations(
     repo_id: Optional[str] = None,
-    limit: int = 50,
-    offset: int = 0,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
 ):
-    """
-    List conversations, optionally filtered by repo_id.
-    Used by the UI to populate the 'chat sidebar'.
-    """
-    limit = max(1, min(limit, 200))
     mongo = get_mongo_client()
-    conversations = mongo["conversations"]
 
-    query: dict = {}
-    if repo_id:
-        query["repo_id"] = repo_id
-
-    cursor = (
-        conversations.find(query, projection={"title": 1, "repo_id": 1, "created_at": 1, "updated_at": 1})
-        .sort("updated_at", -1)
-        .skip(offset)
-        .limit(limit)
+    docs = await asyncio.to_thread(
+        mongo.list_conversations,
+        repo_id=repo_id,
+        limit=limit,
+        offset=offset,
     )
 
-    docs = await asyncio.to_thread(list, cursor)
-    results: List[ConversationSummary] = []
-    for doc in docs:
-        results.append(
-            ConversationSummary(
-                conversation_id=str(doc["_id"]),
-                repo_id=doc["repo_id"],
-                created_at=doc.get("created_at"),
-                updated_at=doc.get("updated_at"),
-                title=doc.get("title"),
-            )
+    return [
+        ConversationSummary(
+            conversation_id=str(d["_id"]),
+            repo_id=d.get("repo_id"),
+            created_at=d.get("created_at"),
+            updated_at=d.get("updated_at"),
+            title=d.get("title"),
         )
-
-    return results
+        for d in docs
+    ]
 
 
 @app.get("/conversations/{conversation_id}/messages", response_model=ConversationMessagesResponse)
-async def list_conversation_messages(conversation_id: str, limit: int = 200):
-    """
-    Return all messages for a given conversation_id (up to `limit`).
-    Used by the UI to reload an existing chat.
-    """
-    limit = max(1, min(limit, 500))
+async def list_conversation_messages(conversation_id: str, limit: int = Query(200, ge=1, le=500)):
     mongo = get_mongo_client()
-    conversations = mongo["conversations"]
-    messages_col = mongo["messages"]
 
-    # Ensure the conversation exists
     try:
-        conv = await asyncio.to_thread(
-            conversations.find_one, {"_id": ObjectId(conversation_id)}, {"_id": 1}
-        )
-    except Exception:
+        exists = await asyncio.to_thread(mongo.conversation_exists, conversation_id)
+    except ValueError:
         raise HTTPException(status_code=400, detail="Invalid conversation id")
 
-    if not conv:
+    if not exists:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    cursor = (
-        messages_col.find({"conversation_id": conversation_id}, {"_id": 0})
-        .sort("created_at", 1)
-        .limit(limit)
-    )
-
-    messages: List[MessageModel] = []
-    docs = await asyncio.to_thread(list, cursor)
-    for m in docs:
-        messages.append(
-            MessageModel(
-                role=m["role"],
-                content=m["content"],
-                created_at=m.get("created_at"),
-            )
-        )
-
-    return ConversationMessagesResponse(
+    docs = await asyncio.to_thread(
+        mongo.list_conversation_messages,
         conversation_id=conversation_id,
-        messages=messages,
+        limit=limit,
     )
+
+    messages: List[MessageModel] = [
+        MessageModel(
+            role=m["role"],
+            content=m["content"],
+            created_at=m.get("created_at"),
+        )
+        for m in docs
+    ]
+
+    return ConversationMessagesResponse(conversation_id=conversation_id, messages=messages)
 
 
 @app.delete("/conversations/{conversation_id}")
 async def delete_conversation(conversation_id: str):
-    """Delete a conversation and all its messages."""
     mongo = get_mongo_client()
-    conversations = mongo["conversations"]
-    messages_col = mongo["messages"]
 
     try:
-        conv = await asyncio.to_thread(conversations.find_one, {"_id": ObjectId(conversation_id)}, {"_id": 1})
-    except Exception:
+        await asyncio.to_thread(mongo.delete_conversation, conversation_id)
+    except ValueError:
         raise HTTPException(status_code=400, detail="Invalid conversation id")
-
-    if not conv:
+    except KeyError:
         raise HTTPException(status_code=404, detail="Conversation not found")
-
-    await asyncio.to_thread(messages_col.delete_many, {"conversation_id": conversation_id})
-    await asyncio.to_thread(conversations.delete_one, {"_id": ObjectId(conversation_id)})
 
     return {"message": "Conversation deleted"}
 
@@ -232,34 +196,121 @@ async def chat(req: ChatRequest):
     )
 
 
-@app.post("/ingest", responses={404: {"model": ErrorResponse}})
-async def ingest_repo(repo_name: str, background_tasks: BackgroundTasks, job_id: Optional[str] = None):
-    """Kick off ingestion of a repo in the background."""
-    local_repo_path = Path("data") / repo_name
+@app.post("/stateless/chat", responses={400: {"model": ErrorResponse}})
+async def stateless_chat(req: StatelessChatRequest):
+    if not req.repo_id:
+        raise HTTPException(status_code=400, detail="repo_id is required")
+    if not req.message:
+        raise HTTPException(status_code=400, detail="message is required")
 
-    repo_name_full = f"data/{repo_name}"
-    if not local_repo_path.exists():
-        raise HTTPException(status_code=404, detail=f"Repository not found: {local_repo_path}")
-
-    job_identifier = job_id or str(uuid4())
-
-    background_tasks.add_task(
-        start_ingestion_pipeline,
-        local_repo_path=local_repo_path,
-        repo_name=repo_name_full,
-        job_id=job_identifier,
+    return StreamingResponse(
+        stateless_stream_chat(repo_id=req.repo_id, user_message=req.message),
+        media_type="text/markdown",
     )
 
-    return {"message": f"Job {job_identifier} started. Check terminal for results"}
+
+@app.post("/ingest", responses={404: {"model": ErrorResponse}})
+async def ingest_repo(
+    background_tasks: BackgroundTasks,
+    repo_names: IngestRequest = None,
+):
+    if len(repo_names.repo_names) < 1:
+        raise HTTPException(status_code=400, detail="Provide repo_names")
+
+    repos = repo_names.repo_names
+
+    # Validate repos exist and build paths
+    repo_paths: List[Path] = []
+    repo_full_names: List[str] = []
+    mongo = get_mongo_client()
+    for r in repos:
+        logger.info(f"Processing repo for ingestion: {r}")
+        local_repo_path = get_repo_path(r)
+        if not local_repo_path.exists():
+            raise HTTPException(status_code=404, detail=f"Repository not found: {local_repo_path}")
+        
+        # Check if the repo has already been ingested
+        repo_full_name = get_repo_dir(r)
+        if mongo.is_repo_ingested(repo_full_name) or mongo.is_repo_being_ingested(repo_full_name):
+            raise HTTPException(status_code=400, detail=f"Repository already ingested or being ingested: {r}")
+
+        repo_paths.append(local_repo_path)
+        repo_full_names.append(repo_full_name)
+
+    # Multiple repos: create batch + queued jobs, run sequentially in ONE task
+    batch_id = str(uuid4())
+    jobs = []
+
+    for idx, (path, full_name) in enumerate(zip(repo_paths, repo_full_names)):
+        job_id = str(uuid4())
+
+        job = IngestionJobStatus(
+            job_id=job_id,
+            repo_name=full_name,
+            status="queued",
+            current_stage=IngestionStage.PRECHECK,
+            stage_status={
+                IngestionStage.PRECHECK: IngestionStageStatus.PENDING,
+                IngestionStage.RESOLVE_REFS: IngestionStageStatus.PENDING,
+                IngestionStage.REPO_GRAPH: IngestionStageStatus.PENDING,
+                IngestionStage.MENTAL_MODEL: IngestionStageStatus.PENDING,
+            },
+        )
+
+        mongo.upsert_ingestion_job(job, extra_fields={"batch_id": batch_id, "batch_index": idx})
+        jobs.append({"job_id": job_id, "repo_name": full_name, "status": "queued", "batch_index": idx})
+
+    background_tasks.add_task(run_batch_sequentially, batch_id=batch_id)
+
+    return {"batch_id": batch_id, "jobs": jobs}
 
 
-@app.delete("/repos/{repo_name}", responses={404: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
-async def delete_repo(repo_name: str, delete_files: bool = False):
+async def run_batch_sequentially(batch_id: str):
+    mongo = get_mongo_client()
+
+    jobs = list(
+        mongo._db["ingestion_jobs"]
+        .find({"batch_id": batch_id}, {"_id": 0})
+        .sort("batch_index", 1)
+    )
+
+    for job_doc in jobs:
+        job_id = job_doc["job_id"]
+        repo_name = job_doc["repo_name"]
+        local_repo_path = Path(repo_name)
+
+        # If user aborted while queued, mark and skip
+        if mongo.is_abort_requested(job_id):
+            mongo.upsert_ingestion_job(
+                IngestionJobStatus(
+                    job_id=job_id,
+                    repo_name=repo_name,
+                    status="aborted",
+                    current_stage=IngestionStage.PRECHECK,
+                    stage_status={IngestionStage.PRECHECK: IngestionStageStatus.ABORTED},
+                ),
+                extra_fields={"aborted_before_start": True, "aborted_at": now_ts()},
+            )
+            continue
+
+        try:
+            await start_ingestion_pipeline(
+                local_repo_path=local_repo_path,
+                repo_name=repo_name,
+                job_id=job_id,
+            )
+
+        except JobAborted:
+            # already marked aborted in pipeline
+            continue
+        except Exception as e:
+            logger.exception("Ingestion pipeline failed", exc_info=e)
+            continue
+
+@app.delete("/repos", responses={404: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
+async def delete_repo(repo_path: str, delete_files: bool = False):
     """Delete a code repository and its associated data."""
-    if Path(repo_name).name != repo_name:
-        raise HTTPException(status_code=400, detail="Invalid repository name")
-
-    local_repo_path = Path("data") / repo_name
+    local_repo_path = Path(repo_path)
 
     if not local_repo_path.exists():
         raise HTTPException(status_code=404, detail=f"Repository not found: {local_repo_path}")
@@ -277,35 +328,79 @@ async def delete_repo(repo_name: str, delete_files: bool = False):
     mongo = get_mongo_client()
     neo4j = get_neo4j_client()
 
-    repo_id = f"data/{repo_name}"
     try:
-        mongo.delete_repo_data(repo_id)
+        mongo.delete_repo_data(repo_path)
     except Exception as exc:
         logger.exception("Failed to delete repo documents", exc_info=exc)
         raise HTTPException(status_code=500, detail="Failed to delete repo data")
 
     try:
         with neo4j.driver.session() as neo_session:
-            neo4j.clear_repo_data(session=neo_session, repo_id=repo_id)
+            neo4j.clear_repo_data(session=neo_session, repo_id=repo_path)
     except Exception as exc:
         logger.exception("Failed to delete repo graph", exc_info=exc)
         raise HTTPException(status_code=500, detail="Failed to delete graph data")
 
-    return {"message": f"Repository {repo_name} and its data have been deleted."}
+    return {"message": f"Repository {repo_path} and its data have been deleted."}
 
 
-@app.get("/status/{job_id}")
-async def get_job_status(job_id: str):
-    """Get the status of a specific job."""
+@app.get("/status/batch/{batch_id}")
+async def get_batch_status(batch_id: str):
     mongo = get_mongo_client()
-    try:
-        job_status = mongo.get_job_status(job_id)
-        return job_status
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
 
-# Create GET /repos endpoint
+    jobs = await asyncio.to_thread(mongo.get_batch_jobs, batch_id)
+    if not jobs:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    return {"batch_id": batch_id, "jobs": jobs}
+
+
+@app.get("/status")
+async def get_status(
+    job_id: Optional[str] = None,
+    batch_id: Optional[str] = None,
+    status: Optional[str] = None,
+    repo_name: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=MAX_LIMIT),
+    skip: int = Query(0, ge=0),
+):
+    mongo = get_mongo_client()
+
+    if job_id:
+        job = mongo.get_job_status(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return job
+
+    jobs, total = mongo.list_jobs(
+        batch_id=batch_id,
+        status=status,
+        repo_name=repo_name,
+        limit=limit,
+        skip=skip,
+        include_total=True,
+    )
+    return {
+        "jobs": jobs,
+        "count": len(jobs),
+        "total": total,
+        "batch_id": batch_id,
+        "skip": skip,
+        "limit": limit,
+    }
+
+
+@app.post("/jobs/{job_id}/abort")
+async def abort_job(job_id: str):
+    mongo = get_mongo_client()
+    ok = mongo.request_abort(job_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {
+        "job_id": job_id,
+        "abort_requested": True,
+    }
+
 @app.get("/repos")
 async def list_repos():
     """List all ingested code repositories."""
@@ -313,6 +408,27 @@ async def list_repos():
     mongo = get_mongo_client()
     ingested_repos = mongo.list_ingested_repos()
     return {"repos": ingested_repos}
+
+
+@app.delete("/jobs/{job_id}")
+async def delete_job(job_id: str):
+    mongo = get_mongo_client()
+
+    job = await asyncio.to_thread(mongo.get_job, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.get("status") in {"running", "aborting"}:
+        raise HTTPException(
+            status_code=409,
+            detail="Job is running. Abort the job before deleting.",
+        )
+
+    ok = await asyncio.to_thread(mongo.delete_job, job_id)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to delete job")
+
+    return {"job_id": job_id, "deleted": True}
 
 
 @app.get("/health")

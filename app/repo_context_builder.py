@@ -2,6 +2,7 @@ import logging
 from collections import deque
 
 from .db import get_mongo_client, get_neo4j_client, MyMongoClient, Neo4jClient
+from .llm_grok import GrokLLM
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +17,7 @@ class RepoContextBuilder:
 
         self.mental = self.mongo_client[MENTAL_MODEL_COL]
 
-    def create_repo_contxt(self) -> list[str]:
+    def create_repo_contxt(self, llm: GrokLLM) -> int:
         """
         Build REPO_CONTEXT by concatenating brief file overviews.
 
@@ -68,7 +69,7 @@ class RepoContextBuilder:
                         queue.append(child_path)
 
         repo_context = "\n\n".join(context_parts)
-
+        repo_context_token_count = llm.count_tokens(repo_context)
         # Store as REPO_CONTEXT document
         doc = {
             "repo_id": self.repo_id,
@@ -81,13 +82,12 @@ class RepoContextBuilder:
             upsert=True,
         )
 
-        # Keep return type unchanged (if callers still expect a list of entry points)
-        return entry_points
+        return repo_context_token_count
 
 
 # === Convenience Functions =====================================================
 
-async def build_repo_context(repo_id: str) -> dict[str, str]:
+async def build_repo_context(repo_id: str, llm: GrokLLM) -> int:
     """Build repository context using brief per-file summaries concatenated in BFS order."""
     builder = RepoContextBuilder(repo_id=repo_id)
-    return builder.create_repo_contxt()
+    return builder.create_repo_contxt(llm)

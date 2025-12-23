@@ -19,16 +19,13 @@ class Config:
     LLM_TEMPERATURE = 0.7
     LLM_MAX_TOKENS = 10240
 
-    # AWS S3 Configuration
-    AWS_ACCESS_KEY_ID: str = ""
-    AWS_SECRET_ACCESS_KEY: str = ""
-    AWS_REGION: str = "eu-west-2"
-    S3_BUCKET_NAME: str = "code-analysis-repos"
-
     # New Neo4j configs
     NEO4J_URI: str = os.getenv("NEO4J_URI")
     NEO4J_USER: str = os.getenv("NEO4J_USER")
     NEO4J_PASSWORD: str = os.getenv("NEO4J_PASSWORD")
+
+    # Base directory to store cloned repositories
+    BASE_REPO_DIR: str = "data"
 
     # MongoDB Configuration
     MONGO_URI: str = os.getenv("MONGO_URI", "mongodb://localhost:27017")
@@ -49,6 +46,9 @@ class Config:
         ".venv",
         "venv",
         "__pycache__",
+        ".tox",
+        ".eggs",
+        "site-packages",
     }
 
     SUPPORTED_LANGUAGES: dict = {

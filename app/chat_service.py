@@ -113,23 +113,60 @@ async def stream_chat(conversation_id: str, user_message: str):
     )
 
 
+async def stateless_stream_chat(repo_id: str, user_message: str):
+    """
+    Stream a reply for a given repo_id and user message, ChatGPT-style.
+    This is a stateless chat (no conversation history).
+    - Loads repo architecture (system seed)
+    - Streams assistant reply
+    """
+    mongo = get_mongo_client()
+    mental = mongo[MENTAL_MODEL_COL]
+
+    # 1) Load repo architecture (seed for system prompt)
+    arch_doc = await asyncio.to_thread(
+        mental.find_one,
+        {"repo_id": repo_id, "document_type": "REPO_CONTEXT"},
+        {"_id": 0, "context": 1},
+    )
+    repo_arch = (arch_doc or {}).get("context", "")
+
+    system_seed = _make_system_seed(repo_arch, repo_id=repo_id)
+
+    # 2) Build messages for LLM
+    messages_for_llm: List[Dict[str, str]] = [
+        {"role": "system", "content": system_seed},
+        {
+            "role": "user",
+            "content": user_message,
+        }
+    ]
+
+    # 3) Stream assistant reply, capturing content so we can save it at the end
+    captured: List[str] = []
+    async for chunk in _stream_final_answer_grok(
+        messages=messages_for_llm,
+        captured=captured,
+    ):
+        yield chunk
+
 # ---------------------------
 # Internal helpers
 # ---------------------------
 
 def _make_system_seed(file_summaries: str, repo_id: str) -> str:
     seed = (
-        "Your task is to answer questions accurately about the given file summaries of the repo.\n"
-        "Don't assume anything, Only answer from the information provided in the summaries. "
-        " If a question warrants information that's not present say what file you need more information from.\n"
-        "Use the file summaries below to reason about *where* to look and how things fit together.\n"
-        "When needed, you may inspect specific files (we will provide code). Be accurate, cite which files informed your answer.\n"
         f"REPOSITORY ID: {repo_id}\n\n"
         "FILE SUMMARIES:\n"
         "------------------------------------------------------------\n"
         f"{file_summaries.strip()}\n"
-        "------------------------------------------------------------\n"
+        "------------------------------------------------------------\n\n"
+        "Your job is to provide complete and accurate answers to user questions using these file summaries.\n"
+        "If the answer is not contained in these summaries then say what more info you need and from where. "
+        "Be accurate, cite which files informed your answer.\n"
         "Answer what is asked, nothing more nothing less. If something is ambiguous, state assumptions or ask for a path to inspect."
+        "Use your internal reasoning and knowledge + provided summaries to answer the question.\n"
+        "In the reponse don't mention that you got the info from file summaries, just provide the answer.\n"
     )
     return seed
 
