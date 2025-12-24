@@ -120,7 +120,8 @@ class PreIngestionAnalysisStage:
                     )
                 )
                 total_files_tokenized += 1
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Tokenization error for file {file_path}: {e}")
                 tokenization_errors += 1
                 continue
 

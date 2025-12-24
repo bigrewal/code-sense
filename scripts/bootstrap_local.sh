@@ -48,6 +48,10 @@ else
   warn "docker-compose.yml not found. Skipping datastore startup."
 fi
 
+##  --- sleep for 5 seconds ---
+bold "Waiting for datastores to start..."
+sleep 5
+
 # --- sync python deps ---
 bold "Syncing Python dependencies (uv sync)..."
 uv sync

@@ -1,17 +1,17 @@
-# **CodeSense — Repo-wide QA via Graph-Based Compression**
+# **CodeSense — Repo-wide QA engine**
 
 > **Goal:** Build a repo-wide code understanding system that provides **accurate, evidence-grounded answers developers can rely on especially on large code repositories**.
 
-Repo-wide code question answering is typically approached using **RAG** (retrieve top-k snippets) and/or **agentic traversal** (search → read → repeat). These methods give the model a **partial, fragmented view** of the codebase and often struggle with cross-file reasoning and global structure.
+Repo-wide code question answering is typically approached using **RAG** (retrieve top-k snippets) and/or **agentic traversal** (search → read → repeat). These methods give the model a **partial view** of the codebase and often struggle with cross-file reasoning and global structure.
 
 CodeSense takes a different approach.
 
-> **I treat repo QA as a compression problem, not a search problem.**
+> **CodeSense treats repo QA as a compression problem, not a search problem.**
 
 Instead of retrieving isolated snippets, CodeSense:
 
 * builds a **semantic dependency graph directly from code** (AST + LSP),
-* compresses that graph into a **global repository context** that fits within an LLM’s context window,
+* compresses that graph into a **global repository context** that fits within an LLM’s context window. For example: [Astropy on GitHub](https://github.com/astropy/astropy) (~1M Python tokens) is compressed by CodeSense to ~48k tokens.
 * and uses this context to answer questions with a **repo-wide mental model**.
 
 > Note: The repo-wide mental model is constructed exclusively from source code (AST + semantic dependencies) and does not rely on repository documentation or Markdown files.
@@ -21,7 +21,7 @@ The resulting mental model captures **upstream and downstream relationships acro
 Importantly, this mental model serves two roles:
 
 1. **Answering**: the LLM can directly answer questions using a coherent global view of the repository.
-2. **Navigation**: the model can also use the mental model as a guide to identify *where to look* when deeper inspection is needed, rather than relying on blind retrieval.
+2. **Navigation**: the model can also use the mental model as a navigation guide to identify *where to look* when deeper inspection is needed, rather than relying on blind retrieval.
 
 The goal is to give the LLM an **integrated understanding of the entire codebase**, rather than a handful of retrieved chunks or an agent’s transient working memory.
 
@@ -128,7 +128,15 @@ Make sure you have the following installed:
 
 ### Setup Environment
 
-1. Install dependencies and create the virtual environment:
+1. Clone the repo and create `data/` dir and clone a repo to ingest. For example: https://github.com/cyberlis/dictquery.git
+
+   ```bash
+   mkdir data
+   git clone https://github.com/cyberlis/dictquery.git
+   ```
+
+
+2. Install dependencies and create the virtual environment:
 
    ```bash
    uv sync
@@ -172,6 +180,16 @@ Make sure you have the following installed:
    Create .env.local and set VITE_API_BASE=http://localhost:8000
    npm run dev
    ```
+
+
+---
+
+## Demo
+
+[▶️ Watch demo](demo/demo.mov)
+
+
+![Demo screenshot](demo/screenshot.png)
 
 ---
 
