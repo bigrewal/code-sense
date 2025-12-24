@@ -71,7 +71,7 @@ Search-based approaches inevitably expose the model to only a small subset of th
 
 ## Evaluation
 
-To demonstrate the system's ability to understand complex codebases **purely from source code** (without relying on documentation, READMEs, or markdown files), I conducted a ablation test using X's open-sourced recommendation algorithm repository (`twitter/the-algorithm`, ~1M LOC in Scala/Finagle).
+To demonstrate the system's ability to understand complex codebases **purely from source code** (without relying on documentation, READMEs, or markdown files), I conducted a ablation test using X's open-sourced recommendation algorithm repository (`twitter/the-algorithm`, ~1M LOC in Scala, Java, python and Rust).
 
 ### DeepWiki Ablation Test (Code-Only vs. With Documentation)
 
