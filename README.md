@@ -112,7 +112,7 @@ I believe this is a meaningful step toward more robust, doc-independent reposito
 
 * **Language support**: CodeSense currently supports Scala, Java, Python, and Rust. Support for additional languages is planned as the ingestion and analysis pipeline is extended.
 * **Tool use**: To further enhance accuracy of the answers, Grok should use file tools which will help it navigate the code base to answer the question.
-
+* **Context window constraints**: CodeSense relies on fitting the compressed repo-wide mental model within the LLM’s context window. If the compressed representation exceeds the available context, this approach will not scale further without additional hierarchical compression. In practice, this design works well for most real-world repositories; for example, a ~1.2M LoC codebase (~5M raw tokens) was compressed to ~600k tokens, comfortably fitting within Grok’s 2M-token context window.
 --- 
 
 ## Run Locally
