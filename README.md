@@ -1,6 +1,6 @@
-### **CodeSense — Repo-wide QA via Graph-Based Compression**
+# **CodeSense — Repo-wide QA via Graph-Based Compression**
 
-> **Goal:** Build a repo-wide code understanding system that provides **accurate, evidence-grounded answers developers can rely on**.
+> **Goal:** Build a repo-wide code understanding system that provides **accurate, evidence-grounded answers developers can rely on especially on large code repositories**.
 
 Repo-wide code question answering is typically approached using **RAG** (retrieve top-k snippets) and/or **agentic traversal** (search → read → repeat). These methods give the model a **partial, fragmented view** of the codebase and often struggle with cross-file reasoning and global structure.
 
@@ -46,6 +46,9 @@ The goal is to give the LLM an **integrated understanding of the entire codebase
 * **RAG**: high recall is hard; you often miss the “glue” code, registry wiring, and multi-hop dependencies.
 * **Agents**: can recover via iteration, but are slower, costlier, and still prone to partial views and drift.
 * **Compression-first**: gives the model a **stable global view**, enabling more reliable cross-file reasoning.
+
+## TL;DR
+Search-based approaches inevitably expose the model to only a small subset of the repository (e.g., top-k files out of thousands). In large codebases like Twitter’s recommendation system (~6k files), this means answers are constructed from a partial view and can miss critical cross-file interactions. CodeSense instead compresses the entire repository into a global, dependency-aware context, allowing questions to be answered with awareness of all files, not just a retrieved fraction.
 
 ---
 
