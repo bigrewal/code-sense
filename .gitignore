@@ -8,8 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
-.*
-../
-
+.env.local
+data/
 # macOS cruft
 .DS_Store

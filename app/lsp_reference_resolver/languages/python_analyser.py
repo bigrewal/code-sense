@@ -22,7 +22,6 @@ PY_QUERY = r"""
 # """
 
 
-# Parent/field pairs where an identifier is a *binding*, not a read
 BINDING_SLOTS = {
     ("function_definition", "name"),
     ("class_definition", "name"),
@@ -64,7 +63,7 @@ class PythonAnalyzer(BaseLSPAnalyzer):
         return 4  # keep initial pressure low
 
     def get_warmup_seconds(self) -> float:
-        return 30.0
+        return 300.0
 
     def get_initialize_options(self) -> dict:
         return {"python": {"analysis": {"indexing": True}}}
@@ -95,7 +94,7 @@ class PythonAnalyzer(BaseLSPAnalyzer):
                 continue
 
             # Exclude any identifier that sits in a binding slot (parent, field)
-            field = _field_name_in_parent(node)
+            # field = _field_name_in_parent(node)
             # if (p.type, field) in BINDING_SLOTS or (p.type, None) in BINDING_SLOTS:
             #     continue
 
