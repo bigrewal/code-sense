@@ -72,7 +72,7 @@ To demonstrate the system's ability to understand complex codebases **purely fro
 
 ### DeepWiki Ablation Test (Code-Only vs. With Documentation)
 
-We compared our tool against **DeepWiki** (Cognition Labs / Devin-powered repository documentation and QA tool) on the same challenging questions, in two modes:
+I compared our tool against **DeepWiki** (Cognition Labs / Devin-powered repository documentation and QA tool) on the same challenging questions, in two modes:
 
 1. **Full repo (with all .md/README files)** — DeepWiki's default setting  
 2. **Code-only (all *.md files removed)** — simulating real-world undocumented or sparsely documented codebases
@@ -101,16 +101,14 @@ We compared our tool against **DeepWiki** (Cognition Labs / Devin-powered reposi
 
 This demonstrates a significant advantage in real-world scenarios where documentation is sparse, outdated, or absent — a common situation in large production codebases.
 
-We believe this is a meaningful step toward more robust, doc-independent repository-level code understanding, and plan to evaluate further on benchmarks like SWE-QA in pure code-only mode.
+I believe this is a meaningful step toward more robust, doc-independent repository-level code understanding, and plan to evaluate further on benchmarks like SWE-QA in pure code-only mode.
 
 ---
 
 ## Limitations (current)
 
-* **Compression loss**: summaries can omit critical edge-case behavior.
-* **Framework “magic”**: plugin/registry systems can require additional heuristics (imports, decorators, dynamic dispatch).
-* **Evidence pointers**: answers are stronger when they include file/symbol evidence; this is still being improved.
-* **Taxonomy slicing**: SWE-QA question types (What/Why/Where/How) aren’t always present in scorer outputs; slicing requires joining metadata.
+* **Language support**: CodeSense currently supports Scala, Java, Python, and Rust. Support for additional languages is planned as the ingestion and analysis pipeline is extended.
+* **Tool use**: To further enhance accuracy of the answers, Grok should use file tools which will help it navigate the code base to answer the question.
 
 --- 
 
@@ -198,20 +196,6 @@ docker compose down -v
 * API: [http://localhost:8000](http://localhost:8000)
 * Neo4j UI: [http://localhost:7474](http://localhost:7474)
 * MongoDB: mongodb://localhost:27017
-
----
-
-
-## License
-
-[MIT / Apache-2.0 / Proprietary — choose one]
-
----
-
-## Contact
-
-* [Bimal Grewal]
-* [Email / Twitter / LinkedIn]
-* [Optional: short demo link]
+* CodeSense UI: http://localhost:5173/
 
 ---
