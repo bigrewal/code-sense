@@ -63,7 +63,7 @@ class PythonAnalyzer(BaseLSPAnalyzer):
         return 4  # keep initial pressure low
 
     def get_warmup_seconds(self) -> float:
-        return 30.0
+        return 300.0
 
     def get_initialize_options(self) -> dict:
         return {"python": {"analysis": {"indexing": True}}}
