@@ -26,8 +26,6 @@ class ScalaAnalyzer(BaseLSPAnalyzer):
     def needs_did_open(self) -> bool:
         return False  # Metals indexes workspace fine
 
-    def get_warmup_seconds(self) -> float:
-        return 120.0
 
     def get_max_concurrency(self) -> int:
         import os

@@ -225,7 +225,6 @@ class LSPClient:
         self.server_capabilities = res.get("capabilities", {})
         self._workspace_folders = [{"uri": root_uri, "name": name}]
         await self.send_notification("initialized", {})
-        logger.info("LSP initialized")
 
     async def shutdown(self):
         if not self.process:

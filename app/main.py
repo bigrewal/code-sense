@@ -326,20 +326,12 @@ async def delete_repo(repo_path: str, delete_files: bool = False):
             raise HTTPException(status_code=500, detail="Failed to delete repo files")
 
     mongo = get_mongo_client()
-    neo4j = get_neo4j_client()
 
     try:
         mongo.delete_repo_data(repo_path)
     except Exception as exc:
         logger.exception("Failed to delete repo documents", exc_info=exc)
         raise HTTPException(status_code=500, detail="Failed to delete repo data")
-
-    try:
-        with neo4j.driver.session() as neo_session:
-            neo4j.clear_repo_data(session=neo_session, repo_id=repo_path)
-    except Exception as exc:
-        logger.exception("Failed to delete repo graph", exc_info=exc)
-        raise HTTPException(status_code=500, detail="Failed to delete graph data")
 
     return {"message": f"Repository {repo_path} and its data have been deleted."}
 

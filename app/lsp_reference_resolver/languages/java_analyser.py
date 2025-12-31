@@ -35,9 +35,6 @@ class JavaAnalyzer(BaseLSPAnalyzer):
         import os
         return min(32, max(8, (os.cpu_count() or 8)))
 
-    def get_warmup_seconds(self) -> float:
-        return 120.0
-
     def is_excluded_definition_path(self, path: Path) -> bool:
         # Exclude generated files or specific directories if needed
         return False

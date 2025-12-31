@@ -66,9 +66,6 @@ class RustAnalyzer(BaseLSPAnalyzer):
     def needs_did_open(self) -> bool:
         return False
 
-    def get_warmup_seconds(self) -> float:
-        return 120.0
-
     def get_max_concurrency(self) -> int:
         return min(16, max(6, (os.cpu_count() or 8)))
     

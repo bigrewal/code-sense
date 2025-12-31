@@ -10,5 +10,6 @@ wheels/
 .venv
 .env.local
 data/
+eval/
 # macOS cruft
 .DS_Store

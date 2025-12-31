@@ -48,10 +48,11 @@ class BaseLSPAnalyzer:
     def __init__(self, repo_path: Path, base_repo_path: str, show_progress: bool = True):
         self.repo_path = repo_path
         self.base_repo_path = base_repo_path
-        self.client: Optional[LSPClient] = None
+        # self.client: Optional[LSPClient] = None
         self.show_progress = show_progress and (tqdm is not None)
         self.cache: Optional[Cache] = None
         self.changed_files: Set[str] = set()
+        self.server_list: List[LSPClient] = []
 
     # --- required by subclasses ---
     def get_server_command(self) -> List[str]:
@@ -100,17 +101,22 @@ class BaseLSPAnalyzer:
 
     # --- lifecycle ---
     async def start_server(self):
-        self.client = LSPClient(self.get_server_command())
-        await self.client.start()
-        await self.client.initialize(
-            self.repo_path.as_uri(),
-            self.repo_path.name,
-            initialize_options=self.get_initialize_options(),
-        )
+        # Start 4 language servers
+        for _ in range(4):
+            self.client = LSPClient(self.get_server_command())
+            await self.client.start()
+            await self.client.initialize(
+                self.repo_path.as_uri(),
+                self.repo_path.name,
+                initialize_options=self.get_initialize_options(),
+            )
+
+            self.server_list.append(self.client)
+
 
     async def shutdown(self):
-        if self.client:
-            await self.client.shutdown()
+        for client in self.server_list:
+            await client.shutdown()
 
     # --- file discovery ---
     def get_files(self) -> List[Path]:
@@ -125,27 +131,6 @@ class BaseLSPAnalyzer:
                     files.append(f)
         return files
 
-    # --- best-effort readiness ---
-    async def _warmup_and_probe(self):
-        warm = self.get_warmup_seconds()
-        logger.info("Warming up LSP server for %.1f seconds...", warm)
-
-        if warm:
-            if self.show_progress:
-                for _ in tqdm(range(int(warm / 0.1)), desc="Warming up LSP", leave=True):
-                    await asyncio.sleep(0.1)
-            else:
-                await asyncio.sleep(warm)
-
-        # Best-effort probe: some servers respond faster once analysis is underway.
-        # (Not all servers support workspace/symbol; failures are ignored.)
-        for _ in range(3):
-            try:
-                await self.client.send_request("workspace/symbol", {"query": ""}, timeout=5.0)
-                break
-            except Exception:
-                await asyncio.sleep(1.0)
-
     # --- main ---
     async def analyze(self) -> List[Dict]:
         if self.cache is None:
@@ -154,14 +139,10 @@ class BaseLSPAnalyzer:
         files = self.get_files()
         logger.info("Found %d source files", len(files))
         await self.start_server()
-        await self._warmup_and_probe()
 
         timeout_primary = 120.0 if self.get_language_id().lower() == "python" else 45.0
         timeout_retry = 180.0 if self.get_language_id().lower() == "python" else 90.0
         timeout_backoff = 0.2
-
-        max_conc = self.get_max_concurrency()
-        sem = asyncio.Semaphore(max_conc)
 
         mappings: List[Dict] = []
 
@@ -231,13 +212,19 @@ class BaseLSPAnalyzer:
                     mappings.extend(cached_maps)
 
         # ---------- Phase 2: process recompute files in batches ----------
-        recompute_list = [rp for rp in file_infos.keys() if rp in files_to_recompute]
+        file_queue = asyncio.Queue()
+        recompute_list: List[str] = []
+        for rp in file_infos.keys():
+            if rp in files_to_recompute:
+                await file_queue.put(rp)
+                recompute_list.append(rp)
+
         batch_size = max(1, self.get_batch_size())
 
         defs_bar = tqdm(total=0, desc="Querying definitions", leave=True) if self.show_progress else None
-        batch_bar = tqdm(total=len(recompute_list), desc="Processing batches", leave=True) if self.show_progress else None
+        batch_bar = tqdm(total=len(recompute_list), desc="Resolving references", leave=True) if self.show_progress else None
 
-        async def resolve_queries(queries: List[Tuple[str, Path, Dict]]):
+        async def resolve_queries(client: LSPClient, queries: List[Tuple[str, Path, Dict]], worker_sem: asyncio.Semaphore):
             # per-position memo inside this batch
             pos_cache: Dict[Tuple[str, int, int], Optional[Dict]] = {}
 
@@ -246,10 +233,10 @@ class BaseLSPAnalyzer:
                 if k in pos_cache:
                     return pos_cache[k]
 
-                r = await self._query_def_streaming(uri, path, pos, sem, timeout=timeout_primary)
+                r = await self._query_def_streaming(client, uri, path, pos, worker_sem, timeout=timeout_primary)
                 if not r:
                     await asyncio.sleep(timeout_backoff)
-                    r = await self._query_def_streaming(uri, path, pos, sem, timeout=timeout_retry)
+                    r = await self._query_def_streaming(client, uri, path, pos, worker_sem, timeout=timeout_retry)
                 pos_cache[k] = r
                 return r
 
@@ -261,72 +248,76 @@ class BaseLSPAnalyzer:
                 if defs_bar:
                     defs_bar.update(1)
 
-        try:
-            for i in range(0, len(recompute_list), batch_size):
-                batch_paths = recompute_list[i : i + batch_size]
-                if not batch_paths:
+        async def worker(client: LSPClient, worker_id: int):
+            worker_sem = asyncio.Semaphore(self.get_max_concurrency())
+            while True:
+                try:
+                    rel_path = file_queue.get_nowait()
+                except asyncio.QueueEmpty:
                     break
+                info = file_infos[rel_path]
+                fpath: Path = info["path"]
+                uri: str = info["uri"]
+                text: str = info["text"]
+                sha1: str = info["sha1"]
+                cached_sha: Optional[str] = info["cached_sha"]
 
-                # didOpen batch
+                # didOpen
                 if self.needs_did_open():
-                    for rel_path in batch_paths:
-                        info = file_infos[rel_path]
-                        await self.client.send_notification(
-                            "textDocument/didOpen",
-                            {
-                                "textDocument": {
-                                    "uri": info["uri"],
-                                    "languageId": self.get_language_id(),
-                                    "version": 1,
-                                    "text": info["text"],
-                                }
-                            },
-                        )
+                    await client.send_notification(
+                        "textDocument/didOpen",
+                        {
+                            "textDocument": {
+                                "uri": uri,
+                                "languageId": self.get_language_id(),
+                                "version": 1,
+                                "text": text,
+                            }
+                        },
+                    )
 
-                # enqueue queries for this batch
+                seen_local: Set[Tuple[int, int]] = set()
                 queries: List[Tuple[str, Path, Dict]] = []
-                for rel_path in batch_paths:
-                    info = file_infos[rel_path]
-                    fpath: Path = info["path"]
-                    uri: str = info["uri"]
-                    text: str = info["text"]
-                    sha1: str = info["sha1"]
-                    cached_sha: Optional[str] = info["cached_sha"]
+                for (line, col) in self.ref_pos_extractor(text, fpath):
+                    if (line, col) in seen_local:
+                        continue
+                    seen_local.add((line, col))
 
-                    # update cache bookkeeping
-                    if self.cache:
-                        self.cache.delete_mappings_for_file(rel_path)
-                        final_sha = sha1 if cached_sha != sha1 else (cached_sha or sha1)
-                        self.cache.update_file_sha(rel_path, final_sha)
-
-                    seen_local: Set[Tuple[int, int]] = set()
-                    for (line, col) in self.ref_pos_extractor(text, fpath):
-                        if (line, col) in seen_local:
-                            continue
-                        seen_local.add((line, col))
-                        queries.append((uri, fpath, {"line": line, "character": col}))
+                    queries.append((uri, fpath, {"line": line, "character": col}))
 
                 if defs_bar:
                     defs_bar.total += len(queries)
                     defs_bar.refresh()
 
-                # run queries (bounded by semaphore)
-                await resolve_queries(queries)
+                await resolve_queries(client, queries, worker_sem=worker_sem)
 
-                # didClose batch
+                # didClose
                 if self.needs_did_open():
-                    for rel_path in batch_paths:
-                        info = file_infos[rel_path]
-                        await self.client.send_notification(
-                            "textDocument/didClose",
-                            {"textDocument": {"uri": info["uri"]}},
-                        )
+                    await client.send_notification(
+                        "textDocument/didClose",
+                        {"textDocument": {"uri": uri}},
+                    )
 
+                # update cache bookkeeping
                 if self.cache:
+                    self.cache.delete_mappings_for_file(rel_path)
+                    final_sha = sha1 if cached_sha != sha1 else (cached_sha or sha1)
+                    self.cache.update_file_sha(rel_path, final_sha)
                     self.cache.commit()
 
                 if batch_bar:
-                    batch_bar.update(len(batch_paths))
+                    batch_bar.update(1)
+
+                file_queue.task_done()
+
+        # Launch workers
+        worker_tasks = [
+            asyncio.create_task(worker(client, i)) 
+            for i, client in enumerate(self.server_list)
+        ]
+
+        try:
+            await asyncio.gather(*worker_tasks)
 
         finally:
             if batch_bar:
@@ -338,10 +329,13 @@ class BaseLSPAnalyzer:
             await self.shutdown()
             logger.info("Got %d mappings", len(mappings))
 
+        # logger.info("======= Total definition queries issued: %d ======", total_queries)
+        logger.info("Got %d mappings", len(mappings))
         return mappings
 
     async def _query_def_streaming(
         self,
+        client: LSPClient,
         file_uri: str,
         file_path: Path,
         position: Dict,
@@ -361,7 +355,8 @@ class BaseLSPAnalyzer:
 
             params = {"textDocument": {"uri": file_uri}, "position": position}
 
-            res = await self.client.send_request(
+            import time
+            res = await client.send_request(
                 "textDocument/definition",
                 params,
                 on_partial=_append_partial,
