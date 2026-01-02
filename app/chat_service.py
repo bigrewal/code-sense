@@ -335,9 +335,7 @@ async def stream_answer(user_question: str, repo_id: str):
     repo_context = (arch_doc or {}).get("context", "")
 
     # Stage 1: Find out if we need to fetch code of various files to answer the question 
-    additional_info_required: List[Dict[str, str]] = await _select_files_for_query(repo_context=repo_context, 
-                                            repo_id=repo_id, 
-                                            user_question=user_question)
+    additional_info_required: List[Dict[str, str]] = await _select_files_for_query(repo_context=repo_context)
     
 
     # Stage 2: Fetch the information required 
@@ -350,8 +348,6 @@ async def stream_answer(user_question: str, repo_id: str):
 
     tasks.append(_answer_query_using_repo_context(
         repo_context=repo_context,
-        repo_id=repo_id,
-        user_question=user_question,
     ))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)

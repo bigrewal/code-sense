@@ -95,7 +95,7 @@ class Neo4jClient:
             logger.error("Neo4j driver not initialized")
             raise Exception("Neo4j driver not initialized")
 
-        async def _initialise():
+        def _initialise():
             try:
                 logger.info("Initialising graph for repo: %s", repo_id)
                 with self.driver.session() as session:
