@@ -55,7 +55,7 @@ class Config:
         ".rs": "rust",
     }
 
-    min_supported_ratio: float = 0.5
+    min_supported_cov_ratio: float = 0.5
 
 def validate_required_settings() -> None:
     """Fail fast with a clear list of missing required environment values."""

@@ -64,7 +64,7 @@ class RustAnalyzer(BaseLSPAnalyzer):
 
     # rust-analyzer indexes workspaces/crates; didOpen per-file is not required
     def needs_did_open(self) -> bool:
-        return False
+        return True
 
     def get_max_concurrency(self) -> int:
         return min(16, max(6, (os.cpu_count() or 8)))
@@ -116,11 +116,6 @@ class RustAnalyzer(BaseLSPAnalyzer):
         if self._discovered["cargo_tomls"]:
             linked = [str(p) for p in self._discovered["cargo_tomls"]]
             init_opts["rust-analyzer"] = {"linkedProjects": linked}
-
-        # You could add more rust-analyzer options here if desired, e.g.:
-        # init_opts.setdefault("rust-analyzer", {}).update({
-        #     "cargo": {"loadOutDirsFromCheck": True}
-        # })
 
         return init_opts
 

@@ -427,7 +427,7 @@ class MyMongoClient:
         return [doc.get("file_path") for doc in docs if doc.get("file_path")]
 
     def delete_repo_data(self, repo_id: str):
-        collections = [CONVERSATIONS_COLLECTION, MESSAGES_COLLECTION, MENTAL_MODEL_COLLECTION, INGESTED_REPOS_COLLECTION]
+        collections = [CONVERSATIONS_COLLECTION, MESSAGES_COLLECTION, MENTAL_MODEL_COLLECTION, INGESTED_REPOS_COLLECTION, INGESTION_JOBS_COLLECTION]
         for coll_name in collections:
             collection = self._db[coll_name]
             result = collection.delete_many({"repo_id": repo_id})

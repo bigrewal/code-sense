@@ -16,8 +16,7 @@ from ..config import Config
 import traceback
 
 from ..models.data_model import (CodeFile,
-    ASTNode, IngestionStage, IngestionStageStatus,
-    IngestionJobStatus
+    ASTNode
 )
 from ..db import get_neo4j_client, get_mongo_client
 

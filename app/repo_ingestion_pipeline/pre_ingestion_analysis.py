@@ -3,7 +3,9 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from collections import Counter
+import asyncio
 
+from tqdm import tqdm
 from ..llm_grok import GrokLLM
 from ..config import Config
 
@@ -45,8 +47,8 @@ class PreIngestionAnalysisStage:
         self.job_id = job_id
         self.repo_name = repo_name
 
-    def run(self, repo_path: Path) -> Dict[str, Any]:
-        file_metrics, scan_stats = self.scan(repo_path)
+    async def run(self, repo_path: Path) -> Dict[str, Any]:
+        file_metrics, scan_stats = await self.scan(repo_path)
         summary = self.summarize(file_metrics=file_metrics, scan_stats=scan_stats)
         self.validate(summary)
         return summary
@@ -64,15 +66,13 @@ class PreIngestionAnalysisStage:
         # Map suffix -> language name (supported languages only)
         return Config.SUPPORTED_LANGUAGES.get(path.suffix.lower())
 
-    def scan(self, repo_path: Path) -> Tuple[List[FileMetric], Dict[str, Any]]:
+
+    async def scan(self, repo_path: Path) -> Tuple[List[FileMetric], Dict[str, Any]]:
         """
         Enumerate files and compute per-file token metrics using the LLM tokenizer.
 
-        We record BOTH supported and unsupported files:
-        - supported: file extension in Config.SUPPORTED_LANGUAGES
-        - unsupported: everything else (still token-counted for meaningful ratios)
-
-        We also track exclusion stats for transparency.
+        Async tokenization with a max of 10 concurrent count_tokens() calls.
+        Shows a progress bar for files pending/processed.
         """
         repo_path = Path(repo_path)
 
@@ -84,6 +84,10 @@ class PreIngestionAnalysisStage:
         total_files_tokenized = 0
         tokenization_errors = 0
 
+        # ---- First pass: enumerate + apply exclusions (fast) ----
+        to_process: List[tuple[Path, str, bool, str]] = []
+        # items are: (file_path, language_label, supported, rel_path_str)
+
         for file_path in repo_path.rglob("*"):
             if not file_path.is_file():
                 continue
@@ -94,8 +98,7 @@ class PreIngestionAnalysisStage:
                 excluded_file_count += 1
                 try:
                     rel_parts = file_path.relative_to(repo_path).parts
-                    # record the top-level folder when possible for useful reporting
-                    if len(rel_parts) > 0:
+                    if rel_parts:
                         excluded_paths_counter[rel_parts[0]] += 1
                 except Exception:
                     pass
@@ -103,27 +106,54 @@ class PreIngestionAnalysisStage:
 
             language = self._classify_language(file_path)
             supported = bool(language)
-
-            # Give unsupported a stable label so users can see the mix.
             language_label = language if supported else "unsupported/unknown"
+            rel = str(file_path.relative_to(repo_path))
+            to_process.append((file_path, language_label, supported, rel))
+
+        # ---- Second pass: async processing with bounded concurrency ----
+        sem = asyncio.Semaphore(10)
+        lock = asyncio.Lock()
+
+        pbar = tqdm(total=len(to_process), desc="Pre-analysis file scan", unit="file")
+
+        async def process_one(file_path: Path, language_label: str, supported: bool, rel: str) -> None:
+            nonlocal tokenization_errors, total_files_tokenized
 
             try:
-                content = file_path.read_text(encoding="utf-8", errors="ignore")
-                tok = self.llm_grok.count_tokens(content)
-                rel = str(file_path.relative_to(repo_path))
-                metrics.append(
-                    FileMetric(
-                        file_path=rel,
-                        language=language_label,
-                        tokens=tok,
-                        supported=supported,
-                    )
+                content = await asyncio.to_thread(file_path.read_text, encoding="utf-8", errors="ignore")
+
+                if supported:
+                    # Limit only the expensive tokenizer call
+                    async with sem:
+                        tok = await asyncio.to_thread(self.llm_grok.count_tokens, content)
+                    async with lock:
+                        total_files_tokenized += 1
+                else:
+                    tok = 0
+
+                metric = FileMetric(
+                    file_path=rel,
+                    language=language_label,
+                    tokens=tok,
+                    supported=supported,
                 )
-                total_files_tokenized += 1
+
+                async with lock:
+                    metrics.append(metric)
+
             except Exception as e:
                 logger.warning(f"Tokenization error for file {file_path}: {e}")
-                tokenization_errors += 1
-                continue
+                async with lock:
+                    tokenization_errors += 1
+            finally:
+                # Always advance the progress bar even on error
+                pbar.update(1)
+
+        try:
+            tasks = [asyncio.create_task(process_one(*item)) for item in to_process]
+            await asyncio.gather(*tasks)
+        finally:
+            pbar.close()
 
         scan_stats = {
             "total_files_seen": total_files_seen,
@@ -142,31 +172,24 @@ class PreIngestionAnalysisStage:
         tokens_by_lang: Dict[str, int] = {}
         files_by_lang: Dict[str, int] = {}
 
-        total_tokens = 0
         supported_tokens = 0
-        unsupported_tokens = 0
         supported_file_count = 0
         unsupported_file_count = 0
 
         # Outliers / helpful user-facing items
         largest_files = sorted(file_metrics, key=lambda m: m.tokens, reverse=True)[:10]
         max_file_tokens = largest_files[0].tokens if largest_files else 0
-        avg_tokens_per_file = int(total_tokens / len(file_metrics)) if file_metrics else 0  # will be overwritten after loop
 
         for m in file_metrics:
             tokens_by_lang[m.language] = tokens_by_lang.get(m.language, 0) + m.tokens
             files_by_lang[m.language] = files_by_lang.get(m.language, 0) + 1
 
-            total_tokens += m.tokens
             if m.supported:
                 supported_tokens += m.tokens
                 supported_file_count += 1
             else:
-                unsupported_tokens += m.tokens
+                # unsupported_tokens += m.tokens
                 unsupported_file_count += 1
-
-        avg_tokens_per_file = int(total_tokens / len(file_metrics)) if file_metrics else 0
-        supported_ratio = (supported_tokens / total_tokens) if total_tokens > 0 else 0.0
 
         # Compute language distribution only for supported languages (more meaningful),
         # but keep unsupported/unknown visible separately.
@@ -192,14 +215,17 @@ class PreIngestionAnalysisStage:
         if language_distribution_pct:
             top_pct = max(language_distribution_pct.values())
             single_language_dominant = top_pct >= 70.0
+        
+        total_files_seen = scan_stats.get("total_files_seen", 0)
+        total_files_tokenized = scan_stats.get("total_files_tokenized", 0)
+
 
         return {
-            # Verdict-ish fields (validate() will still raise on failure)
             "passes_precheck": True,
 
             # High-level counts
-            "total_files_seen": scan_stats.get("total_files_seen", 0),
-            "total_files_tokenized": scan_stats.get("total_files_tokenized", 0),
+            "total_files_seen": total_files_seen,
+            "total_files_tokenized": total_files_tokenized,
             "tokenization_errors": scan_stats.get("tokenization_errors", 0),
 
             "excluded_file_count": scan_stats.get("excluded_file_count", 0),
@@ -207,14 +233,11 @@ class PreIngestionAnalysisStage:
 
             "supported_file_count": supported_file_count,
             "unsupported_file_count": unsupported_file_count,
-            "tokenized_file_count": len(file_metrics),
+            "coverage_ratio": total_files_tokenized/total_files_seen,
 
             # Token totals
-            "total_tokens": total_tokens,
             "supported_tokens": supported_tokens,
-            "unsupported_tokens": unsupported_tokens,
-            "supported_ratio": supported_ratio,
-            "min_supported_ratio": Config.min_supported_ratio,
+            "min_supported_cov_ratio": Config.min_supported_cov_ratio,
 
             # Language insight
             "supported_languages": supported_langs,
@@ -227,7 +250,6 @@ class PreIngestionAnalysisStage:
 
             # Outliers / cost drivers
             "max_file_tokens": max_file_tokens,
-            "avg_tokens_per_file": avg_tokens_per_file,
             "largest_files": [
                 {
                     "path": m.file_path,
@@ -241,42 +263,19 @@ class PreIngestionAnalysisStage:
             # Quick heuristics
             "single_language_dominant": single_language_dominant,
 
-            # Placeholders for UX; pipeline/UI can display these directly
             "recommendations": [],
         }
 
     def validate(self, summary: Dict[str, Any]) -> None:
-        total_tokens = int(summary.get("total_tokens") or 0)
-        supported_ratio = float(summary.get("supported_ratio") or 0.0)
+        total_files_tokenized = int(summary.get("total_files_tokenized") or 0)
 
-        if total_tokens <= 0:
+        if total_files_tokenized <= 0:
             summary["passes_precheck"] = False
             summary.setdefault("recommendations", []).append(
-                "No tokens counted. Ensure the repository contains readable source files and is not entirely excluded."
+                "No tokens counted. Ensure the repository contains supported files."
             )
             raise PreIngestionAnalysisError(
                 "Pre-ingestion check failed: no tokens counted.",
                 metrics=summary,
                 code="NO_TOKENS_COUNTED",
-            )
-
-        if supported_ratio < Config.min_supported_ratio:
-            summary["passes_precheck"] = False
-            pct = round(supported_ratio * 100, 2)
-            min_pct = round(Config.min_supported_ratio * 100, 2)
-
-            # Add actionable recommendations
-            recs = summary.setdefault("recommendations", [])
-            excluded_paths = summary.get("excluded_paths_top") or []
-            if excluded_paths:
-                recs.append("Review excluded folders; large exclusions can skew token counts.")
-            recs.append("Consider adding additional language support or excluding non-source/generated content.")
-            largest = summary.get("largest_files") or []
-            if largest:
-                recs.append("Check largest files; generated/minified artifacts can dominate token usage.")
-
-            raise PreIngestionAnalysisError(
-                f"Pre-ingestion check failed: supported languages account for {pct}% of tokens (min {min_pct}%).",
-                metrics=summary,
-                code="UNSUPPORTED_LANGUAGE_MIX",
             )

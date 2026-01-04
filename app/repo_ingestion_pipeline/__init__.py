@@ -76,7 +76,7 @@ async def start_ingestion_pipeline(
         pre_ingestion_stage = PreIngestionAnalysisStage(
             llm_grok=llm, job_id=job_id, repo_name=repo_name
         )
-        analysis_summary = pre_ingestion_stage.run(repo_path=local_repo_path)
+        analysis_summary = await pre_ingestion_stage.run(repo_path=local_repo_path)
 
         mongo.upsert_ingestion_job(
             IngestionJobStatus(
