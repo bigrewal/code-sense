@@ -88,6 +88,16 @@ class BaseLSPAnalyzer:
     def get_cache_namespace(self) -> str:
         cmd = " ".join(self.get_server_command())
         return f"{self.__class__.__name__}:{cmd}"
+    
+    async def _warmup(self, warmup_time: float):
+        logger.info("Warming up LSP server for %.1f seconds...", warmup_time)
+
+        if warmup_time:
+            if self.show_progress:
+                for _ in tqdm(range(int(warmup_time / 0.1)), desc="Warming up language server", leave=True):
+                    await asyncio.sleep(0.1)
+            else:
+                await asyncio.sleep(warmup_time)
 
     # --- lifecycle ---
     async def start_server(self):
@@ -131,8 +141,7 @@ class BaseLSPAnalyzer:
         logger.info("Found %d source files", len(files))
         await self.start_server()
 
-        logger.info(f"Waiting for LSP (2 min)")
-        await asyncio.sleep(120.0)
+        await self._warmup(warmup_time=120.0)
 
         timeout_primary = 120.0 if self.get_language_id().lower() == "python" else 45.0
         timeout_retry = 180.0 if self.get_language_id().lower() == "python" else 90.0

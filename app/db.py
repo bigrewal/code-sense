@@ -112,6 +112,7 @@ class Neo4jClient:
         indexes = [
             "CREATE INDEX IF NOT EXISTS FOR (n:ASTNode) ON (n.node_id)",
             "CREATE INDEX IF NOT EXISTS FOR (n:ASTNode) ON (n.repo_id)",
+            "CREATE INDEX IF NOT EXISTS FOR (n:ASTNode) ON (n.repo_id, n.node_id)",
             "CREATE INDEX IF NOT EXISTS FOR (n:ASTNode) ON (n.file_path)",
             "CREATE INDEX IF NOT EXISTS FOR (n:ASTNode) ON (n.node_type)",
         ]
@@ -213,64 +214,47 @@ class Neo4jClient:
             batch_num = (i // self.batch_size) + 1
             batch = edges[i:i + self.batch_size]
 
-            # Group edges by type for efficient processing
-            contains_edges = []
-            references_edges = []
-            depends_on_edges = []
-
-            for edge in batch:
-                edge_data = {
-                    'source': edge['source'],
-                    'target': edge['target'],
-                    'sequence': edge.get('sequence', 1),
+            edges_payload = [
+                {
+                    "source": e["source"],
+                    "target": e["target"],
+                    "sequence": e.get("sequence", 1),
+                    "type": e["type"],
                 }
+                for e in batch
+            ]
 
-                if edge['type'] == 'CONTAINS':
-                    contains_edges.append(edge_data)
-                elif edge['type'] == 'REFERENCES':
-                    references_edges.append(edge_data)
-                elif edge['type'] == 'DEPENDS_ON':
-                    depends_on_edges.append(edge_data)
+            query = """
+            UNWIND $edges AS edge
+            MATCH (s:ASTNode {repo_id: $repo_id, node_id: edge.source})
+            MATCH (t:ASTNode {repo_id: $repo_id, node_id: edge.target})
+            CALL {
+                WITH s, t, edge
+                WITH s, t, edge WHERE edge.type = 'CONTAINS'
+                CREATE (s)-[:CONTAINS {sequence: edge.sequence}]->(t)
+            }
+            CALL {
+                WITH s, t, edge
+                WITH s, t, edge WHERE edge.type = 'REFERENCES'
+                CREATE (s)-[:REFERENCES {sequence: edge.sequence}]->(t)
+            }
+            """
 
             def _write_edges():
                 with self.driver.session() as session:
-                    if contains_edges:
-                        contains_query = """
-                        UNWIND $edges AS edge
-                        MATCH (source:ASTNode {node_id: edge.source})
-                        MATCH (target:ASTNode {node_id: edge.target})
-                        CREATE (source)-[:CONTAINS {sequence: edge.sequence}]->(target)
-                        """
-                        session.run(contains_query, edges=contains_edges)
-
-                    if references_edges:
-                        references_query = """
-                        UNWIND $edges AS edge
-                        MATCH (source:ASTNode {node_id: edge.source})
-                        MATCH (target:ASTNode {node_id: edge.target})
-                        CREATE (source)-[:REFERENCES {sequence: edge.sequence}]->(target)
-                        """
-                        session.run(references_query, edges=references_edges)
-
-                    if depends_on_edges:
-                        depends_on_query = """
-                        UNWIND $edges AS edge
-                        MATCH (source:ASTNode {node_id: edge.source})
-                        MATCH (target:ASTNode {node_id: edge.target})
-                        CREATE (source)-[:DEPENDS_ON {sequence: edge.sequence}]->(target)
-                        """
-                        session.run(depends_on_query, edges=depends_on_edges)
+                    session.execute_write(
+                        lambda tx: tx.run(query, edges=edges_payload, repo_id=repo_id)
+                    )
 
             try:
                 await asyncio.to_thread(_write_edges)
                 logger.debug(
-                    "Created edges in batch %s/%s (contains=%s, references=%s, depends_on=%s)",
+                    "Created edges in batch %s/%s (%s edges)",
                     batch_num,
                     total_batches,
-                    len(contains_edges),
-                    len(references_edges),
-                    len(depends_on_edges),
+                    len(edges_payload),
                 )
+
             except Exception as e:
                 logger.error("Failed to create edges in batch %s: %s", batch_num, e)
                 raise
@@ -427,11 +411,16 @@ class MyMongoClient:
         return [doc.get("file_path") for doc in docs if doc.get("file_path")]
 
     def delete_repo_data(self, repo_id: str):
-        collections = [CONVERSATIONS_COLLECTION, MESSAGES_COLLECTION, MENTAL_MODEL_COLLECTION, INGESTED_REPOS_COLLECTION, INGESTION_JOBS_COLLECTION]
+        print(f"ABout to delete repo: {repo_id}")
+        collections = [CONVERSATIONS_COLLECTION, MESSAGES_COLLECTION, MENTAL_MODEL_COLLECTION, INGESTED_REPOS_COLLECTION]
         for coll_name in collections:
             collection = self._db[coll_name]
             result = collection.delete_many({"repo_id": repo_id})
             logger.info(f"Deleted {result.deleted_count} documents from '{coll_name}' for repo_id '{repo_id}'")
+        
+        ingest_job_coll = self._db[INGESTION_JOBS_COLLECTION]
+        result = ingest_job_coll.delete_many({"repo_name": repo_id})
+        logger.info(f"Deleted {result.deleted_count} documents from '{INGESTION_JOBS_COLLECTION}' for repo_id '{repo_id}'")
     
     def create_conversation(self, repo_id: str) -> dict:
         collection = self._db[CONVERSATIONS_COLLECTION]

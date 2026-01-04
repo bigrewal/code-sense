@@ -19,6 +19,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 logging.getLogger("grpc").setLevel(logging.WARNING)
 
+MAX_ATTEMPTS = 3
 
 def _is_rate_limit_error(exc: Exception) -> bool:
     """
@@ -204,9 +205,7 @@ class GrokLLM:
         - If `stream=True`, returns the xai-sdk chat.stream() iterator.
         """
 
-        max_attempts = 3
-
-        for attempt in range(max_attempts):
+        for attempt in range(MAX_ATTEMPTS):
             try:
                 chat = self._build_chat(
                     model=model,
@@ -239,23 +238,41 @@ class GrokLLM:
                     raise RuntimeError(f"xAI Grok API error: {str(e)}")
 
                 # Rate limit handling with exponential backoff: 60s, 120s, 240s
-                if attempt == max_attempts - 1:
+                if attempt == MAX_ATTEMPTS - 1:
                     logger.error("Max retry attempts reached for Grok rate limit")
                     raise RuntimeError("xAI Grok API rate limit exceeded after retries")
 
                 wait_time = 60 * (2**attempt)
                 logger.info(
                     f"Rate limit hit for Grok, waiting {wait_time} seconds "
-                    f"before retry {attempt + 1}/{max_attempts}"
+                    f"before retry {attempt + 1}/{MAX_ATTEMPTS}"
                 )
                 time.sleep(wait_time)
 
     def count_tokens(self, text: str) -> int:
-        tokens = self.client.tokenize.tokenize_text(
-            model=Config.GROK_4_NON_REASONING_MODEL, text=text
-        )
+        for attempt in range(MAX_ATTEMPTS):
+            try:
+                tokens = self.client.tokenize.tokenize_text(
+                    model=Config.GROK_4_NON_REASONING_MODEL, text=text
+                )
 
-        return len(tokens)
+                return len(tokens)
+            except Exception as e:
+                if not _is_rate_limit_error(e):
+                    logger.error(f"xAI Grok API error: {str(e)}")
+                    raise RuntimeError(f"xAI Grok API error: {str(e)}")
+
+                # Rate limit handling with exponential backoff: 60s, 120s, 240s
+                if attempt == MAX_ATTEMPTS - 1:
+                    logger.error("Max retry attempts reached for Grok rate limit")
+                    raise RuntimeError("xAI Grok API rate limit exceeded after retries")
+
+                wait_time = 60 * (2**attempt)
+                logger.info(
+                    f"Rate limit hit for Grok, waiting {wait_time} seconds "
+                    f"before retry {attempt + 1}/{MAX_ATTEMPTS}"
+                )
+                time.sleep(wait_time)
 
     async def generate_async(
         self,
@@ -270,9 +287,8 @@ class GrokLLM:
         """
         Async equivalent using AsyncClient + chat.sample().
         """
-        max_attempts = 3
 
-        for attempt in range(max_attempts):
+        for attempt in range(MAX_ATTEMPTS):
             try:
                 # Build messages in the same way as sync path
                 message_objs: List[Any] = []
@@ -313,7 +329,7 @@ class GrokLLM:
                     logger.error(f"xAI Grok API error (async): {str(e)}")
                     raise RuntimeError(f"xAI Grok API error: {str(e)}")
 
-                if attempt == max_attempts - 1:
+                if attempt == MAX_ATTEMPTS - 1:
                     logger.error(
                         "Max retry attempts reached for Grok rate limit (async)"
                     )
@@ -322,6 +338,6 @@ class GrokLLM:
                 wait_time = 60 * (2**attempt)
                 logger.info(
                     f"Rate limit hit for Grok (async), waiting {wait_time} seconds "
-                    f"before retry {attempt + 1}/{max_attempts}"
+                    f"before retry {attempt + 1}/{MAX_ATTEMPTS}"
                 )
                 await asyncio.sleep(wait_time)
