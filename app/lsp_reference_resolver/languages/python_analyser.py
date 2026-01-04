@@ -18,7 +18,7 @@ class PythonAnalyzer(BaseLSPAnalyzer):
     def get_language_id(self): return "python"
 
     def needs_did_open(self) -> bool:
-        return False
+        return True
 
     def get_max_concurrency(self) -> int:
         return 8

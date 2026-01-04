@@ -72,36 +72,38 @@ install_jdtls_macos() {
 }
 
 install_jdtls_linux() {
-  bold "Installing Java + jdtls (Linux)..."
-  have apt-get || die "This script supports Linux via apt-get. Install jdtls manually for your distro."
+  echo "Installing Java 17 + jdtls (Linux)..."
+  
   sudo apt-get update
-  sudo apt-get install -y wget unzip default-jre
+  sudo apt-get install -y wget openjdk-21-jre
 
-  # Install jdtls to ~/.local/jdtls and a wrapper to ~/.local/bin/jdtls
-  ensure_path_local_bin
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
+  mkdir -p ~/.local/bin
+  mkdir -p ~/.local/jdtls
 
-  wget -O "$tmpdir/jdtls.tar.gz" https://download.eclipse.org/jdtls/milestones/latest/jdt-language-server-latest.tar.gz
-  mkdir -p "$HOME/.local/jdtls"
-  tar -xzf "$tmpdir/jdtls.tar.gz" -C "$HOME/.local/jdtls" --strip-components=1
+  cd /tmp
+  wget -O jdtls.tar.gz https://download.eclipse.org/jdtls/snapshots/jdt-language-server-latest.tar.gz
+  tar -xzf jdtls.tar.gz -C ~/.local/jdtls
+  rm jdtls.tar.gz
 
-  cat <<'SH' > "$HOME/.local/bin/jdtls"
+  cat <<'SH' > ~/.local/bin/jdtls
 #!/usr/bin/env bash
 set -euo pipefail
 JDTLS_HOME="${JDTLS_HOME:-$HOME/.local/jdtls}"
-JAVA_BIN="${JAVA_BIN:-$(command -v java)}"
+JAVA_BIN="${JAVA_BIN:-/usr/lib/jvm/java-21-openjdk-amd64/bin/java}"
 exec "$JAVA_BIN" \
   -Declipse.application=org.eclipse.jdt.ls.core.id1 \
   -Dosgi.bundles.defaultStartLevel=4 \
   -Declipse.product=org.eclipse.jdt.ls.core.product \
   -Dlog.protocol=true -Dlog.level=ALL \
   -Xms256m -Xmx2G \
-  -jar "$JDTLS_HOME/plugins/org.eclipse.equinox.launcher_"*.jar \
+  -jar "$(ls $JDTLS_HOME/plugins/org.eclipse.equinox.launcher_*.jar)" \
   -configuration "$JDTLS_HOME/config_linux" \
   "$@"
 SH
-  chmod +x "$HOME/.local/bin/jdtls"
+
+  chmod +x ~/.local/bin/jdtls
+  
+  echo "Done. Make sure ~/.local/bin is in your PATH."
 }
 
 install_metals_macos() {

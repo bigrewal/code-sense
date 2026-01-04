@@ -47,15 +47,3 @@ if [[ -f docker-compose.yml ]]; then
 else
   warn "docker-compose.yml not found. Skipping datastore startup."
 fi
-
-##  --- sleep for 5 seconds ---
-bold "Waiting for datastores to start..."
-sleep 5
-
-# --- sync python deps ---
-bold "Syncing Python dependencies (uv sync)..."
-uv sync
-
-# --- run api ---
-bold "Starting API at http://localhost:8000 ..."
-exec uv run uvicorn app.main:app --reload --host 127.0.0.1 --port 8000

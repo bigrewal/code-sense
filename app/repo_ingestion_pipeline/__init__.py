@@ -76,7 +76,7 @@ async def start_ingestion_pipeline(
         pre_ingestion_stage = PreIngestionAnalysisStage(
             llm_grok=llm, job_id=job_id, repo_name=repo_name
         )
-        analysis_summary = pre_ingestion_stage.run(repo_path=local_repo_path)
+        analysis_summary = await pre_ingestion_stage.run(repo_path=local_repo_path)
 
         mongo.upsert_ingestion_job(
             IngestionJobStatus(
@@ -141,7 +141,7 @@ async def start_ingestion_pipeline(
             )
         )
 
-        changed_files: List[str] = await CodeAnalyzer(
+        await CodeAnalyzer(
             repo=local_repo_path, repo_id=repo_name, job_id=job_id
         ).analyze()
 
@@ -195,7 +195,6 @@ async def start_ingestion_pipeline(
         await CreateRepoGraphStage(job_id=job_id).run(
             local_path=local_repo_path,
             repo_id=repo_name,
-            changed_files=changed_files,
         )
 
         mongo.upsert_ingestion_job(

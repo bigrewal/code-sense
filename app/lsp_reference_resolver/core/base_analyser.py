@@ -51,6 +51,7 @@ class BaseLSPAnalyzer:
         # self.client: Optional[LSPClient] = None
         self.show_progress = show_progress and (tqdm is not None)
         self.cache: Optional[Cache] = None
+        self.cache_lock: Optional[asyncio.Lock] = None
         self.changed_files: Set[str] = set()
         self.server_list: List[LSPClient] = []
 
@@ -69,18 +70,7 @@ class BaseLSPAnalyzer:
 
     # --- overridable knobs ---
     def needs_did_open(self) -> bool:
-        # for many servers, opening docs improves correctness/latency
-        return self.get_language_id().lower() == "python"
-
-    def get_warmup_seconds(self) -> float:
-        lang = self.get_language_id().lower()
-        if lang == "scala":
-            return 4.0
-        if lang in ("java", "rust"):
-            return 12.0
-        if lang == "python":
-            return 30.0
-        return 1.0
+        raise NotImplementedError
 
     def get_max_concurrency(self) -> int:
         cpu = (os.cpu_count() or 8)
@@ -98,20 +88,30 @@ class BaseLSPAnalyzer:
     def get_cache_namespace(self) -> str:
         cmd = " ".join(self.get_server_command())
         return f"{self.__class__.__name__}:{cmd}"
+    
+    async def _warmup(self, warmup_time: float):
+        logger.info("Warming up LSP server for %.1f seconds...", warmup_time)
+
+        if warmup_time:
+            if self.show_progress:
+                for _ in tqdm(range(int(warmup_time / 0.1)), desc="Warming up language server", leave=True):
+                    await asyncio.sleep(0.1)
+            else:
+                await asyncio.sleep(warmup_time)
 
     # --- lifecycle ---
     async def start_server(self):
         # Start 4 language servers
         for _ in range(4):
-            self.client = LSPClient(self.get_server_command())
-            await self.client.start()
-            await self.client.initialize(
+            client = LSPClient(self.get_server_command())
+            await client.start()
+            await client.initialize(
                 self.repo_path.as_uri(),
                 self.repo_path.name,
                 initialize_options=self.get_initialize_options(),
             )
 
-            self.server_list.append(self.client)
+            self.server_list.append(client)
 
 
     async def shutdown(self):
@@ -133,6 +133,7 @@ class BaseLSPAnalyzer:
 
     # --- main ---
     async def analyze(self) -> List[Dict]:
+        self.cache_lock = asyncio.Lock()
         if self.cache is None:
             self.cache = Cache(self.repo_path, self.get_cache_namespace())
 
@@ -140,11 +141,11 @@ class BaseLSPAnalyzer:
         logger.info("Found %d source files", len(files))
         await self.start_server()
 
+        await self._warmup(warmup_time=300.0)
+
         timeout_primary = 120.0 if self.get_language_id().lower() == "python" else 45.0
         timeout_retry = 180.0 if self.get_language_id().lower() == "python" else 90.0
         timeout_backoff = 0.2
-
-        mappings: List[Dict] = []
 
         # ---------- Phase 1: scan files, sha1, cache hits ----------
         scan_bar = tqdm(total=len(files), desc="Scanning files", leave=True) if self.show_progress else None
@@ -184,32 +185,15 @@ class BaseLSPAnalyzer:
         # ---------- Phase 1.5: invalidate referencing files if definitions changed ----------
         impacted_ref_files: Set[str] = set()
         if self.cache and content_changed_files:
-            # optional: your Cache may implement this; if not, just skip.
-            invalidate = getattr(self.cache, "invalidate_by_definition_file", None)
-            if callable(invalidate):
-                for def_path in content_changed_files:
-                    impacted = invalidate(def_path)
-                    if impacted:
-                        impacted_ref_files.update(impacted)
+            for def_path in content_changed_files:
+                impacted = self.cache.invalidate_by_definition_file(def_path)
+                if impacted:
+                    impacted_ref_files.update(impacted)
 
         files_to_recompute: Set[str] = set(content_changed_files) | set(impacted_ref_files)
         self.changed_files = set(files_to_recompute)
 
-        logger.info(
-            "Files to recompute mappings for (content-changed=%d, impacted=%d, total=%d)",
-            len(content_changed_files),
-            len(impacted_ref_files),
-            len(files_to_recompute),
-        )
-
-        # Load cached mappings for files not recomputed
-        for rel_path, info in file_infos.items():
-            if rel_path in files_to_recompute:
-                continue
-            if self.cache and info["cached_sha"] is not None:
-                cached_maps = self.cache.load_mappings_for_file(rel_path)
-                if cached_maps:
-                    mappings.extend(cached_maps)
+        logger.info(f"{len(files_to_recompute)}/{len(files)} need to be recomputed")
 
         # ---------- Phase 2: process recompute files in batches ----------
         file_queue = asyncio.Queue()
@@ -219,14 +203,12 @@ class BaseLSPAnalyzer:
                 await file_queue.put(rp)
                 recompute_list.append(rp)
 
-        batch_size = max(1, self.get_batch_size())
-
-        defs_bar = tqdm(total=0, desc="Querying definitions", leave=True) if self.show_progress else None
         batch_bar = tqdm(total=len(recompute_list), desc="Resolving references", leave=True) if self.show_progress else None
 
         async def resolve_queries(client: LSPClient, queries: List[Tuple[str, Path, Dict]], worker_sem: asyncio.Semaphore):
             # per-position memo inside this batch
             pos_cache: Dict[Tuple[str, int, int], Optional[Dict]] = {}
+            resolved_queries = []
 
             async def run_one(uri: str, path: Path, pos: Dict):
                 k = (uri, pos["line"], pos["character"])
@@ -244,12 +226,13 @@ class BaseLSPAnalyzer:
             for fut in asyncio.as_completed(tasks):
                 r = await fut
                 if r:
-                    mappings.append(r)
-                if defs_bar:
-                    defs_bar.update(1)
+                    resolved_queries.append(r)
+            
+            return resolved_queries
 
         async def worker(client: LSPClient, worker_id: int):
             worker_sem = asyncio.Semaphore(self.get_max_concurrency())
+            total_resolved_queries = 0
             while True:
                 try:
                     rel_path = file_queue.get_nowait()
@@ -285,11 +268,24 @@ class BaseLSPAnalyzer:
 
                     queries.append((uri, fpath, {"line": line, "character": col}))
 
-                if defs_bar:
-                    defs_bar.total += len(queries)
-                    defs_bar.refresh()
+                if self.cache:
+                    self.cache.delete_mappings_for_file(rel_path)
+                    self.cache.commit()
 
-                await resolve_queries(client, queries, worker_sem=worker_sem)
+                resolved_queries = await resolve_queries(client, queries, worker_sem=worker_sem)
+                total_resolved_queries += len(resolved_queries)
+
+                if self.cache and resolved_queries:
+                    async with self.cache_lock:
+                        for r in resolved_queries:
+                            self.cache.store_mapping(r)
+                        self.cache.commit()
+                
+                if self.cache:
+                    async with self.cache_lock:
+                        final_sha = sha1 if cached_sha != sha1 else (cached_sha or sha1)
+                        self.cache.update_file_sha(rel_path, final_sha)
+                        self.cache.commit()
 
                 # didClose
                 if self.needs_did_open():
@@ -297,19 +293,14 @@ class BaseLSPAnalyzer:
                         "textDocument/didClose",
                         {"textDocument": {"uri": uri}},
                     )
-
-                # update cache bookkeeping
-                if self.cache:
-                    self.cache.delete_mappings_for_file(rel_path)
-                    final_sha = sha1 if cached_sha != sha1 else (cached_sha or sha1)
-                    self.cache.update_file_sha(rel_path, final_sha)
-                    self.cache.commit()
+                
 
                 if batch_bar:
                     batch_bar.update(1)
 
                 file_queue.task_done()
 
+            return total_resolved_queries
         # Launch workers
         worker_tasks = [
             asyncio.create_task(worker(client, i)) 
@@ -317,21 +308,17 @@ class BaseLSPAnalyzer:
         ]
 
         try:
-            await asyncio.gather(*worker_tasks)
+            worker_results = await asyncio.gather(*worker_tasks)
+            total_resolved = sum(worker_results)
 
         finally:
             if batch_bar:
                 batch_bar.close()
-            if defs_bar:
-                defs_bar.close()
             if self.cache:
                 self.cache.commit()
             await self.shutdown()
-            logger.info("Got %d mappings", len(mappings))
-
-        # logger.info("======= Total definition queries issued: %d ======", total_queries)
-        logger.info("Got %d mappings", len(mappings))
-        return mappings
+        
+        logger.info(f"{total_resolved} queries resolved")
 
     async def _query_def_streaming(
         self,
@@ -341,7 +328,7 @@ class BaseLSPAnalyzer:
         position: Dict,
         sem: asyncio.Semaphore,
         timeout: float = 45.0,
-    ):
+    ) -> dict:
         async with sem:
             collected = []
 
@@ -410,11 +397,5 @@ class BaseLSPAnalyzer:
                 return None
 
             result = {"reference": ref.to_dict(), "definitions": [d.to_dict() for d in valid]}
-
-            if self.cache:
-                try:
-                    self.cache.store_mapping(result)
-                except Exception:
-                    logger.exception("Failed to store mapping in cache")
 
             return result

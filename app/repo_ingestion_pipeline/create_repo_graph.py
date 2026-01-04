@@ -16,8 +16,7 @@ from ..config import Config
 import traceback
 
 from ..models.data_model import (CodeFile,
-    ASTNode, IngestionStage, IngestionStageStatus,
-    IngestionJobStatus
+    ASTNode
 )
 from ..db import get_neo4j_client, get_mongo_client
 
@@ -64,7 +63,7 @@ class CreateRepoGraphStage():
         # File content cache for definition-name extraction
         self._file_content_cache: Dict[str, List[str]] = {}
 
-    async def run(self, local_path: Path, repo_id: str, changed_files: Optional[List[str]] = None) -> None:
+    async def run(self, local_path: Path, repo_id: str) -> None:
         """
         Process AST and create graph in Neo4j.
 
@@ -77,14 +76,11 @@ class CreateRepoGraphStage():
         try:
 
             repo_path = local_path
-            is_incremental = bool(changed_files)
-            changed_set = set(changed_files or [])
 
             logger.info("Job %s: Starting AST processing for repository: %s", self.job_id, repo_id)
 
             # Clear existing graph state for this repo
-            if not is_incremental:
-                await self.neo4j_client.init_graph_for_repo(repo_id)
+            await self.neo4j_client.init_graph_for_repo(repo_id)
 
             # Discover code files
             code_files = await self._discover_code_files(repo_path)
@@ -132,13 +128,7 @@ class CreateRepoGraphStage():
                 for ref_path, data in cursor.fetchall():
                     refs_by_file.setdefault(ref_path, []).append(json.loads(data))
 
-                # Decide which ref_paths we will actually attach references for
-                if not is_incremental:
-                    # Full rebuild: all files that have mappings
-                    target_ref_paths = list(refs_by_file.keys())
-                else:
-                    # Incremental: only files whose mappings were recomputed
-                    target_ref_paths = [p for p in refs_by_file.keys() if p in changed_set]
+                target_ref_paths = list(refs_by_file.keys())
 
                 ref_bar = None
                 if tqdm is not None:
@@ -178,26 +168,14 @@ class CreateRepoGraphStage():
             logger.info("Job %s: After pruning: %s nodes, %s edges", self.job_id, len(all_nodes), len(all_edges))
 
             # --- Decide which nodes/edges to write (full vs incremental) ---
-            if not is_incremental:
-                nodes_to_write = all_nodes
-                edges_to_write = all_edges
-            else:
-                # Only write graph slices for changed_files
-                changed_paths = changed_set
-                nodes_to_write = [n for n in all_nodes if n.file_path in changed_paths]
-                node_ids = {n.node_id for n in nodes_to_write}
-                # Keep edges that touch at least one changed node
-                edges_to_write = [
-                    e for e in all_edges
-                    if e.get("source") in node_ids or e.get("target") in node_ids
-                ]
+            nodes_to_write = all_nodes
+            edges_to_write = all_edges
 
             logger.info(
-                "Job %s: Writing %s nodes and %s edges to Neo4j (%s mode)",
+                "Job %s: Writing %s nodes and %s edges to Neo4j",
                 self.job_id,
                 len(nodes_to_write),
                 len(edges_to_write),
-                "incremental" if is_incremental else "full",
             )
 
             # --- Batched writes to Neo4j with progress bars ---

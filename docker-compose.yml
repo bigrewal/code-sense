@@ -7,7 +7,7 @@ services:
       - mongo_data:/data/db
 
   neo4j:
-    image: neo4j:5
+    image: neo4j:5.22.0
     ports:
       - "7474:7474"   # browser
       - "7687:7687"   # bolt

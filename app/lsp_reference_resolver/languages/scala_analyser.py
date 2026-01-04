@@ -24,8 +24,7 @@ class ScalaAnalyzer(BaseLSPAnalyzer):
     def get_language_id(self): return "scala"
 
     def needs_did_open(self) -> bool:
-        return False  # Metals indexes workspace fine
-
+        return True
 
     def get_max_concurrency(self) -> int:
         import os

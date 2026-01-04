@@ -168,12 +168,18 @@ Make sure you have the following installed:
 5. Bootstrap the local environment:
 
    ```bash
-   ./scripts/bootstrap_local.sh 2>&1 | tee /tmp/bootstrap.log
+   ./scripts/bootstrap_local.sh
    ```
 
-6. Go to http://localhost:8000/docs#/ to check if the CodeSense API is up.
+6. Run:
+   ```
+   uv run uvicorn app.main:app --reload
+   ```
 
-7. Run `git clone https://github.com/bigrewal/code-sense-ui` and point it to the API:
+
+7. Go to http://localhost:8000/docs#/ to check if the CodeSense API is up.
+
+8. Run `git clone https://github.com/bigrewal/code-sense-ui` and point it to the API:
 
    ```bash
    npm install
