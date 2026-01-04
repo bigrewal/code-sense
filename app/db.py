@@ -100,6 +100,7 @@ class Neo4jClient:
                 logger.info("Initialising graph for repo: %s", repo_id)
                 with self.driver.session() as session:
                     self._create_indexes(session)
+                    session.run("CALL db.awaitIndexes()")
                     self.clear_repo_data(session, repo_id)
             except Exception as exc:
                 logger.error("Neo4j initialisation failed: %s", exc)
@@ -118,11 +119,8 @@ class Neo4jClient:
         ]
 
         for index_query in indexes:
-            try:
-                session.run(index_query)
-                # logger.debug(f"Created index: {index_query}")
-            except Exception as e:
-                logger.warning(f"Index creation failed: {e}")
+            logger.info(f"Creating index for query: {index_query}")
+            session.run(index_query).consume()
 
     def clear_repo_data(self, session, repo_id: str):
         """Clear existing data for a repository."""
