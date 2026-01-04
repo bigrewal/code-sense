@@ -141,7 +141,7 @@ class BaseLSPAnalyzer:
         logger.info("Found %d source files", len(files))
         await self.start_server()
 
-        await self._warmup(warmup_time=600.0)
+        await self._warmup(warmup_time=300.0)
 
         timeout_primary = 120.0 if self.get_language_id().lower() == "python" else 45.0
         timeout_retry = 180.0 if self.get_language_id().lower() == "python" else 90.0
