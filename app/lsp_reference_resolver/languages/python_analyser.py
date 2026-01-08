@@ -18,11 +18,20 @@ class PythonAnalyzer(BaseLSPAnalyzer):
     def get_language_id(self): return "python"
 
     def needs_did_open(self) -> bool:
-        return True
+        return False
 
     def get_max_concurrency(self) -> int:
         return 8
+
+    def get_warmup_seconds(self) -> float:
+        return 0.0
+
+    def get_timeout_seconds(self) -> float:
+        return 120.0
     
+    def get_total_server_instances(self) -> int:
+        return 4
+
     def get_initialize_options(self) -> dict:
         return {"python": {"analysis": {"indexing": True}}}
     

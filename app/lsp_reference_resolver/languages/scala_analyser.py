@@ -19,7 +19,9 @@ SCALA_QUERY = r"""
 """
 
 class ScalaAnalyzer(BaseLSPAnalyzer):
-    def get_server_command(self): return ["metals"]
+    def get_server_command(self) -> List[str]:
+        return ["metals"]
+    
     def get_file_extensions(self): return [".scala", ".sbt", ".sc"]
     def get_language_id(self): return "scala"
 
@@ -27,12 +29,16 @@ class ScalaAnalyzer(BaseLSPAnalyzer):
         return True
 
     def get_max_concurrency(self) -> int:
-        import os
-        return min(32, max(8, (os.cpu_count() or 8)))
+        return 16
+    
+    def get_timeout_seconds(self) -> float:
+        return 120.0
+    
+    def get_total_server_instances(self) -> int:
+        return 4
     
     def is_excluded_definition_path(self, path: Path) -> bool:
         parts = set(path.parts)
-        # Ignore Metals / build junk inside repo
         exclude = {
             ".metals", ".bloop", "project", "target",
         }

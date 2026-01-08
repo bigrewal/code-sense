@@ -21,6 +21,9 @@ class LSPClient:
         self._work_handlers: Dict[str, ProgressHandler] = {}
         self._req_tokens: Dict[int, Dict[str, Optional[str]]] = {}
 
+        self._work_done_futs: dict[str, asyncio.Future] = {}
+        self._work_done_create_queue: asyncio.Queue[str] = asyncio.Queue()
+
     async def start(self):
         self.process = await asyncio.create_subprocess_exec(
             *self.command,
@@ -132,15 +135,6 @@ class LSPClient:
         if method in ("window/logMessage", "telemetry/event", "textDocument/publishDiagnostics"):
             return
 
-    async def _handle_server_request(self, msg: dict):
-        m, id_, p = msg.get("method"), msg.get("id"), msg.get("params") or {}
-        if m in ("workspace/configuration","window/showMessageRequest","client/registerCapability",
-                 "client/unregisterCapability","window/workDoneProgress/create","$/setTrace"):
-            return await self._send_response(id_, result=( [{} for _ in p.get("items", [])] if m=="workspace/configuration" else None ))
-        if m == "workspace/workspaceFolders":
-            return await self._send_response(id_, result=self._workspace_folders)
-        return await self._send_response(id_, error={"code": -32601, "message": f"Not implemented: {m}"})
-
     async def send_request(self, method: str, params: dict,
                            on_partial: Optional[ProgressHandler] = None,
                            on_work_done: Optional[ProgressHandler] = None,
@@ -165,17 +159,18 @@ class LSPClient:
 
         self._req_tokens[rid] = tokens
 
+        fut = asyncio.get_event_loop().create_future()
+        self._pending[rid] = fut
+        
         raw = json.dumps({"jsonrpc":"2.0","id":rid,"method":method,"params":req_params})
         content = f"Content-Length: {len(raw)}\r\n\r\n{raw}"
         self.process.stdin.write(content.encode())
         await self.process.stdin.drain()
-
-        fut = asyncio.get_event_loop().create_future()
-        self._pending[rid] = fut
+        
         try:
             res_msg = await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError:
-            await self.cancel_request(rid)
+            # await self.cancel_request(rid)
             logger.warning("LSP request timed out: %s", method)
             res_msg = {"error": {"code": -32800, "message": "timeout"}}
         finally:
@@ -184,8 +179,11 @@ class LSPClient:
             if pr: self._partial_handlers.pop(pr, None)
             if wd: self._work_handlers.pop(wd, None)
 
-        if res_msg.get("error"):
-            return {}
+        err = res_msg.get("error")
+        if err:
+            logger.debug("LSP error for %s: %s", method, err)
+            return None
+
         return res_msg.get("result", {})
 
     async def cancel_request(self, request_id: int):
@@ -202,6 +200,64 @@ class LSPClient:
         content = f"Content-Length: {len(raw)}\r\n\r\n{raw}"
         self.process.stdin.write(content.encode())
         await self.process.stdin.drain()
+    
+    def _register_work_done_token(self, token: str) -> asyncio.Future:
+        fut = self._work_done_futs.get(token)
+        if fut is None or fut.done():
+            fut = asyncio.get_running_loop().create_future()
+            self._work_done_futs[token] = fut
+
+            # hook into your existing $/progress routing
+            def on_progress(value):
+                if isinstance(value, dict) and value.get("kind") == "end" and not fut.done():
+                    fut.set_result(True)
+
+            self._work_handlers[str(token)] = on_progress
+
+        return fut
+
+    async def wait_for_next_work_done_token(self, timeout: float = 30.0) -> str | None:
+        try:
+            return await asyncio.wait_for(self._work_done_create_queue.get(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+
+    async def _handle_server_request(self, msg: dict):
+        method = msg.get("method")
+        req_id = msg.get("id")
+        params = msg.get("params", {}) or {}
+
+        if method == "window/workDoneProgress/create":
+            token = str(params.get("token"))
+            if token:
+                self._register_work_done_token(token)
+                self._work_done_create_queue.put_nowait(token)
+            await self._send_response(req_id, result=None)
+            return
+
+        if method == "workspace/configuration":
+            items = params.get("items", [])
+            await self._send_response(req_id, result=[{} for _ in items])
+            return
+
+        if method == "workspace/workspaceFolders":
+            await self._send_response(req_id, result=self._workspace_folders)
+            return
+
+        if method in ("client/registerCapability", "client/unregisterCapability", 
+                    "window/showMessageRequest", "$/setTrace"):
+            await self._send_response(req_id, result=None)
+            return
+
+        await self._send_response(req_id, error={"code": -32601, "message": f"Not implemented: {method}"})
+        
+    async def wait_for_work_done(self, token: str, timeout: float = 120.0) -> bool:
+        fut = self._register_work_done_token(token)
+        try:
+            await asyncio.wait_for(fut, timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     async def initialize(self, root_uri: str, name: str, initialize_options: Optional[Dict] = None):
         params = {
