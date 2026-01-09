@@ -53,6 +53,7 @@ class BaseLSPAnalyzer:
         self.cache: Optional[Cache] = None
         self.cache_lock: Optional[asyncio.Lock] = None
         self.changed_files: Set[str] = set()
+        self._doc_versions = {}
         self.server_list: List[LSPClient] = []
 
     # --- required by subclasses ---
@@ -73,36 +74,70 @@ class BaseLSPAnalyzer:
         raise NotImplementedError
 
     def get_max_concurrency(self) -> int:
-        cpu = (os.cpu_count() or 8)
-        lang = self.get_language_id().lower()
-        if lang == "python":
-            return 2  # safer default for big repos; tune up later
-        return min(16, max(6, cpu))
+        NotImplementedError
 
-    def get_batch_size(self) -> int:
-        return 5
+    def get_timeout_seconds(self) -> float:
+        NotImplementedError
 
+    def get_total_server_instances(self) -> int:
+        NotImplementedError
+    
     def get_initialize_options(self) -> Dict:
         return {}
 
     def get_cache_namespace(self) -> str:
         cmd = " ".join(self.get_server_command())
         return f"{self.__class__.__name__}:{cmd}"
-    
-    async def _warmup(self, warmup_time: float):
-        logger.info("Warming up LSP server for %.1f seconds...", warmup_time)
-
-        if warmup_time:
-            if self.show_progress:
-                for _ in tqdm(range(int(warmup_time / 0.1)), desc="Warming up language server", leave=True):
-                    await asyncio.sleep(0.1)
-            else:
-                await asyncio.sleep(warmup_time)
 
     # --- lifecycle ---
+    async def _wait_for_ready(self, client: LSPClient, timeout: float = 120.0):
+        """Wait for server readiness via progress tokens OR probe."""
+        
+        # Approach 1: Try progress token (rust-analyzer, jdtls)
+        token = await client.wait_for_next_work_done_token(timeout=10.0)
+        if token:
+            logger.info(f"Waiting for indexing (token: {token})")
+            success = await client.wait_for_work_done(token, timeout=timeout)
+            if success:
+                logger.info("Indexing complete via progress token")
+                return
+
+        # Approach 2: Probe until server responds (fallback for pylsp, metals)
+        logger.info("No progress token, probing for readiness...")
+        files = self.get_files()
+        if not files:
+            await asyncio.sleep(2.0)
+            return
+
+        uri = files[0].as_uri()
+        
+        # Send didOpen first (some servers require it)
+        if self.needs_did_open():
+            text = files[0].read_text(encoding="utf-8", errors="ignore")
+            await client.send_notification("textDocument/didOpen", {
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": self.get_language_id(),
+                    "version": 1,
+                    "text": text,
+                }
+            })
+
+        params = {"textDocument": {"uri": uri}, "position": {"line": 0, "character": 0}}
+        
+        start = asyncio.get_event_loop().time()
+        while (asyncio.get_event_loop().time() - start) < timeout:
+            res = await client.send_request("textDocument/definition", params, timeout=5.0)
+            if res is not None:
+                logger.info("Server ready (probe successful)")
+                return
+            await asyncio.sleep(1.0)
+        
+        logger.warning("Server readiness probe timed out, proceeding anyway")
+
+
     async def start_server(self):
-        # Start 4 language servers
-        for _ in range(4):
+        async def start_one():
             client = LSPClient(self.get_server_command())
             await client.start()
             await client.initialize(
@@ -110,8 +145,15 @@ class BaseLSPAnalyzer:
                 self.repo_path.name,
                 initialize_options=self.get_initialize_options(),
             )
+            return client
 
-            self.server_list.append(client)
+        total_servers = self.get_total_server_instances()
+        self.server_list = await asyncio.gather(*[start_one() for _ in range(total_servers)])
+
+        # Wait for all servers to be ready
+        logger.info("Waiting for LSP servers to be ready...")
+        await asyncio.gather(*[self._wait_for_ready(client) for client in self.server_list])
+        logger.info("All LSP servers are ready.")
 
 
     async def shutdown(self):
@@ -141,10 +183,7 @@ class BaseLSPAnalyzer:
         logger.info("Found %d source files", len(files))
         await self.start_server()
 
-        await self._warmup(warmup_time=300.0)
-
-        timeout_primary = 120.0 if self.get_language_id().lower() == "python" else 45.0
-        timeout_retry = 180.0 if self.get_language_id().lower() == "python" else 90.0
+        timeout_primary = self.get_timeout_seconds()
         timeout_backoff = 0.2
 
         # ---------- Phase 1: scan files, sha1, cache hits ----------
@@ -218,7 +257,7 @@ class BaseLSPAnalyzer:
                 r = await self._query_def_streaming(client, uri, path, pos, worker_sem, timeout=timeout_primary)
                 if not r:
                     await asyncio.sleep(timeout_backoff)
-                    r = await self._query_def_streaming(client, uri, path, pos, worker_sem, timeout=timeout_retry)
+                    r = await self._query_def_streaming(client, uri, path, pos, worker_sem, timeout=timeout_primary)
                 pos_cache[k] = r
                 return r
 
@@ -246,6 +285,9 @@ class BaseLSPAnalyzer:
                 cached_sha: Optional[str] = info["cached_sha"]
 
                 # didOpen
+                v = self._doc_versions.get(uri, 0) + 1
+                self._doc_versions[uri] = v
+
                 if self.needs_did_open():
                     await client.send_notification(
                         "textDocument/didOpen",
@@ -253,7 +295,7 @@ class BaseLSPAnalyzer:
                             "textDocument": {
                                 "uri": uri,
                                 "languageId": self.get_language_id(),
-                                "version": 1,
+                                "version": v,
                                 "text": text,
                             }
                         },
@@ -288,11 +330,11 @@ class BaseLSPAnalyzer:
                         self.cache.commit()
 
                 # didClose
-                if self.needs_did_open():
-                    await client.send_notification(
-                        "textDocument/didClose",
-                        {"textDocument": {"uri": uri}},
-                    )
+                # if self.needs_did_open():
+                #     await client.send_notification(
+                #         "textDocument/didClose",
+                #         {"textDocument": {"uri": uri}},
+                #     )
                 
 
                 if batch_bar:
@@ -367,8 +409,11 @@ class BaseLSPAnalyzer:
             for d in result_items:
                 if "uri" in d and "range" in d:
                     uri, rng = d["uri"], d["range"]
-                elif "targetUri" in d and "targetRange" in d:
-                    uri, rng = d["targetUri"], d["targetRange"]
+                elif "targetUri" in d:
+                    uri = d["targetUri"]
+                    rng = d.get("targetSelectionRange") or d.get("targetRange")
+                    if not rng:
+                        continue
                 else:
                     continue
 

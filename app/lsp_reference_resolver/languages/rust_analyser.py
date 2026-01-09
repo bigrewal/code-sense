@@ -2,6 +2,9 @@ from pathlib import Path
 from typing import List, Tuple, Dict
 import logging
 import os
+import asyncio
+
+from app.lsp_reference_resolver.core.lsp_client import LSPClient
 
 from ..core.base_analyser import BaseLSPAnalyzer
 
@@ -61,13 +64,19 @@ class RustAnalyzer(BaseLSPAnalyzer):
 
     def get_language_id(self) -> str:
         return "rust"
+    
+    def get_timeout_seconds(self) -> float:
+        return 120.0
+    
+    def get_total_server_instances(self) -> int:
+        return 1
 
     # rust-analyzer indexes workspaces/crates; didOpen per-file is not required
     def needs_did_open(self) -> bool:
-        return True
+        return False
 
     def get_max_concurrency(self) -> int:
-        return min(16, max(6, (os.cpu_count() or 8)))
+        return 8
     
     def is_excluded_definition_path(self, path: Path) -> bool:
         parts = set(path.parts)
@@ -83,6 +92,21 @@ class RustAnalyzer(BaseLSPAnalyzer):
             "build", "dist", ".tox", ".eggs"
         }
         return any(s in p.parts for s in skip)
+
+    def get_rust_root(self) -> Path:
+        """Find common parent of all Cargo.toml files."""
+        if not self._discovered["cargo_tomls"]:
+            self._discover_crates()
+        
+        if self._discovered["crate_roots"]:
+            roots = self._discovered["crate_roots"]
+            common = roots[0]
+            for root in roots[1:]:
+                while common not in root.parents and common != root:
+                    common = common.parent
+            return common
+        
+        return self.repo_path
 
     def _discover_crates(self):
         """Find all Cargo.toml files and their parent dirs (crate roots)."""
@@ -119,19 +143,65 @@ class RustAnalyzer(BaseLSPAnalyzer):
 
         return init_opts
 
+    async def _wait_for_rust_ready(self, client: LSPClient, timeout_per_token: float = 60.0):
+        """Wait for rust-analyzer to fully index."""
+        seen_tokens = set()
+        
+        while True:
+            token = await client.wait_for_next_work_done_token(timeout=5.0)
+            if not token or token in seen_tokens:
+                break
+            
+            seen_tokens.add(token)
+            logger.info(f"Waiting for: {token}")
+            success = await client.wait_for_work_done(token, timeout=timeout_per_token)
+            if success:
+                logger.info(f"Completed: {token}")
+            else:
+                logger.info(f"Timeout waiting for: {token}, continuing...")
+        
+        # Final probe
+        logger.info("Probing for readiness...")
+        files = self.get_files()
+        if files:
+            uri = files[0].as_uri()
+            params = {"textDocument": {"uri": uri}, "position": {"line": 0, "character": 0}}
+            for _ in range(10):
+                res = await client.send_request("textDocument/definition", params, timeout=5.0)
+                if res is not None and res != []:
+                    logger.info("rust-analyzer ready")
+                    return
+                await asyncio.sleep(2.0)
+        
+        logger.warning("rust-analyzer may not be fully ready")
+
     async def start_server(self):
-        """
-        Use base startup (which calls initialize with get_initialize_options()),
-        then dynamically add all crate/fallback roots as workspace folders.
-        """
-        # Ensure discovery before base start
         self._discover_crates()
+
         if not self._discovered["cargo_tomls"]:
             self._discover_fallback_roots()
+            logger.info(f"Fallback roots: {self._discovered['fallback_roots']}")
 
-        await super().start_server()
+        rust_root = self.get_rust_root()
+        logger.info(f"Using Rust root: {rust_root}")
 
-        # Build workspace folder adds (avoid duplicating the repo root)
+        # Initialize servers with rust_root instead of repo_path
+        num_servers = self.get_total_server_instances()
+        
+        for i in range(num_servers):
+            client = LSPClient(self.get_server_command())
+            await client.start()
+            await client.initialize(
+                rust_root.as_uri(),
+                rust_root.name,
+                initialize_options=self.get_initialize_options(),
+            )
+            self.server_list.append(client)
+            
+            if i == 0:
+                await self._wait_for_rust_ready(client)
+
+        # Add workspace folders for individual crates
         adds: List[Dict] = []
         roots = (
             self._discovered["crate_roots"]
@@ -140,21 +210,20 @@ class RustAnalyzer(BaseLSPAnalyzer):
         )
 
         for root in roots:
-            # Skip if it's exactly the repo root
             try:
-                root.relative_to(self.repo_path)
+                root.relative_to(rust_root)
             except ValueError:
-                # outside repo — skip
                 continue
-            if root == self.repo_path:
+            if root == rust_root:
                 continue
             adds.append({"uri": root.as_uri(), "name": root.name})
 
         if adds:
-            await self.client.send_notification(
-                "workspace/didChangeWorkspaceFolders",
-                {"event": {"added": adds, "removed": []}},
-            )
+            for client in self.server_list:
+                await client.send_notification(
+                    "workspace/didChangeWorkspaceFolders",
+                    {"event": {"added": adds, "removed": []}},
+                )
 
     # ---------- Reference position extraction via tree-sitter ----------
     def ref_pos_extractor(self, text: str, path: Path) -> List[Tuple[int, int]]:
@@ -173,4 +242,5 @@ class RustAnalyzer(BaseLSPAnalyzer):
                 if key not in seen:
                     seen.add(key)
                     positions.append(key)
+        
         return positions
