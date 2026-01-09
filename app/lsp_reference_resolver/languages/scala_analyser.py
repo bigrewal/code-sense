@@ -29,13 +29,13 @@ class ScalaAnalyzer(BaseLSPAnalyzer):
         return True
 
     def get_max_concurrency(self) -> int:
-        return 16
+        return 8
     
     def get_timeout_seconds(self) -> float:
         return 120.0
     
     def get_total_server_instances(self) -> int:
-        return 4
+        return 1
     
     def is_excluded_definition_path(self, path: Path) -> bool:
         parts = set(path.parts)

@@ -2,6 +2,9 @@ from pathlib import Path
 from typing import List, Tuple, Dict
 import logging
 import os
+import asyncio
+
+from app.lsp_reference_resolver.core.lsp_client import LSPClient
 
 from ..core.base_analyser import BaseLSPAnalyzer
 
