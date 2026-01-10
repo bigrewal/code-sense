@@ -37,14 +37,10 @@ def _serialize_job(job_doc: Dict[str, Any]) -> Dict[str, Any]:
 
 def _filter_stage_metrics(job: Dict[str, Any]) -> Dict[str, Any]:
     ALLOWED_PRECHECK_METRICS = {
-        "total_tokens",
-        "supported_tokens",
-        "supported_ratio",
-        "primary_language",
-        "language_distribution_pct",
         "supported_file_count",
         "unsupported_file_count",
-        "excluded_file_count",
+        "language_distribution_pct",
+        "supported_tokens"
     }
     stages = job.get("stages") or {}
 
