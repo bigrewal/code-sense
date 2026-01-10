@@ -82,6 +82,8 @@ class Neo4jClient:
             )
             # Test connection
             with self.driver.session() as session:
+                self._create_indexes(session)
+                session.run("CALL db.awaitIndexes()")
                 session.run("RETURN 1")
             logger.info("Neo4j connection established successfully")
         except Exception as e:
@@ -99,8 +101,6 @@ class Neo4jClient:
             try:
                 logger.info("Initialising graph for repo: %s", repo_id)
                 with self.driver.session() as session:
-                    self._create_indexes(session)
-                    session.run("CALL db.awaitIndexes()")
                     self.clear_repo_data(session, repo_id)
             except Exception as exc:
                 logger.error("Neo4j initialisation failed: %s", exc)
@@ -119,7 +119,6 @@ class Neo4jClient:
         ]
 
         for index_query in indexes:
-            logger.info(f"Creating index for query: {index_query}")
             session.run(index_query).consume()
 
     def clear_repo_data(self, session, repo_id: str):
