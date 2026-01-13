@@ -21,32 +21,53 @@ MENTAL_MODEL_TYPES = {
 }
 
 PROMPT_SYSTEM = (
-    "Your task is to analyze the provided code file and determine if it is critical to the core "
-    "functionality of the repository. If the file is critical, write a 1–3 sentence plain-English "
-    "description covering components, purpose, and key interactions. Otherwise, output IGNORE. "
-    "Ignore tutorials, tests, and docs."
+    "You are analyzing a single code file from a repository.\n\n"
+    "First, decide whether this file is CRITICAL to the repository’s core functionality.\n\n"
+    "A file is CRITICAL if it directly implements, coordinates, or enables the primary behavior "
+    "of the system (e.g., core logic, main services, orchestration, key data models, APIs, or entry points).\n\n"
+    "A file is NOT critical if it is primarily:\n"
+    "- tests, mocks, fixtures\n"
+    "- documentation or examples\n"
+    "- tutorials or demos\n"
+    "- configuration-only or boilerplate with no domain logic\n"
+    "- thin wrappers with no meaningful behavior\n\n"
+    "If the file is NOT critical, output exactly: IGNORE\n\n"
+    "If the file IS critical, write a concise 1–4 sentence, plain-English description that explains:\n"
+    "- what the file defines\n"
+    "- its main responsibility\n"
+    "- how it interacts with other important files or components\n\n"
+    "Do not quote code. Do not explain your reasoning. Do not add extra commentary."
 )
 
 PROMPT_USER_TEMPLATE = """
-Repo name:
+Repository:
 {repo_id}
 
-File path:
-`{file_path}`
+File:
+{file_path}
 
-File code:
+Code:
 {code}
 
-Upstream interactions:
+Upstream dependencies (who calls or uses this file):
 {upstream}
 
-Downstream interactions:
+Downstream dependencies (what this file calls or uses):
 {downstream}
 
-If critical, write 1–3 sentences like:
-"`{file_path}` defines <key components> to <main responsibilities>, and interacts with <other files> to <reason>."
-Otherwise, output "IGNORE".
-Be concise but readable.
+Instructions:
+- Decide whether this file is CRITICAL to the repository’s core functionality.
+- If NOT critical, output exactly: IGNORE
+- If CRITICAL, write 1–4 concise sentences in plain English.
+
+Preferred format for critical files:
+"`{file_path}` defines <key components> that <primary responsibility>. "
+"It works with <other files or modules> to <explain the interaction or flow>."
+
+Output rules:
+- Output ONLY the description or IGNORE
+- Be concise, concrete, and readable
+- No bullet points, no markdown, no extra text
 """.strip()
 
 

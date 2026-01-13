@@ -31,42 +31,49 @@ class RepoContextBuilder:
 
         if not entry_points:
             logger.info("No entry points found for repo %s; skipping REPO_CONTEXT build", self.repo_id)
-            return []
+            return 0
 
         critical_files = set(self.mongo_client.get_critical_file_paths(self.repo_id))
-        already_included: set[str] = set()
+        # already_included: set[str] = set()
         context_parts: list[str] = []
 
-        for ep in entry_points:
-            # BFS from this entry point
-            queue: deque[str] = deque()
-            local_visited: set[str] = set()
+        for file_path in critical_files:
+            brief = self.mongo_client.get_brief_file_overview(self.repo_id, file_path)
+            if brief:
+                context_parts.append(brief)
 
-            queue.append(ep)
-            local_visited.add(ep)
+        # for ep in entry_points:
+        #     # BFS from this entry point
+        #     queue: deque[str] = deque()
+        #     local_visited: set[str] = set()
 
-            while queue:
-                file_path = queue.popleft()
+        #     queue.append(ep)
+        #     local_visited.add(ep)
 
-                # If this is a critical file and not yet included, append its brief overview
-                if file_path in critical_files and file_path not in already_included:
-                    brief = self.mongo_client.get_brief_file_overview(self.repo_id, file_path) or ""
-                    if brief:
-                        context_parts.append(brief)
-                        already_included.add(file_path)
+        #     while queue:
+        #         file_path = queue.popleft()
 
-                # Traverse downstream dependencies
-                cfi = self.neo4j_client.cross_file_interactions_in_file(
-                    file_path=file_path,
-                    repo_id=self.repo_id,
-                )
-                downstream_info = cfi.get("downstream", {}) or {}
-                downstream_files = list(downstream_info.get("files", []) or [])
+        #         # If this is a critical file and not yet included, append its brief overview
+        #         if file_path in critical_files and file_path not in already_included:
+        #             brief = self.mongo_client.get_brief_file_overview(self.repo_id, file_path) or ""
+        #             if brief:
+        #                 context_parts.append(brief)
+        #                 already_included.add(file_path)
 
-                for child_path in downstream_files:
-                    if child_path not in local_visited:
-                        local_visited.add(child_path)
-                        queue.append(child_path)
+        #         # Traverse downstream dependencies
+        #         cfi = self.neo4j_client.cross_file_interactions_in_file(
+        #             file_path=file_path,
+        #             repo_id=self.repo_id,
+        #         )
+        #         downstream_info = cfi.get("downstream", {}) or {}
+        #         downstream_files = list(downstream_info.get("files", []) or [])
+
+        #         for child_path in downstream_files:
+        #             if child_path not in local_visited:
+        #                 local_visited.add(child_path)
+        #                 queue.append(child_path)
+
+        print(f"Built REPO_CONTEXT for repo {self.repo_id} with {len(context_parts)} file summaries out of {len(critical_files)} critical files.")
 
         repo_context = "\n\n".join(context_parts)
         repo_context_token_count = llm.count_tokens(repo_context)

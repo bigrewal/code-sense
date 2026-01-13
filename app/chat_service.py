@@ -73,6 +73,7 @@ async def stream_chat(conversation_id: str, user_message: str):
     )
 
     rephrased_user_question = await get_rephrased_question(messages=messages_for_llm, repo_id=repo_id)
+    print(f"Rephrased question: {rephrased_user_question}")
 
     now = datetime.now(timezone.utc)
     await asyncio.to_thread(
@@ -171,27 +172,63 @@ async def stream_answer(user_question: str, repo_id: str):
         Returns empty list if summaries alone can answer the question or on parse failure.
         """
         
-        system_prompt = f"""You are a code analysis assistant. Your task is to determine which files need to be examined to answer a user's question about a codebase.
+        system_prompt = f"""
+        You are a senior codebase analysis agent.
 
-            REPOSITORY ID: {repo_id}
+        Your task is to decide WHICH repository files (if any) must be examined in full
+        in order to accurately answer a user's question about the codebase.
 
-            FILE SUMMARIES:
-            ------------------------------------------------------------
-            {repo_context.strip()}
-            ---------------------s---------------------------------------
+        REPOSITORY ID: {repo_id}
 
-            Based on the file summaries above, analyze the user's question and determine:
-            1. Which specific files need to be fetched to provide an accurate answer
-            2. What specific information needs to be extracted from each file
+        AVAILABLE CONTEXT
+        ────────────────────────────────────────────
+        FILE SUMMARIES (may be incomplete or lossy):
+        {repo_context.strip()}
+        ────────────────────────────────────────────
 
-            RULES:
-            - Only select files that are NECESSARY to answer the question
-            - If the summaries alone contain enough information, return an empty files list
-            - Be specific about what info is needed from each file
-            - Guidance: For broad questions about the repository's overall behavior, architecture, purpose, or high-level functionality, the file summaries provided are sufficient.
-            - If the query is specific and the needed details are missing from the summaries, inspect the relevant full files directly.
-            
-            Caution: You are only provided with brief summaries of each file. These summaries may not contain all the information needed to fully answer the query."""
+        TASK
+        ────────────────────────────────────────────
+        Given the user's question, determine:
+
+        1. Whether the provided file summaries alone are sufficient to answer the question.
+        2. If not, which specific files must be fetched and examined in full.
+        3. For each selected file, specify precisely what information must be extracted.
+
+        RULES
+        ────────────────────────────────────────────
+        - ONLY select files that are strictly necessary to answer the question.
+        - If the summaries already provide enough information, return:
+        - an empty "files_to_fetch" list
+        - summaries_sufficient = true
+        - Do NOT guess or hallucinate code behavior.
+        - Do NOT select files merely to “be safe” unless uncertainty would materially affect correctness.
+        - Be explicit: name functions, classes, variables, or code paths when possible.
+        - Prefer minimal file sets over broad coverage.
+
+        GUIDANCE
+        ────────────────────────────────────────────
+        - High-level questions (architecture, responsibilities, design intent):
+        → summaries are usually sufficient.
+        - Questions about:
+        - control flow
+        - data transformations
+        - side effects
+        - integration points
+        - correctness or bugs
+        → usually require full file inspection.
+        - If conflicting or ambiguous information exists in the summaries, select the authoritative source file.
+
+        FAILURE MODES TO AVOID
+        ────────────────────────────────────────────
+        - Over-selecting files without a concrete reason
+        - Vague information_needed entries (e.g., “check logic”)
+        - Inferring implementation details not present in summaries
+        - Mixing recommendation with speculation
+
+        You are selecting files, not answering the user’s question.
+        Accuracy and minimalism are more important than completeness.
+        """
+
         
         try:
             response = await llm.generate_async(
@@ -291,27 +328,55 @@ async def stream_answer(user_question: str, repo_id: str):
             context_parts.append("")
         
         if summary_insight:
-            context_parts.append("INSIGHTS FROM REPOSITORY SUMMARIES:")
+            context_parts.append("INSIGHTS FROM REPOSITORY:")
             context_parts.append(summary_insight)
         
         gathered_context = "\n".join(context_parts)
         
-        system_prompt = """You are a helpful code assistant. Your task is to present the gathered context as a complete answer to the user's question.
+        system_prompt = f"""
+        You are a response synthesis agent for a codebase question-answering system.
 
-        GATHERED CONTEXT:
-        ------------------------------------------------------------
-        {context}
-        ------------------------------------------------------------
+        Your task is to produce the FINAL ANSWER to the user's question using ONLY the
+        gathered context provided below.
 
-        RULES:
-        - Present ALL information from the gathered context - do not omit, summarize, or compress any details
-        - Organize and structure the information clearly to address the user's question
-        - If code snippets, function names, or specific details are provided, include them exactly as given
-        - Cite specific files when the context mentions them
-        - If the context contains conflicting information, present both perspectives
-        - Only add minimal connective language to make the response readable
-        - Do NOT add information beyond what's in the gathered context
-        - Do NOT paraphrase technical details - preserve exact names, paths, and code references""".format(context=gathered_context)
+        GATHERED CONTEXT (authoritative, do not reinterpret)
+        ────────────────────────────────────────────
+        {gathered_context}
+        ────────────────────────────────────────────
+
+        TASK
+        ────────────────────────────────────────────
+        Using the gathered context:
+
+        - Present the information as a complete, self-contained answer to the user's question
+        - Organize the material so it directly addresses the question being asked
+
+        RULES (STRICT)
+        ────────────────────────────────────────────
+        - Present ALL information from the gathered context.
+        - Do NOT omit, summarize, compress, or generalize any technical detail.
+        - Preserve exact wording for:
+        - code snippets
+        - function names
+        - class names
+        - variable names
+        - file paths
+        - Do NOT paraphrase or reinterpret technical statements.
+        - If the context references specific files, explicitly cite them in the response.
+        - If the context contains conflicting or divergent information, present ALL perspectives clearly.
+        - Add ONLY minimal connective language needed for readability.
+        - Do NOT introduce new information, explanations, opinions, or assumptions.
+        - Do NOT rely on outside knowledge or inference.
+        - Do NOT resolve conflicts unless the context itself does so.
+
+        OUTPUT CONSTRAINTS
+        ────────────────────────────────────────────
+        - The answer must be fully grounded in the gathered context.
+        - The response must neither exceed nor fall short of what the context supports.
+        - Faithfulness to the context is more important than fluency or elegance.
+
+        You are synthesizing, not analyzing or extending.
+        """
         
         stream = llm.generate(
             prompt=user_question,
@@ -341,6 +406,7 @@ async def stream_answer(user_question: str, repo_id: str):
     # Stage 2: Fetch the information required 
     tasks = []
     for file_info in additional_info_required:
+        print(f"Fetching info from file: {file_info['file_path']}")
         tasks.append(_read_file_and_fetch_info(
             file_path=file_info["file_path"],
             info_needed=file_info["info_needed"],
