@@ -57,14 +57,89 @@ class Config:
 
     min_supported_cov_ratio: float = 0.5
 
+    # ========== Database Connection Pool Configuration ==========
+
+    # Neo4j Connection Pool Settings
+    NEO4J_MAX_POOL_SIZE: int = int(os.getenv("NEO4J_MAX_POOL_SIZE", "50"))
+    NEO4J_MAX_CONNECTION_LIFETIME: int = int(
+        os.getenv("NEO4J_MAX_CONNECTION_LIFETIME", "3600")
+    )  # 1 hour in seconds
+    NEO4J_CONNECTION_TIMEOUT: int = int(
+        os.getenv("NEO4J_CONNECTION_TIMEOUT", "30")
+    )  # 30 seconds
+    NEO4J_BATCH_SIZE: int = int(os.getenv("NEO4J_BATCH_SIZE", "1000"))
+
+    # MongoDB Connection Pool Settings
+    MONGO_MAX_POOL_SIZE: int = int(os.getenv("MONGO_MAX_POOL_SIZE", "50"))
+    MONGO_MIN_POOL_SIZE: int = int(os.getenv("MONGO_MIN_POOL_SIZE", "10"))
+    MONGO_MAX_IDLE_TIME_MS: int = int(
+        os.getenv("MONGO_MAX_IDLE_TIME_MS", "300000")
+    )  # 5 minutes
+    MONGO_SERVER_SELECTION_TIMEOUT_MS: int = int(
+        os.getenv("MONGO_SERVER_SELECTION_TIMEOUT_MS", "30000")
+    )  # 30 seconds
+    MONGO_CONNECT_TIMEOUT_MS: int = int(
+        os.getenv("MONGO_CONNECT_TIMEOUT_MS", "20000")
+    )  # 20 seconds
+    MONGO_SOCKET_TIMEOUT_MS: int = int(
+        os.getenv("MONGO_SOCKET_TIMEOUT_MS", "300000")
+    )  # 5 minutes
+
+    # ========== Retry Configuration ==========
+
+    DB_MAX_RETRY_ATTEMPTS: int = int(os.getenv("DB_MAX_RETRY_ATTEMPTS", "3"))
+    DB_RETRY_INITIAL_DELAY: float = float(os.getenv("DB_RETRY_INITIAL_DELAY", "1.0"))
+    DB_RETRY_BACKOFF_MULTIPLIER: float = float(
+        os.getenv("DB_RETRY_BACKOFF_MULTIPLIER", "2.0")
+    )
+
+    # ========== Performance Monitoring ==========
+
+    SLOW_QUERY_THRESHOLD_MS: int = int(
+        os.getenv("SLOW_QUERY_THRESHOLD_MS", "1000")
+    )  # 1 second
+    ENABLE_DB_METRICS: bool = os.getenv("ENABLE_DB_METRICS", "true").lower() == "true"
+
+    # ========== Security ==========
+
+    # Disable query logging in production for security
+    LOG_DB_QUERIES: bool = os.getenv("LOG_DB_QUERIES", "false").lower() == "true"
+
+
 def validate_required_settings() -> None:
     """Fail fast with a clear list of missing required environment values."""
+    # Check required environment variables
     required = {
         "XAI_API_KEY": Config.XAI_API_KEY,
         "NEO4J_URI": Config.NEO4J_URI,
         "NEO4J_USER": Config.NEO4J_USER,
         "NEO4J_PASSWORD": Config.NEO4J_PASSWORD,
+        "MONGO_URI": Config.MONGO_URI,
     }
     missing = [name for name, value in required.items() if not value]
     if missing:
-        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+        raise RuntimeError(
+            f"Missing required environment variables: {', '.join(missing)}"
+        )
+
+    # Validate numeric ranges for database configuration
+    if Config.NEO4J_MAX_POOL_SIZE < 1:
+        raise ValueError("NEO4J_MAX_POOL_SIZE must be >= 1")
+
+    if Config.NEO4J_BATCH_SIZE < 1:
+        raise ValueError("NEO4J_BATCH_SIZE must be >= 1")
+
+    if Config.MONGO_MAX_POOL_SIZE < Config.MONGO_MIN_POOL_SIZE:
+        raise ValueError(
+            f"MONGO_MAX_POOL_SIZE ({Config.MONGO_MAX_POOL_SIZE}) must be >= "
+            f"MONGO_MIN_POOL_SIZE ({Config.MONGO_MIN_POOL_SIZE})"
+        )
+
+    if Config.DB_MAX_RETRY_ATTEMPTS < 1:
+        raise ValueError("DB_MAX_RETRY_ATTEMPTS must be >= 1")
+
+    if Config.DB_RETRY_INITIAL_DELAY <= 0:
+        raise ValueError("DB_RETRY_INITIAL_DELAY must be > 0")
+
+    if Config.DB_RETRY_BACKOFF_MULTIPLIER <= 1.0:
+        raise ValueError("DB_RETRY_BACKOFF_MULTIPLIER must be > 1.0")

@@ -42,37 +42,6 @@ class RepoContextBuilder:
             if brief:
                 context_parts.append(brief)
 
-        # for ep in entry_points:
-        #     # BFS from this entry point
-        #     queue: deque[str] = deque()
-        #     local_visited: set[str] = set()
-
-        #     queue.append(ep)
-        #     local_visited.add(ep)
-
-        #     while queue:
-        #         file_path = queue.popleft()
-
-        #         # If this is a critical file and not yet included, append its brief overview
-        #         if file_path in critical_files and file_path not in already_included:
-        #             brief = self.mongo_client.get_brief_file_overview(self.repo_id, file_path) or ""
-        #             if brief:
-        #                 context_parts.append(brief)
-        #                 already_included.add(file_path)
-
-        #         # Traverse downstream dependencies
-        #         cfi = self.neo4j_client.cross_file_interactions_in_file(
-        #             file_path=file_path,
-        #             repo_id=self.repo_id,
-        #         )
-        #         downstream_info = cfi.get("downstream", {}) or {}
-        #         downstream_files = list(downstream_info.get("files", []) or [])
-
-        #         for child_path in downstream_files:
-        #             if child_path not in local_visited:
-        #                 local_visited.add(child_path)
-        #                 queue.append(child_path)
-
         print(f"Built REPO_CONTEXT for repo {self.repo_id} with {len(context_parts)} file summaries out of {len(critical_files)} critical files.")
 
         repo_context = "\n\n".join(context_parts)

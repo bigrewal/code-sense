@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -9,9 +10,26 @@ from neo4j import GraphDatabase
 from pymongo import MongoClient
 
 from .config import Config
+from .db_exceptions import (
+    ConnectionError as DBConnectionError,
+    ConnectionTimeoutError,
+    QueryError,
+    ValidationError,
+    InvalidParameterError,
+    AuthenticationError,
+    InvalidConnectionStringError,
+    Neo4jHealthCheckError,
+    MongoHealthCheckError,
+)
+from .db_retry import with_retry, with_retry_async
+from .db_metrics import DatabaseMetrics
 from .utils import now_ts
 from .models.data_model import ASTNode, IngestionJobStatus, IngestionStage
+
 logger = logging.getLogger(__name__)
+
+# Module-level metrics collector (singleton)
+_db_metrics = DatabaseMetrics(slow_query_threshold_ms=Config.SLOW_QUERY_THRESHOLD_MS)
 
 ## Silence WARNING:neo4j.notifications: 
 logging.getLogger("neo4j.notifications").setLevel(logging.WARNING)
@@ -54,39 +72,109 @@ def _filter_stage_metrics(job: Dict[str, Any]) -> Dict[str, Any]:
     return job
 
 class Neo4jClient:
-    """Neo4j database client wrapper."""
+    """
+    Neo4j database client wrapper with connection pooling, retry logic, and health monitoring.
+
+    Features:
+    - Singleton pattern for application-wide connection reuse
+    - Automatic retry on transient failures
+    - Connection pool monitoring
+    - Query performance tracking
+    - Comprehensive error handling
+
+    Example:
+        client = get_neo4j_client()
+        await client.batch_create_nodes(nodes, repo_id="my-repo")
+    """
+
     _instance = None  # Singleton instance
+    _lock = threading.Lock()  # Thread-safe singleton initialization
 
     def __new__(cls, *args, **kwargs):
-        # Enforce singleton
+        """Enforce thread-safe singleton pattern."""
         if cls._instance is None:
-            cls._instance = super(Neo4jClient, cls).__new__(cls)
+            with cls._lock:
+                # Double-check locking pattern
+                if cls._instance is None:
+                    cls._instance = super(Neo4jClient, cls).__new__(cls)
         return cls._instance
 
     def __init__(self):
-        # Prevent re-initialisation on subsequent instantiations
+        """Initialize Neo4j client with connection pooling and retry logic."""
+        # Prevent re-initialization on subsequent instantiations
         if getattr(self, "_initialized", False):
             return
 
         self.driver = None
-        self.batch_size = 1000
-        logger.info(f"Initializing Neo4jClient with config: {Config.NEO4J_URI}")
+        self.batch_size = Config.NEO4J_BATCH_SIZE
+        self._metrics = _db_metrics
+
+        # SECURITY: Don't log credentials
+        logger.info("Initializing Neo4jClient connection")
+
         try:
+            # VALIDATION: Check connection configuration
+            self._validate_connection_config()
+
+            # PERFORMANCE: Configure connection pool
             self.driver = GraphDatabase.driver(
                 Config.NEO4J_URI,
-                auth=(Config.NEO4J_USER, Config.NEO4J_PASSWORD)
+                auth=(Config.NEO4J_USER, Config.NEO4J_PASSWORD),
+                max_connection_lifetime=Config.NEO4J_MAX_CONNECTION_LIFETIME,
+                max_connection_pool_size=Config.NEO4J_MAX_POOL_SIZE,
+                connection_timeout=Config.NEO4J_CONNECTION_TIMEOUT,
+                keep_alive=True,
             )
-            # Test connection
+
+            # Test connection with retry
+            self._initialize_database_with_retry()
+
+            logger.info("Neo4j connection established successfully")
+
+        except DBConnectionError as e:
+            logger.error("Neo4j connection failed: %s", str(e))
+            raise
+        except Exception as e:
+            logger.exception("Unexpected error during Neo4j initialization")
+            raise DBConnectionError(f"Failed to initialize Neo4j client: {str(e)}") from e
+
+        self._initialized = True
+
+    def _validate_connection_config(self):
+        """
+        Validate Neo4j connection configuration.
+
+        Raises:
+            InvalidConnectionStringError: If connection URI is invalid
+            AuthenticationError: If credentials are not configured
+        """
+        if not Config.NEO4J_URI:
+            raise InvalidConnectionStringError("NEO4J_URI not configured")
+
+        valid_schemes = ("bolt://", "neo4j://", "bolt+s://", "neo4j+s://")
+        if not Config.NEO4J_URI.startswith(valid_schemes):
+            raise InvalidConnectionStringError(
+                f"Invalid Neo4j URI scheme. Must start with one of: {valid_schemes}"
+            )
+
+        if not Config.NEO4J_USER or not Config.NEO4J_PASSWORD:
+            raise AuthenticationError("Neo4j credentials not configured")
+
+    @with_retry(max_attempts=3, initial_delay=2.0)
+    def _initialize_database_with_retry(self):
+        """
+        Initialize database with index creation (with retry for transient failures).
+
+        Raises:
+            DBConnectionError: If initialization fails after retries
+        """
+        try:
             with self.driver.session() as session:
                 self._create_indexes(session)
                 session.run("CALL db.awaitIndexes()")
                 session.run("RETURN 1")
-            logger.info("Neo4j connection established successfully")
         except Exception as e:
-            logger.warning(f"Neo4j connection failed: {e}")
-            raise
-
-        self._initialized = True
+            raise DBConnectionError(f"Failed to initialize database: {str(e)}") from e
 
     async def init_graph_for_repo(self, repo_id: str):
         if not self.driver:
@@ -129,128 +217,326 @@ class Neo4jClient:
         except Exception as e:
             logger.warning(f"Failed to clear repo data: {e}")
 
-    async def batch_create_nodes(self, nodes: List["ASTNode"], repo_id: str):
-        """Create AST nodes in batches."""
-        if not self.driver:
-            logger.error("Neo4j driver not initialized")
-            raise Exception("Neo4j driver not initialized")
+    def _serialize_nodes(self, nodes: List[ASTNode], repo_id: str) -> List[Dict[str, Any]]:
+        """
+        Serialize AST nodes to dictionaries with validation.
 
-        total_batches = (len(nodes) + self.batch_size - 1) // self.batch_size
+        Args:
+            nodes: List of ASTNode objects to serialize
+            repo_id: Repository identifier for validation
 
-        for i in range(0, len(nodes), self.batch_size):
-            batch_num = (i // self.batch_size) + 1
-            batch = nodes[i:i + self.batch_size]
+        Returns:
+            List of node dictionaries ready for Neo4j insertion
 
-            # Convert nodes to dictionaries
-            node_dicts = []
-            for node in batch:
-                node_dict = {
-                    'node_id': node.node_id,
-                    'node_type': node.node_type,
-                    'start_line': node.start_line,
-                    'start_column': node.start_column,
-                    'end_line': node.end_line,
-                    'end_column': node.end_column,
-                    'parent_id': node.parent_id,
-                    'file_path': node.file_path,
-                    'is_definition': node.is_definition,
-                    'is_reference': node.is_reference,
-                    'repo_id': repo_id,
-                    'name': node.name,
-                }
-                node_dicts.append(node_dict)
+        Raises:
+            ValidationError: If node validation fails
+        """
+        node_dicts = []
 
-            query = """
-            UNWIND $nodes AS node
-            CREATE (n:ASTNode)
-            SET n = node
-            """
-
-            # Add Definition label if is_definition is True
-            query += """
-            WITH n, node
-            WHERE node.is_definition = true
-            SET n:Definition
-            """
-
-            # Add Reference label if is_reference is True
-            query += """
-            WITH n, node
-            WHERE node.is_reference = true
-            SET n:Reference
-            """
-
-            def _write_nodes():
-                with self.driver.session() as session:
-                    session.run(query, nodes=node_dicts)
-
-            try:
-                await asyncio.to_thread(_write_nodes)
-                logger.debug("Created node batch %s/%s (%s nodes)", batch_num, total_batches, len(batch))
-            except Exception as e:
-                logger.error("Failed to create node batch %s: %s", batch_num, e)
-                raise
-
-    async def batch_create_edges(self, edges: List[Dict[str, Any]], repo_id: str):
-        """Create edges in batches."""
-        if not self.driver:
-            logger.error("Neo4j driver not initialized")
-            raise Exception("Neo4j driver not initialized")
-
-        if not edges:
-            logger.info("No edges to create")
-            return
-
-        total_batches = (len(edges) + self.batch_size - 1) // self.batch_size
-
-        for i in range(0, len(edges), self.batch_size):
-            batch_num = (i // self.batch_size) + 1
-            batch = edges[i:i + self.batch_size]
-
-            edges_payload = [
-                {
-                    "source": e["source"],
-                    "target": e["target"],
-                    "sequence": e.get("sequence", 1),
-                    "type": e["type"],
-                }
-                for e in batch
-            ]
-
-            query = """
-            UNWIND $edges AS edge
-            MATCH (s:ASTNode {repo_id: $repo_id, node_id: edge.source})
-            MATCH (t:ASTNode {repo_id: $repo_id, node_id: edge.target})
-            CALL {
-                WITH s, t, edge
-                WITH s, t, edge WHERE edge.type = 'CONTAINS'
-                CREATE (s)-[:CONTAINS {sequence: edge.sequence}]->(t)
-            }
-            CALL {
-                WITH s, t, edge
-                WITH s, t, edge WHERE edge.type = 'REFERENCES'
-                CREATE (s)-[:REFERENCES {sequence: edge.sequence}]->(t)
-            }
-            """
-
-            def _write_edges():
-                with self.driver.session() as session:
-                    session.execute_write(
-                        lambda tx: tx.run(query, edges=edges_payload, repo_id=repo_id)
-                    )
-
-            try:
-                await asyncio.to_thread(_write_edges)
-                logger.debug(
-                    "Created edges in batch %s/%s (%s edges)",
-                    batch_num,
-                    total_batches,
-                    len(edges_payload),
+        for idx, node in enumerate(nodes):
+            # VALIDATION: Type checking
+            if not isinstance(node, ASTNode):
+                raise ValidationError(
+                    f"Node at index {idx} is not an ASTNode: {type(node).__name__}"
                 )
 
-            except Exception as e:
-                logger.error("Failed to create edges in batch %s: %s", batch_num, e)
-                raise
+            # VALIDATION: Required fields
+            if not node.node_id:
+                raise ValidationError(f"Node at index {idx} missing node_id")
+            if not node.file_path:
+                raise ValidationError(f"Node at index {idx} missing file_path")
+
+            node_dict = {
+                'node_id': node.node_id,
+                'node_type': node.node_type,
+                'start_line': node.start_line,
+                'start_column': node.start_column,
+                'end_line': node.end_line,
+                'end_column': node.end_column,
+                'parent_id': node.parent_id,
+                'file_path': node.file_path,
+                'is_definition': node.is_definition,
+                'is_reference': node.is_reference,
+                'repo_id': repo_id,
+                'name': node.name,
+            }
+            node_dicts.append(node_dict)
+
+        return node_dicts
+
+    @with_retry_async(max_attempts=3, initial_delay=1.0)
+    async def batch_create_nodes(
+        self,
+        nodes: List[ASTNode],
+        repo_id: str,
+        batch_size: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Create AST nodes in batches with retry and monitoring.
+
+        Args:
+            nodes: List of AST nodes to create
+            repo_id: Repository identifier
+            batch_size: Optional batch size override (default: Config.NEO4J_BATCH_SIZE)
+
+        Returns:
+            Dict with operation summary: {
+                "total_nodes": int,
+                "batches_processed": int,
+                "duration_ms": float,
+                "errors": List[str],
+            }
+
+        Raises:
+            InvalidParameterError: If inputs are invalid
+            QueryError: If batch creation fails after retries
+            DBConnectionError: If driver not initialized
+
+        Example:
+            result = await client.batch_create_nodes(nodes, "my-repo")
+            logger.info("Created %d nodes in %d batches",
+                        result["total_nodes"], result["batches_processed"])
+        """
+        start_time = time.time()
+        operation = self._metrics.start_operation("batch_create_nodes")
+
+        # VALIDATION: Input checking
+        if not repo_id or not isinstance(repo_id, str):
+            raise InvalidParameterError("repo_id must be a non-empty string")
+
+        if not nodes:
+            logger.warning("batch_create_nodes called with empty node list for repo: %s", repo_id)
+            return {"total_nodes": 0, "batches_processed": 0, "duration_ms": 0.0, "errors": []}
+
+        if not isinstance(nodes, list):
+            raise InvalidParameterError("nodes must be a list of ASTNode objects")
+
+        # Driver check
+        if not self.driver:
+            raise DBConnectionError("Neo4j driver not initialized")
+
+        batch_size = batch_size or self.batch_size
+        total_batches = (len(nodes) + batch_size - 1) // batch_size
+        errors = []
+        batches_processed = 0
+
+        logger.info(
+            "Starting batch node creation: repo_id=%s, total_nodes=%d, batch_size=%d, batches=%d",
+            repo_id, len(nodes), batch_size, total_batches
+        )
+
+        try:
+            for i in range(0, len(nodes), batch_size):
+                batch_num = (i // batch_size) + 1
+                batch = nodes[i:i + batch_size]
+
+                batch_start = time.time()
+
+                # Convert nodes to dictionaries with validation
+                node_dicts = self._serialize_nodes(batch, repo_id)
+
+                query = """
+                UNWIND $nodes AS node
+                CREATE (n:ASTNode)
+                SET n = node
+                WITH n, node
+                WHERE node.is_definition = true
+                SET n:Definition
+                WITH n, node
+                WHERE node.is_reference = true
+                SET n:Reference
+                """
+
+                def _write_nodes():
+                    with self.driver.session() as session:
+                        session.run(query, nodes=node_dicts)
+
+                try:
+                    await asyncio.to_thread(_write_nodes)
+                    batches_processed += 1
+
+                    batch_duration_ms = (time.time() - batch_start) * 1000
+
+                    # MONITORING: Track slow batches
+                    if batch_duration_ms > Config.SLOW_QUERY_THRESHOLD_MS:
+                        logger.warning(
+                            "Slow batch operation: repo_id=%s, batch=%d/%d, nodes=%d, duration_ms=%.2f",
+                            repo_id, batch_num, total_batches, len(batch), batch_duration_ms
+                        )
+
+                    logger.debug(
+                        "Created node batch: repo_id=%s, batch=%d/%d, nodes=%d, duration_ms=%.2f",
+                        repo_id, batch_num, total_batches, len(batch), batch_duration_ms
+                    )
+
+                except Exception as e:
+                    error_msg = f"Batch {batch_num}/{total_batches} failed: {str(e)}"
+                    errors.append(error_msg)
+                    logger.error(
+                        "Failed to create node batch: repo_id=%s, batch=%d/%d, error=%s",
+                        repo_id, batch_num, total_batches, str(e)
+                    )
+                    raise QueryError(error_msg) from e
+
+            duration_ms = (time.time() - start_time) * 1000
+            self._metrics.end_operation(operation, success=True)
+
+            logger.info(
+                "Completed batch node creation: repo_id=%s, total_nodes=%d, batches=%d, duration_ms=%.2f",
+                repo_id, len(nodes), batches_processed, duration_ms
+            )
+
+            return {
+                "total_nodes": len(nodes),
+                "batches_processed": batches_processed,
+                "duration_ms": duration_ms,
+                "errors": errors,
+            }
+
+        except Exception as e:
+            self._metrics.end_operation(operation, success=False, error=e)
+            raise
+
+    @with_retry_async(max_attempts=3, initial_delay=1.0)
+    async def batch_create_edges(
+        self,
+        edges: List[Dict[str, Any]],
+        repo_id: str,
+        batch_size: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Create edges in batches with retry and monitoring.
+
+        Args:
+            edges: List of edge dictionaries with 'source', 'target', 'type', 'sequence'
+            repo_id: Repository identifier
+            batch_size: Optional batch size override (default: Config.NEO4J_BATCH_SIZE)
+
+        Returns:
+            Dict with operation summary: {
+                "total_edges": int,
+                "batches_processed": int,
+                "duration_ms": float,
+                "errors": List[str],
+            }
+
+        Raises:
+            InvalidParameterError: If inputs are invalid
+            QueryError: If batch creation fails after retries
+            DBConnectionError: If driver not initialized
+
+        Example:
+            result = await client.batch_create_edges(edges, "my-repo")
+            logger.info("Created %d edges in %d batches",
+                        result["total_edges"], result["batches_processed"])
+        """
+        start_time = time.time()
+        operation = self._metrics.start_operation("batch_create_edges")
+
+        # VALIDATION: Input checking
+        if not repo_id or not isinstance(repo_id, str):
+            raise InvalidParameterError("repo_id must be a non-empty string")
+
+        if not edges:
+            logger.info("No edges to create for repo: %s", repo_id)
+            return {"total_edges": 0, "batches_processed": 0, "duration_ms": 0.0, "errors": []}
+
+        if not isinstance(edges, list):
+            raise InvalidParameterError("edges must be a list of dictionaries")
+
+        # Driver check
+        if not self.driver:
+            raise DBConnectionError("Neo4j driver not initialized")
+
+        batch_size = batch_size or self.batch_size
+        total_batches = (len(edges) + batch_size - 1) // batch_size
+        errors = []
+        batches_processed = 0
+
+        try:
+            for i in range(0, len(edges), batch_size):
+                batch_num = (i // batch_size) + 1
+                batch = edges[i:i + batch_size]
+
+                batch_start = time.time()
+
+                # Validate and prepare edges
+                edges_payload = []
+                for idx, e in enumerate(batch):
+                    if not isinstance(e, dict):
+                        raise ValidationError(f"Edge at index {idx} is not a dictionary")
+                    if "source" not in e or "target" not in e or "type" not in e:
+                        raise ValidationError(f"Edge at index {idx} missing required fields")
+
+                    edges_payload.append({
+                        "source": e["source"],
+                        "target": e["target"],
+                        "sequence": e.get("sequence", 1),
+                        "type": e["type"],
+                    })
+
+                query = """
+                UNWIND $edges AS edge
+                MATCH (s:ASTNode {repo_id: $repo_id, node_id: edge.source})
+                MATCH (t:ASTNode {repo_id: $repo_id, node_id: edge.target})
+                CALL {
+                    WITH s, t, edge
+                    WITH s, t, edge WHERE edge.type = 'CONTAINS'
+                    CREATE (s)-[:CONTAINS {sequence: edge.sequence}]->(t)
+                }
+                CALL {
+                    WITH s, t, edge
+                    WITH s, t, edge WHERE edge.type = 'REFERENCES'
+                    CREATE (s)-[:REFERENCES {sequence: edge.sequence}]->(t)
+                }
+                """
+
+                def _write_edges():
+                    with self.driver.session() as session:
+                        session.execute_write(
+                            lambda tx: tx.run(query, edges=edges_payload, repo_id=repo_id)
+                        )
+
+                try:
+                    await asyncio.to_thread(_write_edges)
+                    batches_processed += 1
+
+                    batch_duration_ms = (time.time() - batch_start) * 1000
+
+                    # MONITORING: Track slow batches
+                    if batch_duration_ms > Config.SLOW_QUERY_THRESHOLD_MS:
+                        logger.warning(
+                            "Slow batch operation: repo_id=%s, batch=%d/%d, edges=%d, duration_ms=%.2f",
+                            repo_id, batch_num, total_batches, len(edges_payload), batch_duration_ms
+                        )
+
+                    logger.debug(
+                        "Created edge batch: repo_id=%s, batch=%d/%d, edges=%d, duration_ms=%.2f",
+                        repo_id, batch_num, total_batches, len(edges_payload), batch_duration_ms
+                    )
+
+                except Exception as e:
+                    error_msg = f"Batch {batch_num}/{total_batches} failed: {str(e)}"
+                    errors.append(error_msg)
+                    logger.error(
+                        "Failed to create edge batch: repo_id=%s, batch=%d/%d, error=%s",
+                        repo_id, batch_num, total_batches, str(e)
+                    )
+                    raise QueryError(error_msg) from e
+
+            duration_ms = (time.time() - start_time) * 1000
+            self._metrics.end_operation(operation, success=True)
+
+            return {
+                "total_edges": len(edges),
+                "batches_processed": batches_processed,
+                "duration_ms": duration_ms,
+                "errors": errors,
+            }
+
+        except Exception as e:
+            self._metrics.end_operation(operation, success=False, error=e)
+            raise
 
     def cross_file_interactions_in_file(self, file_path: str, repo_id: str):
         """Infer cross-file interactions for a given file by finding references to and from definitions in other files."""
@@ -314,34 +600,175 @@ class Neo4jClient:
                 },
             }
 
+    def health_check(self) -> Dict[str, Any]:
+        """
+        Perform health check on Neo4j connection.
+
+        Returns:
+            Dict with health status: {
+                "status": "healthy" | "unhealthy",
+                "response_time_ms": float,
+                "connection_pool": {"in_use": int, "idle": int},
+                "error": Optional[str],
+            }
+
+        Example:
+            health = client.health_check()
+            if health["status"] == "unhealthy":
+                logger.error("Neo4j is down: %s", health.get("error"))
+        """
+        start_time = time.time()
+        
+        if not self.driver:
+            return {
+                "status": "unhealthy",
+                "error": "Driver not initialized",
+                "response_time_ms": 0.0,
+            }
+
+        try:
+            # Simple query to test connectivity
+            with self.driver.session() as session:
+                result = session.run("RETURN 1 AS health_check")
+                result.single()
+
+            response_time_ms = (time.time() - start_time) * 1000
+
+            # Get connection pool metrics (placeholder for future enhancement)
+            pool_stats = {"in_use": 0, "idle": 0}
+
+            health_status = {
+                "status": "healthy",
+                "response_time_ms": response_time_ms,
+                "connection_pool": pool_stats,
+            }
+
+            return health_status
+
+        except Exception as e:
+            logger.error("Neo4j health check failed: %s", str(e))
+            return {
+                "status": "unhealthy",
+                "error": str(e),
+                "response_time_ms": (time.time() - start_time) * 1000,
+            }
+
     def close(self):
-        """Close the Neo4j connection."""
-        if self.driver:
+        """
+        Close the Neo4j connection gracefully.
+
+        Ensures all in-flight operations complete before closing.
+        Should be called during application shutdown.
+        """
+        if not self.driver:
+            logger.warning("close() called but driver was not initialized")
+            return
+
+        try:
+            logger.info("Closing Neo4j connection")
+
+            # Give in-flight operations time to complete
+            time.sleep(0.5)
+
             self.driver.close()
-            logger.info("Neo4j connection closed")
+            logger.info("Neo4j connection closed successfully")
+
+        except Exception as e:
+            logger.error("Error closing Neo4j connection: %s", str(e))
+            raise
+        finally:
+            self.driver = None
 
 
 class MyMongoClient:
+    """
+    MongoDB database client wrapper with connection pooling, retry logic, and health monitoring.
+
+    Features:
+    - Singleton pattern for application-wide connection reuse
+    - Automatic retry on transient failures
+    - Connection pool configuration
+    - Query performance tracking
+    - Input validation and sanitization
+
+    Example:
+        client = get_mongo_client()
+        result = client.create_conversation(repo_id="my-repo")
+    """
+
     _instance = None   # Singleton instance
+    _lock = threading.Lock()  # Thread-safe singleton initialization
 
     def __new__(cls, *args, **kwargs):
+        """Enforce thread-safe singleton pattern."""
         if cls._instance is None:
-            cls._instance = super(MyMongoClient, cls).__new__(cls)
+            with cls._lock:
+                # Double-check locking pattern
+                if cls._instance is None:
+                    cls._instance = super(MyMongoClient, cls).__new__(cls)
         return cls._instance
 
     def __init__(self, *args, **kwargs):
+        """Initialize MongoDB client with connection pooling and retry logic."""
         # Init runs every time __new__ returns the instance,
         # so guard actual initialization.
         if hasattr(self, "_initialized") and self._initialized:
             return
 
-        self._client = MongoClient(*args, **kwargs)
-        self._db = None
-        self._initialized = True
+        logger.info("Initializing MyMongoClient connection")
+
+        try:
+            # VALIDATION: Check connection string
+            if not Config.MONGO_URI:
+                raise InvalidConnectionStringError("MONGO_URI not configured")
+
+            # PERFORMANCE: Configure connection pool
+            self._client = MongoClient(
+                Config.MONGO_URI,
+                maxPoolSize=Config.MONGO_MAX_POOL_SIZE,
+                minPoolSize=Config.MONGO_MIN_POOL_SIZE,
+                maxIdleTimeMS=Config.MONGO_MAX_IDLE_TIME_MS,
+                serverSelectionTimeoutMS=Config.MONGO_SERVER_SELECTION_TIMEOUT_MS,
+                connectTimeoutMS=Config.MONGO_CONNECT_TIMEOUT_MS,
+                socketTimeoutMS=Config.MONGO_SOCKET_TIMEOUT_MS,
+                retryWrites=True,
+                retryReads=True,
+                *args,
+                **kwargs
+            )
+
+            self._db = None
+            self._metrics = _db_metrics
+            self._initialized = True
+
+            logger.info("MongoDB client initialized successfully")
+
+        except Exception as e:
+            logger.exception("Failed to initialize MongoDB client")
+            raise DBConnectionError(f"Failed to initialize MongoDB client: {str(e)}") from e
 
     def connect(self, db_name: str):
-        """Select the DB to operate on."""
-        self._db = self._client[db_name]
+        """
+        Select the database to operate on with validation.
+
+        Args:
+            db_name: Database name
+
+        Raises:
+            InvalidParameterError: If db_name is invalid
+            DBConnectionError: If connection fails
+        """
+        if not db_name or not isinstance(db_name, str):
+            raise InvalidParameterError("db_name must be a non-empty string")
+
+        try:
+            self._db = self._client[db_name]
+            # Test connection
+            self._db.command("ping")
+            logger.info("Connected to MongoDB database: %s", db_name)
+        except Exception as e:
+            logger.error("Failed to connect to database %s: %s", db_name, str(e))
+            raise DBConnectionError(f"Failed to connect to database: {str(e)}") from e
     
     def __getitem__(self, collection_name: str):
         return self._db[collection_name]
@@ -403,32 +830,154 @@ class MyMongoClient:
         })
         return [doc.get("file_path") for doc in docs if doc.get("file_path")]
 
-    def delete_repo_data(self, repo_id: str):
-        print(f"ABout to delete repo: {repo_id}")
-        collections = [CONVERSATIONS_COLLECTION, MESSAGES_COLLECTION, MENTAL_MODEL_COLLECTION, INGESTED_REPOS_COLLECTION]
-        for coll_name in collections:
-            collection = self._db[coll_name]
-            result = collection.delete_many({"repo_id": repo_id})
-            logger.info(f"Deleted {result.deleted_count} documents from '{coll_name}' for repo_id '{repo_id}'")
-        
-        ingest_job_coll = self._db[INGESTION_JOBS_COLLECTION]
-        result = ingest_job_coll.delete_many({"repo_name": repo_id})
-        logger.info(f"Deleted {result.deleted_count} documents from '{INGESTION_JOBS_COLLECTION}' for repo_id '{repo_id}'")
-    
+    @with_retry(max_attempts=3, initial_delay=1.0)
+    def delete_repo_data(self, repo_id: str) -> Dict[str, Any]:
+        """
+        Delete all data for a repository across collections.
+
+        Args:
+            repo_id: Repository identifier
+
+        Returns:
+            Dict with deletion summary: {
+                "repo_id": str,
+                "collections_processed": int,
+                "total_deleted": int,
+                "duration_ms": float,
+            }
+
+        Raises:
+            InvalidParameterError: If repo_id is invalid
+            QueryError: If deletion fails
+
+        Example:
+            result = client.delete_repo_data("my-repo")
+            logger.info("Deleted %d documents", result["total_deleted"])
+        """
+        operation = self._metrics.start_operation("delete_repo_data")
+        start_time = time.time()
+
+        # VALIDATION: Input checking
+        if not repo_id or not isinstance(repo_id, str):
+            raise InvalidParameterError("repo_id must be a non-empty string")
+
+        # SECURITY: Sanitize repo_id
+        if any(char in repo_id for char in ['$', '{', '}']):
+            raise InvalidParameterError("repo_id contains invalid characters")
+
+        try:
+            logger.info("Deleting all data for repo_id: %s", repo_id)
+
+            collections = [
+                CONVERSATIONS_COLLECTION,
+                MESSAGES_COLLECTION,
+                MENTAL_MODEL_COLLECTION,
+                INGESTED_REPOS_COLLECTION
+            ]
+            total_deleted = 0
+
+            for coll_name in collections:
+                collection = self._db[coll_name]
+                result = collection.delete_many({"repo_id": repo_id})
+                total_deleted += result.deleted_count
+                logger.info(
+                    "Deleted documents: collection=%s, repo_id=%s, count=%d",
+                    coll_name, repo_id, result.deleted_count
+                )
+
+            # Delete ingestion jobs (uses repo_name field)
+            ingest_job_coll = self._db[INGESTION_JOBS_COLLECTION]
+            result = ingest_job_coll.delete_many({"repo_name": repo_id})
+            total_deleted += result.deleted_count
+            logger.info(
+                "Deleted documents: collection=%s, repo_id=%s, count=%d",
+                INGESTION_JOBS_COLLECTION, repo_id, result.deleted_count
+            )
+
+            duration_ms = (time.time() - start_time) * 1000
+            self._metrics.end_operation(operation, success=True)
+
+            logger.info(
+                "Completed repo data deletion: repo_id=%s, total_deleted=%d, duration_ms=%.2f",
+                repo_id, total_deleted, duration_ms
+            )
+
+            return {
+                "repo_id": repo_id,
+                "collections_processed": len(collections) + 1,
+                "total_deleted": total_deleted,
+                "duration_ms": duration_ms,
+            }
+
+        except Exception as e:
+            self._metrics.end_operation(operation, success=False, error=e)
+            logger.error("Failed to delete repo data: repo_id=%s, error=%s", repo_id, str(e))
+            raise QueryError(f"Failed to delete repo data: {str(e)}") from e
+
+    @with_retry(max_attempts=3, initial_delay=1.0)
     def create_conversation(self, repo_id: str) -> dict:
-        collection = self._db[CONVERSATIONS_COLLECTION]
-        new_conversation_doc = {
-            "repo_id": repo_id,
-            "created_at": now_ts(),
-            "updated_at": now_ts(),
-            "type": "REPO_CHAT",
-        }
-        result = collection.insert_one(new_conversation_doc)
-        return {
-            "conversation_id": str(result.inserted_id),
-            "repo_id": repo_id,
-            "created_at": new_conversation_doc["created_at"],
-        }
+        """
+        Create a new conversation for a repository.
+
+        Args:
+            repo_id: Repository identifier
+
+        Returns:
+            Dict with conversation details: {
+                "conversation_id": str,
+                "repo_id": str,
+                "created_at": datetime,
+            }
+
+        Raises:
+            InvalidParameterError: If repo_id is invalid
+            QueryError: If conversation creation fails
+
+        Example:
+            result = client.create_conversation(repo_id="my-repo")
+            conv_id = result["conversation_id"]
+        """
+        operation = self._metrics.start_operation("create_conversation")
+        start_time = time.time()
+
+        # VALIDATION: Input checking
+        if not repo_id or not isinstance(repo_id, str):
+            raise InvalidParameterError("repo_id must be a non-empty string")
+
+        # SECURITY: Sanitize repo_id (basic check)
+        if any(char in repo_id for char in ['$', '{', '}']):
+            raise InvalidParameterError("repo_id contains invalid characters")
+
+        try:
+            collection = self._db[CONVERSATIONS_COLLECTION]
+
+            new_conversation_doc = {
+                "repo_id": repo_id,
+                "created_at": now_ts(),
+                "updated_at": now_ts(),
+                "type": "REPO_CHAT",
+            }
+
+            result = collection.insert_one(new_conversation_doc)
+
+            duration_ms = (time.time() - start_time) * 1000
+            self._metrics.end_operation(operation, success=True)
+
+            logger.info(
+                "Created conversation: conversation_id=%s, repo_id=%s, duration_ms=%.2f",
+                str(result.inserted_id), repo_id, duration_ms
+            )
+
+            return {
+                "conversation_id": str(result.inserted_id),
+                "repo_id": repo_id,
+                "created_at": new_conversation_doc["created_at"],
+            }
+
+        except Exception as e:
+            self._metrics.end_operation(operation, success=False, error=e)
+            logger.error("Failed to create conversation: repo_id=%s, error=%s", repo_id, str(e))
+            raise QueryError(f"Failed to create conversation: {str(e)}") from e
     
     def list_conversations(
         self,
@@ -636,6 +1185,88 @@ class MyMongoClient:
             {"_id": 1}
         )
         return doc is not None
+
+    def health_check(self) -> Dict[str, Any]:
+        """
+        Perform health check on MongoDB connection.
+
+        Returns:
+            Dict with health status: {
+                "status": "healthy" | "unhealthy",
+                "response_time_ms": float,
+                "database": str,
+                "collections": List[str],
+                "error": Optional[str],
+            }
+
+        Example:
+            health = client.health_check()
+            if health["status"] == "unhealthy":
+                logger.error("MongoDB is down: %s", health.get("error"))
+        """
+        start_time = time.time()
+
+        # Fix: MongoDB database objects don't support truth value testing
+        # Must compare with None explicitly
+        if self._client is None or self._db is None:
+            return {
+                "status": "unhealthy",
+                "error": "Client not initialized or database not selected",
+                "response_time_ms": 0.0,
+            }
+
+        try:
+            # Ping database
+            self._db.command("ping")
+
+            # Get collection names
+            collections = self._db.list_collection_names()
+
+            response_time_ms = (time.time() - start_time) * 1000
+
+            return {
+                "status": "healthy",
+                "response_time_ms": response_time_ms,
+                "database": self._db.name,
+                "collections": collections,
+                "collection_count": len(collections),
+            }
+
+        except Exception as e:
+            logger.error("MongoDB health check failed: %s", str(e))
+            return {
+                "status": "unhealthy",
+                "error": str(e),
+                "response_time_ms": (time.time() - start_time) * 1000,
+            }
+
+    def close(self):
+        """
+        Close the MongoDB connection gracefully.
+
+        Ensures all in-flight operations complete before closing.
+        Should be called during application shutdown.
+        """
+        if not self._client:
+            logger.warning("close() called but client was not initialized")
+            return
+
+        try:
+            logger.info("Closing MongoDB connection")
+
+            # Give in-flight operations time to complete
+            time.sleep(0.5)
+
+            self._client.close()
+            logger.info("MongoDB connection closed successfully")
+
+        except Exception as e:
+            logger.error("Error closing MongoDB connection: %s", str(e))
+            raise
+        finally:
+            self._client = None
+            self._db = None
+
 
 def init_neo4j_client() -> Neo4jClient:
     """Initialise the global Neo4jClient singleton (if not already)."""

@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 from uuid import uuid4
@@ -14,7 +14,7 @@ from pydantic import BaseModel
 from .models.data_model import JobAborted, IngestionStage, IngestionStageStatus, IngestionJobStatus
 from .utils import get_repo_path, get_repo_dir, now_ts
 from .chat_service import stream_chat, stateless_stream_chat
-from .config import validate_required_settings
+from .config import Config, validate_required_settings
 from .db import (
     get_mongo_client,
     get_neo4j_client,
@@ -49,7 +49,28 @@ async def on_startup():
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    logger.info("Shutting down app")
+    """
+    Graceful shutdown: close database connections and cleanup resources.
+    """
+    logger.info("Shutting down application - closing database connections")
+
+    try:
+        neo4j_client = get_neo4j_client()
+        if neo4j_client:
+            neo4j_client.close()
+            logger.info("Neo4j connection closed")
+    except Exception as e:
+        logger.error("Error closing Neo4j connection: %s", str(e))
+
+    try:
+        mongo_client = get_mongo_client()
+        if mongo_client:
+            mongo_client.close()
+            logger.info("MongoDB connection closed")
+    except Exception as e:
+        logger.error("Error closing MongoDB connection: %s", str(e))
+
+    logger.info("Shutdown complete")
 
 
 class ChatRequest(BaseModel):
@@ -425,4 +446,82 @@ async def delete_job(job_id: str):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    """
+    Comprehensive health check endpoint.
+
+    Returns:
+        - 200: All systems healthy
+        - 503: One or more systems unhealthy
+
+    Response includes:
+        - Overall status
+        - Component health (Neo4j, MongoDB)
+        - Response times
+        - Connection pool status
+        - Metrics (if enabled)
+    """
+    from fastapi.responses import JSONResponse
+
+    overall_status = "healthy"
+    components = {}
+
+    # Check Neo4j
+    try:
+        neo4j_client = get_neo4j_client()
+        neo4j_health = neo4j_client.health_check()
+        components["neo4j"] = neo4j_health
+        if neo4j_health["status"] != "healthy":
+            overall_status = "unhealthy"
+    except Exception as e:
+        components["neo4j"] = {"status": "unhealthy", "error": str(e)}
+        overall_status = "unhealthy"
+
+    # Check MongoDB
+    try:
+        mongo_client = get_mongo_client()
+        mongo_health = mongo_client.health_check()
+        components["mongodb"] = mongo_health
+        if mongo_health["status"] != "healthy":
+            overall_status = "unhealthy"
+    except Exception as e:
+        components["mongodb"] = {"status": "unhealthy", "error": str(e)}
+        overall_status = "unhealthy"
+
+    # Include metrics if enabled
+    if Config.ENABLE_DB_METRICS:
+        from .db import _db_metrics
+        components["metrics"] = _db_metrics.get_summary()
+
+    response = {
+        "status": overall_status,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "components": components,
+    }
+
+    status_code = 200 if overall_status == "healthy" else 503
+    return JSONResponse(content=response, status_code=status_code)
+
+
+@app.get("/metrics")
+async def metrics():
+    """
+    Expose database operation metrics.
+
+    Returns metrics including:
+        - Operation counts by type
+        - Error counts by type
+        - Slow query count
+        - Average response times
+
+    This endpoint is useful for monitoring and alerting.
+    Can be integrated with Prometheus, Grafana, etc.
+    """
+    if not Config.ENABLE_DB_METRICS:
+        raise HTTPException(status_code=404, detail="Metrics disabled")
+
+    from .db import _db_metrics
+
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "metrics": _db_metrics.get_summary(),
+    }
