@@ -8,8 +8,6 @@ from tqdm import tqdm
 
 from ..db import Neo4jClient, get_mongo_client, get_neo4j_client
 from ..llm_grok import GrokLLM
-from ..repo_context_builder import build_repo_context
-from ..models.data_model import IngestionJobStatus, IngestionStage, IngestionStageStatus
 
 logger = logging.getLogger(__name__)
 
@@ -89,17 +87,17 @@ class MentalModelStage:
 
         try:
             dir_tree = self._build_dir_tree(repo_id)
-            insights, ignored_files = await self.identify_critical_files(dir_tree, repo_id)
+            critical_files, ignored_files = await self.identify_critical_files(dir_tree, repo_id)
             logger.info(
                 "Job %s: generated overview with %s insights, ignored %s files",
                 self.job_id,
-                len(insights),
+                len(critical_files),
                 len(ignored_files),
             )
-            await self._set_potential_entry_points(insights, repo_id)
-            repo_context_token_count = await build_repo_context(repo_id, self.llm_client)
+            await self._set_potential_entry_points(critical_files, repo_id)
+            repo_context_token_count = await self.create_repo_context(repo_id)
 
-            return len(insights), len(ignored_files), repo_context_token_count
+            return len(critical_files), len(ignored_files), repo_context_token_count
 
         except Exception as e:
             logger.exception("Job %s: mental model generation error", self.job_id)
@@ -245,6 +243,31 @@ class MentalModelStage:
             insight["upstream_dep_files"] = list(dependency_info["upstream"]["files"])
 
         return insights, ignored
+
+    async def create_repo_context(self, repo_id: str) -> int:
+        critical_files = set(self.mongo_client.get_critical_file_paths(repo_id))
+        context_parts: list[str] = []
+
+        for file_path in critical_files:
+            brief = self.mongo_client.get_brief_file_overview(repo_id, file_path)
+            if brief:
+                context_parts.append(brief)
+
+        repo_context = "\n\n".join(context_parts)
+        repo_context_token_count = self.llm.count_tokens(repo_context)
+        # Store as REPO_CONTEXT document
+        doc = {
+            "repo_id": repo_id,
+            "document_type": "REPO_CONTEXT",
+            "context": repo_context,
+        }
+        self.mental.update_one(
+            {"repo_id": repo_id, "document_type": "REPO_CONTEXT"},
+            {"$set": doc},
+            upsert=True,
+        )
+
+        return repo_context_token_count
 
     def _build_dir_tree(self, repo_id: str) -> List[str]:
         """Build a nested dict representing the directory tree from file paths in Neo4j or MongoDB."""
