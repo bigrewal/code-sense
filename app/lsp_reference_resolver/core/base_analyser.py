@@ -7,6 +7,7 @@ from urllib.parse import urlparse, unquote
 from .lsp_client import LSPClient
 from .cache import Cache
 from app.config import Config
+from app.db import get_mongo_client
 
 try:
     from tqdm import tqdm
@@ -192,6 +193,22 @@ class BaseLSPAnalyzer:
         file_infos: Dict[str, Dict] = {}
         content_changed_files: Set[str] = set()
 
+        # ---------- Phase 0.5: detect and clean deleted files ----------
+        if self.cache:
+            current_files = {f"{self.base_repo_path}/{str(f.relative_to(self.repo_path))}" for f in files}
+            cached_files = self.cache.get_all_cached_file_paths()
+            deleted_files = cached_files - current_files
+            if deleted_files:
+                logger.info(f"Found {len(deleted_files)} deleted files, cleaning cache...")
+                mongo_client = get_mongo_client()
+                for del_path in deleted_files:
+                    impacted = self.cache.invalidate_by_definition_file(del_path)
+                    if impacted:
+                        content_changed_files.update(impacted)
+                    self.cache.delete_file_completely(del_path)
+                    mongo_client.delete_brief_file_overview(self.base_repo_path, del_path)
+                self.cache.commit()
+
         for fpath in files:
             rel_path = f"{self.base_repo_path}/{str(fpath.relative_to(self.repo_path))}"
             try:
@@ -313,6 +330,7 @@ class BaseLSPAnalyzer:
                 if self.cache:
                     self.cache.delete_mappings_for_file(rel_path)
                     self.cache.commit()
+                    get_mongo_client().delete_brief_file_overview(self.base_repo_path, rel_path)
 
                 resolved_queries = await resolve_queries(client, queries, worker_sem=worker_sem)
                 total_resolved_queries += len(resolved_queries)

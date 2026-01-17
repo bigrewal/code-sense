@@ -12,14 +12,11 @@ from pymongo import MongoClient
 from .config import Config
 from .db_exceptions import (
     ConnectionError as DBConnectionError,
-    ConnectionTimeoutError,
     QueryError,
     ValidationError,
     InvalidParameterError,
     AuthenticationError,
     InvalidConnectionStringError,
-    Neo4jHealthCheckError,
-    MongoHealthCheckError,
 )
 from .db_retry import with_retry, with_retry_async
 from .db_metrics import DatabaseMetrics
@@ -84,7 +81,7 @@ class Neo4jClient:
 
     Example:
         client = get_neo4j_client()
-        await client.batch_create_nodes(nodes, repo_id="my-repo")
+        await client.batch_create_nodes(nodes, repo_name="my-repo")
     """
 
     _instance = None  # Singleton instance
@@ -176,16 +173,16 @@ class Neo4jClient:
         except Exception as e:
             raise DBConnectionError(f"Failed to initialize database: {str(e)}") from e
 
-    async def init_graph_for_repo(self, repo_id: str):
+    async def init_graph_for_repo(self, repo_name: str):
         if not self.driver:
             logger.error("Neo4j driver not initialized")
             raise Exception("Neo4j driver not initialized")
 
         def _initialise():
             try:
-                logger.info("Initialising graph for repo: %s", repo_id)
+                logger.info("Initialising graph for repo: %s", repo_name)
                 with self.driver.session() as session:
-                    self.clear_repo_data(session, repo_id)
+                    self.clear_repo_data(session, repo_name)
             except Exception as exc:
                 logger.error("Neo4j initialisation failed: %s", exc)
                 raise
@@ -196,8 +193,8 @@ class Neo4jClient:
         """Create necessary indexes for performance."""
         indexes = [
             "CREATE INDEX IF NOT EXISTS FOR (n:ASTNode) ON (n.node_id)",
-            "CREATE INDEX IF NOT EXISTS FOR (n:ASTNode) ON (n.repo_id)",
-            "CREATE INDEX IF NOT EXISTS FOR (n:ASTNode) ON (n.repo_id, n.node_id)",
+            "CREATE INDEX IF NOT EXISTS FOR (n:ASTNode) ON (n.repo_name)",
+            "CREATE INDEX IF NOT EXISTS FOR (n:ASTNode) ON (n.repo_name, n.node_id)",
             "CREATE INDEX IF NOT EXISTS FOR (n:ASTNode) ON (n.file_path)",
             "CREATE INDEX IF NOT EXISTS FOR (n:ASTNode) ON (n.node_type)",
         ]
@@ -205,25 +202,25 @@ class Neo4jClient:
         for index_query in indexes:
             session.run(index_query).consume()
 
-    def clear_repo_data(self, session, repo_id: str):
+    def clear_repo_data(self, session, repo_name: str):
         """Clear existing data for a repository."""
         try:
             query = """
-            MATCH (n:ASTNode {repo_id: $repo_id})
+            MATCH (n:ASTNode {repo_name: $repo_name})
             DETACH DELETE n
             """
-            session.run(query, repo_id=repo_id)
-            logger.info(f"Cleared existing data for repo: {repo_id}")
+            session.run(query, repo_name=repo_name)
+            logger.info(f"Cleared existing data for repo: {repo_name}")
         except Exception as e:
             logger.warning(f"Failed to clear repo data: {e}")
 
-    def _serialize_nodes(self, nodes: List[ASTNode], repo_id: str) -> List[Dict[str, Any]]:
+    def _serialize_nodes(self, nodes: List[ASTNode], repo_name: str) -> List[Dict[str, Any]]:
         """
         Serialize AST nodes to dictionaries with validation.
 
         Args:
             nodes: List of ASTNode objects to serialize
-            repo_id: Repository identifier for validation
+            repo_name: Repository identifier for validation
 
         Returns:
             List of node dictionaries ready for Neo4j insertion
@@ -257,7 +254,7 @@ class Neo4jClient:
                 'file_path': node.file_path,
                 'is_definition': node.is_definition,
                 'is_reference': node.is_reference,
-                'repo_id': repo_id,
+                'repo_name': repo_name,
                 'name': node.name,
             }
             node_dicts.append(node_dict)
@@ -268,7 +265,7 @@ class Neo4jClient:
     async def batch_create_nodes(
         self,
         nodes: List[ASTNode],
-        repo_id: str,
+        repo_name: str,
         batch_size: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
@@ -276,7 +273,7 @@ class Neo4jClient:
 
         Args:
             nodes: List of AST nodes to create
-            repo_id: Repository identifier
+            repo_name: Repository identifier
             batch_size: Optional batch size override (default: Config.NEO4J_BATCH_SIZE)
 
         Returns:
@@ -301,11 +298,11 @@ class Neo4jClient:
         operation = self._metrics.start_operation("batch_create_nodes")
 
         # VALIDATION: Input checking
-        if not repo_id or not isinstance(repo_id, str):
-            raise InvalidParameterError("repo_id must be a non-empty string")
+        if not repo_name or not isinstance(repo_name, str):
+            raise InvalidParameterError("repo_name must be a non-empty string")
 
         if not nodes:
-            logger.warning("batch_create_nodes called with empty node list for repo: %s", repo_id)
+            logger.warning("batch_create_nodes called with empty node list for repo: %s", repo_name)
             return {"total_nodes": 0, "batches_processed": 0, "duration_ms": 0.0, "errors": []}
 
         if not isinstance(nodes, list):
@@ -320,11 +317,6 @@ class Neo4jClient:
         errors = []
         batches_processed = 0
 
-        logger.info(
-            "Starting batch node creation: repo_id=%s, total_nodes=%d, batch_size=%d, batches=%d",
-            repo_id, len(nodes), batch_size, total_batches
-        )
-
         try:
             for i in range(0, len(nodes), batch_size):
                 batch_num = (i // batch_size) + 1
@@ -333,7 +325,7 @@ class Neo4jClient:
                 batch_start = time.time()
 
                 # Convert nodes to dictionaries with validation
-                node_dicts = self._serialize_nodes(batch, repo_id)
+                node_dicts = self._serialize_nodes(batch, repo_name)
 
                 query = """
                 UNWIND $nodes AS node
@@ -360,31 +352,26 @@ class Neo4jClient:
                     # MONITORING: Track slow batches
                     if batch_duration_ms > Config.SLOW_QUERY_THRESHOLD_MS:
                         logger.warning(
-                            "Slow batch operation: repo_id=%s, batch=%d/%d, nodes=%d, duration_ms=%.2f",
-                            repo_id, batch_num, total_batches, len(batch), batch_duration_ms
+                            "Slow batch operation: repo_name=%s, batch=%d/%d, nodes=%d, duration_ms=%.2f",
+                            repo_name, batch_num, total_batches, len(batch), batch_duration_ms
                         )
 
                     logger.debug(
-                        "Created node batch: repo_id=%s, batch=%d/%d, nodes=%d, duration_ms=%.2f",
-                        repo_id, batch_num, total_batches, len(batch), batch_duration_ms
+                        "Created node batch: repo_name=%s, batch=%d/%d, nodes=%d, duration_ms=%.2f",
+                        repo_name, batch_num, total_batches, len(batch), batch_duration_ms
                     )
 
                 except Exception as e:
                     error_msg = f"Batch {batch_num}/{total_batches} failed: {str(e)}"
                     errors.append(error_msg)
                     logger.error(
-                        "Failed to create node batch: repo_id=%s, batch=%d/%d, error=%s",
-                        repo_id, batch_num, total_batches, str(e)
+                        "Failed to create node batch: repo_name=%s, batch=%d/%d, error=%s",
+                        repo_name, batch_num, total_batches, str(e)
                     )
                     raise QueryError(error_msg) from e
 
             duration_ms = (time.time() - start_time) * 1000
             self._metrics.end_operation(operation, success=True)
-
-            logger.info(
-                "Completed batch node creation: repo_id=%s, total_nodes=%d, batches=%d, duration_ms=%.2f",
-                repo_id, len(nodes), batches_processed, duration_ms
-            )
 
             return {
                 "total_nodes": len(nodes),
@@ -401,7 +388,7 @@ class Neo4jClient:
     async def batch_create_edges(
         self,
         edges: List[Dict[str, Any]],
-        repo_id: str,
+        repo_name: str,
         batch_size: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
@@ -409,7 +396,7 @@ class Neo4jClient:
 
         Args:
             edges: List of edge dictionaries with 'source', 'target', 'type', 'sequence'
-            repo_id: Repository identifier
+            repo_name: Repository identifier
             batch_size: Optional batch size override (default: Config.NEO4J_BATCH_SIZE)
 
         Returns:
@@ -434,11 +421,11 @@ class Neo4jClient:
         operation = self._metrics.start_operation("batch_create_edges")
 
         # VALIDATION: Input checking
-        if not repo_id or not isinstance(repo_id, str):
-            raise InvalidParameterError("repo_id must be a non-empty string")
+        if not repo_name or not isinstance(repo_name, str):
+            raise InvalidParameterError("repo_name must be a non-empty string")
 
         if not edges:
-            logger.info("No edges to create for repo: %s", repo_id)
+            logger.info("No edges to create for repo: %s", repo_name)
             return {"total_edges": 0, "batches_processed": 0, "duration_ms": 0.0, "errors": []}
 
         if not isinstance(edges, list):
@@ -477,8 +464,8 @@ class Neo4jClient:
 
                 query = """
                 UNWIND $edges AS edge
-                MATCH (s:ASTNode {repo_id: $repo_id, node_id: edge.source})
-                MATCH (t:ASTNode {repo_id: $repo_id, node_id: edge.target})
+                MATCH (s:ASTNode {repo_name: $repo_name, node_id: edge.source})
+                MATCH (t:ASTNode {repo_name: $repo_name, node_id: edge.target})
                 CALL {
                     WITH s, t, edge
                     WITH s, t, edge WHERE edge.type = 'CONTAINS'
@@ -494,7 +481,7 @@ class Neo4jClient:
                 def _write_edges():
                     with self.driver.session() as session:
                         session.execute_write(
-                            lambda tx: tx.run(query, edges=edges_payload, repo_id=repo_id)
+                            lambda tx: tx.run(query, edges=edges_payload, repo_name=repo_name)
                         )
 
                 try:
@@ -506,21 +493,21 @@ class Neo4jClient:
                     # MONITORING: Track slow batches
                     if batch_duration_ms > Config.SLOW_QUERY_THRESHOLD_MS:
                         logger.warning(
-                            "Slow batch operation: repo_id=%s, batch=%d/%d, edges=%d, duration_ms=%.2f",
-                            repo_id, batch_num, total_batches, len(edges_payload), batch_duration_ms
+                            "Slow batch operation: repo_name=%s, batch=%d/%d, edges=%d, duration_ms=%.2f",
+                            repo_name, batch_num, total_batches, len(edges_payload), batch_duration_ms
                         )
 
                     logger.debug(
-                        "Created edge batch: repo_id=%s, batch=%d/%d, edges=%d, duration_ms=%.2f",
-                        repo_id, batch_num, total_batches, len(edges_payload), batch_duration_ms
+                        "Created edge batch: repo_name=%s, batch=%d/%d, edges=%d, duration_ms=%.2f",
+                        repo_name, batch_num, total_batches, len(edges_payload), batch_duration_ms
                     )
 
                 except Exception as e:
                     error_msg = f"Batch {batch_num}/{total_batches} failed: {str(e)}"
                     errors.append(error_msg)
                     logger.error(
-                        "Failed to create edge batch: repo_id=%s, batch=%d/%d, error=%s",
-                        repo_id, batch_num, total_batches, str(e)
+                        "Failed to create edge batch: repo_name=%s, batch=%d/%d, error=%s",
+                        repo_name, batch_num, total_batches, str(e)
                     )
                     raise QueryError(error_msg) from e
 
@@ -538,7 +525,7 @@ class Neo4jClient:
             self._metrics.end_operation(operation, success=False, error=e)
             raise
 
-    def cross_file_interactions_in_file(self, file_path: str, repo_id: str):
+    def cross_file_interactions_in_file(self, file_path: str, repo_name: str):
         """Infer cross-file interactions for a given file by finding references to and from definitions in other files."""
 
         if not self.driver:
@@ -547,7 +534,7 @@ class Neo4jClient:
 
         # Downstream: file_path → other files
         downstream_query = """
-        MATCH (ref:ASTNode {repo_id: $repo_id, file_path: $file_path, is_reference: true})
+        MATCH (ref:ASTNode {repo_name: $repo_name, file_path: $file_path, is_reference: true})
         -[:REFERENCES]->(ident:ASTNode)
         WHERE ident.file_path <> $file_path
         MATCH (def:ASTNode)
@@ -557,7 +544,7 @@ class Neo4jClient:
 
         # Upstream: other files → file_path
         upstream_query = """
-        MATCH (ref:ASTNode {repo_id: $repo_id, is_reference: true})
+        MATCH (ref:ASTNode {repo_name: $repo_name, is_reference: true})
         -[:REFERENCES]->(ident:ASTNode {file_path: $file_path})
         MATCH (def:ASTNode)
         WHERE def.node_id = ident.parent_id
@@ -566,7 +553,7 @@ class Neo4jClient:
 
         with self.driver.session() as session:
             # Downstream
-            downstream_result = list(session.run(downstream_query, repo_id=repo_id, file_path=file_path))
+            downstream_result = list(session.run(downstream_query, repo_name=repo_name, file_path=file_path))
             downstream_interactions: Dict[str, List[str]] = {}
             for record in downstream_result:
                 def_file = record["def_file_path"]
@@ -578,7 +565,7 @@ class Neo4jClient:
             }
 
             # Upstream
-            upstream_result = list(session.run(upstream_query, repo_id=repo_id, file_path=file_path))
+            upstream_result = list(session.run(upstream_query, repo_name=repo_name, file_path=file_path))
             upstream_interactions: Dict[str, List[str]] = {}
             for record in upstream_result:
                 ref_file = record["ref_file_path"]
@@ -693,7 +680,7 @@ class MyMongoClient:
 
     Example:
         client = get_mongo_client()
-        result = client.create_conversation(repo_id="my-repo")
+        result = client.create_conversation(repo_name="my-repo")
     """
 
     _instance = None   # Singleton instance
@@ -775,30 +762,30 @@ class MyMongoClient:
 
     # ========== Former helper functions converted to methods ==========
 
-    def get_potential_entry_points(self, repo_id: str) -> List[str]:
+    def get_potential_entry_points(self, repo_name: str) -> List[str]:
         collection = self._db[MENTAL_MODEL_COLLECTION]
         docs = collection.find({
-            "repo_id": repo_id,
+            "repo_name": repo_name,
             "document_type": "POTENTIAL_ENTRY_POINTS"
         })
         return [doc.get("file_path") for doc in docs if doc.get("file_path")]
 
-    def get_repo_summary(self, repo_id: str) -> str:
+    def get_repo_summary(self, repo_name: str) -> str:
         collection = self._db[MENTAL_MODEL_COLLECTION]
         doc = collection.find_one({
-            "repo_id": repo_id,
+            "repo_name": repo_name,
             "document_type": "REPO_SUMMARY"
         })
         return doc.get("data", "") if doc else ""
 
-    def get_brief_file_overviews(self, repo_id: str, file_paths: List[str]) -> List[Dict[str, str]]:
+    def get_brief_file_overviews(self, repo_name: str, file_paths: List[str]) -> List[Dict[str, str]]:
         collection = self._db[MENTAL_MODEL_COLLECTION]
         result = []
 
         for file_path in file_paths:
             doc = collection.find_one(
                 {
-                    "repo_id": repo_id,
+                    "repo_name": repo_name,
                     "document_type": "BRIEF_FILE_OVERVIEW",
                     "file_path": file_path
                 },
@@ -810,11 +797,11 @@ class MyMongoClient:
 
         return result
 
-    def get_brief_file_overview(self, repo_id: str, file_path: str) -> str:
+    def get_brief_file_overview(self, repo_name: str, file_path: str) -> str:
         collection = self._db[MENTAL_MODEL_COLLECTION]
         doc = collection.find_one(
             {
-                "repo_id": repo_id,
+                "repo_name": repo_name,
                 "document_type": "BRIEF_FILE_OVERVIEW",
                 "file_path": file_path
             },
@@ -822,32 +809,41 @@ class MyMongoClient:
         )
         return (doc or {}).get("data", "")
 
-    def get_critical_file_paths(self, repo_id: str) -> List[str]:
+    def delete_brief_file_overview(self, repo_name: str, file_path: str) -> bool:
+        collection = self._db[MENTAL_MODEL_COLLECTION]
+        result = collection.delete_one({
+            "repo_name": repo_name,
+            "document_type": "BRIEF_FILE_OVERVIEW",
+            "file_path": file_path
+        })
+        return result.deleted_count > 0
+
+    def get_critical_file_paths(self, repo_name: str) -> List[str]:
         collection = self._db[MENTAL_MODEL_COLLECTION]
         docs = collection.find({
-            "repo_id": repo_id,
+            "repo_name": repo_name,
             "document_type": "BRIEF_FILE_OVERVIEW"
         })
         return [doc.get("file_path") for doc in docs if doc.get("file_path")]
 
     @with_retry(max_attempts=3, initial_delay=1.0)
-    def delete_repo_data(self, repo_id: str) -> Dict[str, Any]:
+    def delete_repo_data(self, repo_name: str) -> Dict[str, Any]:
         """
         Delete all data for a repository across collections.
 
         Args:
-            repo_id: Repository identifier
+            repo_name: Repository identifier
 
         Returns:
             Dict with deletion summary: {
-                "repo_id": str,
+                "repo_name": str,
                 "collections_processed": int,
                 "total_deleted": int,
                 "duration_ms": float,
             }
 
         Raises:
-            InvalidParameterError: If repo_id is invalid
+            InvalidParameterError: If repo_name is invalid
             QueryError: If deletion fails
 
         Example:
@@ -858,15 +854,15 @@ class MyMongoClient:
         start_time = time.time()
 
         # VALIDATION: Input checking
-        if not repo_id or not isinstance(repo_id, str):
-            raise InvalidParameterError("repo_id must be a non-empty string")
+        if not repo_name or not isinstance(repo_name, str):
+            raise InvalidParameterError("repo_name must be a non-empty string")
 
-        # SECURITY: Sanitize repo_id
-        if any(char in repo_id for char in ['$', '{', '}']):
-            raise InvalidParameterError("repo_id contains invalid characters")
+        # SECURITY: Sanitize repo_name
+        if any(char in repo_name for char in ['$', '{', '}']):
+            raise InvalidParameterError("repo_name contains invalid characters")
 
         try:
-            logger.info("Deleting all data for repo_id: %s", repo_id)
+            logger.info("Deleting all data for repo_name: %s", repo_name)
 
             collections = [
                 CONVERSATIONS_COLLECTION,
@@ -878,32 +874,32 @@ class MyMongoClient:
 
             for coll_name in collections:
                 collection = self._db[coll_name]
-                result = collection.delete_many({"repo_id": repo_id})
+                result = collection.delete_many({"repo_name": repo_name})
                 total_deleted += result.deleted_count
                 logger.info(
-                    "Deleted documents: collection=%s, repo_id=%s, count=%d",
-                    coll_name, repo_id, result.deleted_count
+                    "Deleted documents: collection=%s, repo_name=%s, count=%d",
+                    coll_name, repo_name, result.deleted_count
                 )
 
             # Delete ingestion jobs (uses repo_name field)
             ingest_job_coll = self._db[INGESTION_JOBS_COLLECTION]
-            result = ingest_job_coll.delete_many({"repo_name": repo_id})
+            result = ingest_job_coll.delete_many({"repo_name": repo_name})
             total_deleted += result.deleted_count
             logger.info(
-                "Deleted documents: collection=%s, repo_id=%s, count=%d",
-                INGESTION_JOBS_COLLECTION, repo_id, result.deleted_count
+                "Deleted documents: collection=%s, repo_name=%s, count=%d",
+                INGESTION_JOBS_COLLECTION, repo_name, result.deleted_count
             )
 
             duration_ms = (time.time() - start_time) * 1000
             self._metrics.end_operation(operation, success=True)
 
             logger.info(
-                "Completed repo data deletion: repo_id=%s, total_deleted=%d, duration_ms=%.2f",
-                repo_id, total_deleted, duration_ms
+                "Completed repo data deletion: repo_name=%s, total_deleted=%d, duration_ms=%.2f",
+                repo_name, total_deleted, duration_ms
             )
 
             return {
-                "repo_id": repo_id,
+                "repo_name": repo_name,
                 "collections_processed": len(collections) + 1,
                 "total_deleted": total_deleted,
                 "duration_ms": duration_ms,
@@ -911,48 +907,48 @@ class MyMongoClient:
 
         except Exception as e:
             self._metrics.end_operation(operation, success=False, error=e)
-            logger.error("Failed to delete repo data: repo_id=%s, error=%s", repo_id, str(e))
+            logger.error("Failed to delete repo data: repo_name=%s, error=%s", repo_name, str(e))
             raise QueryError(f"Failed to delete repo data: {str(e)}") from e
 
     @with_retry(max_attempts=3, initial_delay=1.0)
-    def create_conversation(self, repo_id: str) -> dict:
+    def create_conversation(self, repo_name: str) -> dict:
         """
         Create a new conversation for a repository.
 
         Args:
-            repo_id: Repository identifier
+            repo_name: Repository identifier
 
         Returns:
             Dict with conversation details: {
                 "conversation_id": str,
-                "repo_id": str,
+                "repo_name": str,
                 "created_at": datetime,
             }
 
         Raises:
-            InvalidParameterError: If repo_id is invalid
+            InvalidParameterError: If repo_name is invalid
             QueryError: If conversation creation fails
 
         Example:
-            result = client.create_conversation(repo_id="my-repo")
+            result = client.create_conversation(repo_name="my-repo")
             conv_id = result["conversation_id"]
         """
         operation = self._metrics.start_operation("create_conversation")
         start_time = time.time()
 
         # VALIDATION: Input checking
-        if not repo_id or not isinstance(repo_id, str):
-            raise InvalidParameterError("repo_id must be a non-empty string")
+        if not repo_name or not isinstance(repo_name, str):
+            raise InvalidParameterError("repo_name must be a non-empty string")
 
-        # SECURITY: Sanitize repo_id (basic check)
-        if any(char in repo_id for char in ['$', '{', '}']):
-            raise InvalidParameterError("repo_id contains invalid characters")
+        # SECURITY: Sanitize repo_name (basic check)
+        if any(char in repo_name for char in ['$', '{', '}']):
+            raise InvalidParameterError("repo_name contains invalid characters")
 
         try:
             collection = self._db[CONVERSATIONS_COLLECTION]
 
             new_conversation_doc = {
-                "repo_id": repo_id,
+                "repo_name": repo_name,
                 "created_at": now_ts(),
                 "updated_at": now_ts(),
                 "type": "REPO_CHAT",
@@ -964,25 +960,25 @@ class MyMongoClient:
             self._metrics.end_operation(operation, success=True)
 
             logger.info(
-                "Created conversation: conversation_id=%s, repo_id=%s, duration_ms=%.2f",
-                str(result.inserted_id), repo_id, duration_ms
+                "Created conversation: conversation_id=%s, repo_name=%s, duration_ms=%.2f",
+                str(result.inserted_id), repo_name, duration_ms
             )
 
             return {
                 "conversation_id": str(result.inserted_id),
-                "repo_id": repo_id,
+                "repo_name": repo_name,
                 "created_at": new_conversation_doc["created_at"],
             }
 
         except Exception as e:
             self._metrics.end_operation(operation, success=False, error=e)
-            logger.error("Failed to create conversation: repo_id=%s, error=%s", repo_id, str(e))
+            logger.error("Failed to create conversation: repo_name=%s, error=%s", repo_name, str(e))
             raise QueryError(f"Failed to create conversation: {str(e)}") from e
     
     def list_conversations(
         self,
         *,
-        repo_id: Optional[str] = None,
+        repo_name: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
@@ -990,10 +986,10 @@ class MyMongoClient:
         offset = max(0, offset)
 
         query: dict[str, Any] = {}
-        if repo_id:
-            query["repo_id"] = repo_id
+        if repo_name:
+            query["repo_name"] = repo_name
 
-        projection = {"title": 1, "repo_id": 1, "created_at": 1, "updated_at": 1}
+        projection = {"title": 1, "repo_name": 1, "created_at": 1, "updated_at": 1}
 
         cursor = (
             self._db[CONVERSATIONS_COLLECTION]
@@ -1007,11 +1003,11 @@ class MyMongoClient:
     
     def add_ingested_repo(self, repo_name: str, job_id: str):
         collection = self._db[INGESTED_REPOS_COLLECTION]
-        existing = collection.find_one({"repo_id": repo_name})
+        existing = collection.find_one({"repo_name": repo_name})
         if existing:
             logger.info(f"Repo '{repo_name}' already marked as ingested.")
             return
-        collection.insert_one({"repo_id": repo_name, "job_id": job_id, "ingested_at": datetime.now(timezone.utc).isoformat()})
+        collection.insert_one({"repo_name": repo_name, "job_id": job_id, "ingested_at": datetime.now(timezone.utc).isoformat()})
         logger.info(f"Marked repo '{repo_name}' as ingested.")
 
     def upsert_ingestion_job(
@@ -1115,7 +1111,7 @@ class MyMongoClient:
     def list_ingested_repos(self) -> List[str]:
         collection = self._db[INGESTED_REPOS_COLLECTION]
         docs = collection.find({})
-        return [doc.get("repo_id") for doc in docs if doc.get("repo_id")]
+        return [doc.get("repo_name") for doc in docs if doc.get("repo_name")]
 
     def conversation_exists(self, conversation_id: str) -> bool:
         try:
@@ -1172,7 +1168,7 @@ class MyMongoClient:
     
     def is_repo_ingested(self, repo_name: str) -> bool:
         collection = self._db[INGESTED_REPOS_COLLECTION]
-        doc = collection.find_one({"repo_id": repo_name}, {"_id": 1})
+        doc = collection.find_one({"repo_name": repo_name}, {"_id": 1})
         return doc is not None
     
     def is_repo_being_ingested(self, repo_name: str) -> bool:

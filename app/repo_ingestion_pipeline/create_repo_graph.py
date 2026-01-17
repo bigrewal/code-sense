@@ -63,13 +63,13 @@ class CreateRepoGraphStage():
         # File content cache for definition-name extraction
         self._file_content_cache: Dict[str, List[str]] = {}
 
-    async def run(self, local_path: Path, repo_id: str) -> None:
+    async def run(self, local_path: Path, repo_name: str) -> None:
         """
         Process AST and create graph in Neo4j.
 
         Args:
             local_path: path to local repo checkout
-            repo_id: repo identifier
+            repo_name: repo identifier
         """
         conn = None
 
@@ -77,10 +77,10 @@ class CreateRepoGraphStage():
 
             repo_path = local_path
 
-            logger.info("Job %s: Starting AST processing for repository: %s", self.job_id, repo_id)
+            logger.info("Job %s: Starting AST processing for repository: %s", self.job_id, repo_name)
 
             # Clear existing graph state for this repo
-            await self.neo4j_client.init_graph_for_repo(repo_id)
+            await self.neo4j_client.init_graph_for_repo(repo_name)
 
             # Discover code files
             code_files = await self._discover_code_files(repo_path)
@@ -106,7 +106,7 @@ class CreateRepoGraphStage():
 
             for idx, code_file in enumerate(file_iter, 1):
                 nodes, edges = await self._process_file_ast(
-                    code_file, repo_id, global_leaf_lookup
+                    code_file, repo_name, global_leaf_lookup
                 )
                 all_nodes.extend(nodes)
                 all_edges.extend(edges)
@@ -189,7 +189,7 @@ class CreateRepoGraphStage():
                 )
 
             for chunk in self._chunk_list(nodes_to_write, 5000):
-                await self.neo4j_client.batch_create_nodes(chunk, repo_id)
+                await self.neo4j_client.batch_create_nodes(chunk, repo_name)
                 if nodes_bar:
                     nodes_bar.update(len(chunk))
 
@@ -206,7 +206,7 @@ class CreateRepoGraphStage():
                 )
 
             for chunk in self._chunk_list(edges_to_write, 5000):
-                await self.neo4j_client.batch_create_edges(chunk, repo_id)
+                await self.neo4j_client.batch_create_edges(chunk, repo_name)
                 if edges_bar:
                     edges_bar.update(len(chunk))
 
@@ -276,7 +276,7 @@ class CreateRepoGraphStage():
             self._parsers[language] = parser
         return parser
 
-    async def _process_file_ast(self, code_file: CodeFile, repo_id: str,
+    async def _process_file_ast(self, code_file: CodeFile, repo_name: str,
                                 global_leaf_lookup: dict) -> tuple[List[ASTNode], List[dict]]:
         """Process a single file and create AST nodes and edges."""
         try:
@@ -296,7 +296,7 @@ class CreateRepoGraphStage():
             while node_queue:
                 current_node, parent_id, edge_seq = node_queue.popleft()
 
-                node_id = f"{repo_id}:{code_file.relative_path}:{current_node.start_point[0]}:{current_node.start_point[1]}:{current_node.type}"
+                node_id = f"{repo_name}:{code_file.relative_path}:{current_node.start_point[0]}:{current_node.start_point[1]}:{current_node.type}"
 
                 ast_node = ASTNode(
                     node_id=node_id,

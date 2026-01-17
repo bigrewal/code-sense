@@ -78,25 +78,25 @@ class ChatRequest(BaseModel):
     message: str
 
 class StatelessChatRequest(BaseModel):
-    repo_id: str
+    repo_name: str
     message: str
 
 class ErrorResponse(BaseModel):
     detail: str
 
 class ConversationCreateRequest(BaseModel):
-    repo_id: str
+    repo_name: str
 
 
 class ConversationCreateResponse(BaseModel):
     conversation_id: str
-    repo_id: str
+    repo_name: str
     created_at: datetime
 
 
 class ConversationSummary(BaseModel):
     conversation_id: str
-    repo_id: str
+    repo_name: str
     created_at: datetime
     updated_at: Optional[datetime] = None
     title: Optional[str] = None
@@ -124,18 +124,18 @@ async def create_conversation(req: ConversationCreateRequest):
     """
     mongo = get_mongo_client()
 
-    result = mongo.create_conversation(repo_id=req.repo_id)
+    result = mongo.create_conversation(repo_name=req.repo_name)
 
     return ConversationCreateResponse(
         conversation_id=result["conversation_id"],
-        repo_id=result["repo_id"],
+        repo_name=result["repo_name"],
         created_at=result["created_at"],
     )
 
 
 @app.get("/conversations", response_model=List[ConversationSummary])
 async def list_conversations(
-    repo_id: Optional[str] = None,
+    repo_name: Optional[str] = None,
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ):
@@ -143,7 +143,7 @@ async def list_conversations(
 
     docs = await asyncio.to_thread(
         mongo.list_conversations,
-        repo_id=repo_id,
+        repo_name=repo_name,
         limit=limit,
         offset=offset,
     )
@@ -151,7 +151,7 @@ async def list_conversations(
     return [
         ConversationSummary(
             conversation_id=str(d["_id"]),
-            repo_id=d.get("repo_id"),
+            repo_name=d.get("repo_name"),
             created_at=d.get("created_at"),
             updated_at=d.get("updated_at"),
             title=d.get("title"),
@@ -219,13 +219,13 @@ async def chat(req: ChatRequest):
 
 @app.post("/stateless/chat", responses={400: {"model": ErrorResponse}})
 async def stateless_chat(req: StatelessChatRequest):
-    if not req.repo_id:
-        raise HTTPException(status_code=400, detail="repo_id is required")
+    if not req.repo_name:
+        raise HTTPException(status_code=400, detail="repo_name is required")
     if not req.message:
         raise HTTPException(status_code=400, detail="message is required")
 
     return StreamingResponse(
-        stateless_stream_chat(repo_id=req.repo_id, user_message=req.message),
+        stateless_stream_chat(repo_name=req.repo_name, user_message=req.message),
         media_type="text/markdown",
     )
 
@@ -242,32 +242,27 @@ async def ingest_repo(
 
     # Validate repos exist and build paths
     repo_paths: List[Path] = []
-    repo_full_names: List[str] = []
+    repo_names: List[str] = []
     mongo = get_mongo_client()
     for r in repos:
         logger.info(f"Processing repo for ingestion: {r}")
         local_repo_path = get_repo_path(r)
         if not local_repo_path.exists():
             raise HTTPException(status_code=404, detail=f"Repository not found: {local_repo_path}")
-        
-        # Check if the repo has already been ingested
-        repo_full_name = get_repo_dir(r)
-        if mongo.is_repo_ingested(repo_full_name) or mongo.is_repo_being_ingested(repo_full_name):
-            raise HTTPException(status_code=400, detail=f"Repository already ingested or being ingested: {r}")
 
         repo_paths.append(local_repo_path)
-        repo_full_names.append(repo_full_name)
+        repo_names.append(r)
 
     # Multiple repos: create batch + queued jobs, run sequentially in ONE task
     batch_id = str(uuid4())
     jobs = []
 
-    for idx, (path, full_name) in enumerate(zip(repo_paths, repo_full_names)):
+    for idx, (path, repo_name) in enumerate(zip(repo_paths, repo_names)):
         job_id = str(uuid4())
 
         job = IngestionJobStatus(
             job_id=job_id,
-            repo_name=full_name,
+            repo_name=repo_name,
             status="queued",
             current_stage=IngestionStage.PRECHECK,
             stage_status={
@@ -279,7 +274,7 @@ async def ingest_repo(
         )
 
         mongo.upsert_ingestion_job(job, extra_fields={"batch_id": batch_id, "batch_index": idx})
-        jobs.append({"job_id": job_id, "repo_name": full_name, "status": "queued", "batch_index": idx})
+        jobs.append({"job_id": job_id, "repo_name": repo_name, "status": "queued", "batch_index": idx})
 
     background_tasks.add_task(run_batch_sequentially, batch_id=batch_id)
 
@@ -298,7 +293,7 @@ async def run_batch_sequentially(batch_id: str):
     for job_doc in jobs:
         job_id = job_doc["job_id"]
         repo_name = job_doc["repo_name"]
-        local_repo_path = Path(repo_name)
+        local_repo_path = get_repo_path(repo_name)
 
         # If user aborted while queued, mark and skip
         if mongo.is_abort_requested(job_id):
@@ -329,9 +324,9 @@ async def run_batch_sequentially(batch_id: str):
             continue
 
 @app.delete("/repos", responses={404: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
-async def delete_repo(repo_path: str, delete_files: bool = False):
+async def delete_repo(repo_name: str, delete_files: bool = False):
     """Delete a code repository and its associated data."""
-    local_repo_path = Path(repo_path)
+    local_repo_path = get_repo_path(repo_name)
 
     if not local_repo_path.exists():
         raise HTTPException(status_code=404, detail=f"Repository not found: {local_repo_path}")
@@ -349,13 +344,12 @@ async def delete_repo(repo_path: str, delete_files: bool = False):
     mongo = get_mongo_client()
 
     try:
-        mongo.delete_repo_data(repo_path)
+        mongo.delete_repo_data(repo_name)
     except Exception as exc:
         logger.exception("Failed to delete repo documents", exc_info=exc)
         raise HTTPException(status_code=500, detail="Failed to delete repo data")
 
-    return {"message": f"Repository {repo_path} and its data have been deleted."}
-
+    return {"message": f"Repository {repo_name} and its data have been deleted."}
 
 @app.get("/status/batch/{batch_id}")
 async def get_batch_status(batch_id: str):

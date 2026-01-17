@@ -120,6 +120,18 @@ class Cache:
             (self.namespace, rel_path, sha1, int(time.time())),
         )
 
+    def get_all_cached_file_paths(self) -> Set[str]:
+        """Returns all file paths stored in the cache for this namespace."""
+        cur = self.conn.execute("SELECT path FROM files WHERE namespace = ?", (self.namespace,))
+        return {row[0] for row in cur.fetchall()}
+
+    def delete_file_completely(self, rel_path: str):
+        """Remove all cache data for a deleted file from all tables."""
+        self.conn.execute("DELETE FROM files WHERE namespace = ? AND path = ?", (self.namespace, rel_path))
+        self.conn.execute("DELETE FROM mappings WHERE namespace = ? AND ref_path = ?", (self.namespace, rel_path))
+        self.conn.execute("DELETE FROM def_index WHERE namespace = ? AND (ref_path = ? OR def_path = ?)",
+                         (self.namespace, rel_path, rel_path))
+
     # ---------- mappings (per reference) ----------
 
     def delete_mappings_for_file(self, rel_path: str):

@@ -39,7 +39,7 @@ class FileSelectionResponse(BaseModel):
 # ---------------------------
 
 async def stream_chat(conversation_id: str, user_message: str):
-    # 1) Look up conversation to get repo_id
+    # 1) Look up conversation to get repo_name
     conv = await asyncio.to_thread(conversations_col.find_one, {"_id": ObjectId(conversation_id)})
     if not conv:
         # You could also raise an HTTPException at the route level,
@@ -47,7 +47,7 @@ async def stream_chat(conversation_id: str, user_message: str):
         yield "Conversation not found.\n"
         return
 
-    repo_id = conv["repo_id"]
+    repo_name = conv["repo_name"]
 
     # 3) Load previous messages for this conversation
     history_cursor = messages_col.find(
@@ -72,7 +72,7 @@ async def stream_chat(conversation_id: str, user_message: str):
         }
     )
 
-    rephrased_user_question = await get_rephrased_question(messages=messages_for_llm, repo_id=repo_id)
+    rephrased_user_question = await get_rephrased_question(messages=messages_for_llm, repo_name=repo_name)
     print(f"Rephrased question: {rephrased_user_question}")
 
     now = datetime.now(timezone.utc)
@@ -88,7 +88,7 @@ async def stream_chat(conversation_id: str, user_message: str):
 
     # 6) Stream assistant reply, capturing content so we can save it at the end
     captured: List[str] = []
-    async for chunk in stream_answer(user_question=rephrased_user_question, repo_id=repo_id):
+    async for chunk in stream_answer(user_question=rephrased_user_question, repo_name=repo_name):
         captured.append(chunk)
         yield chunk
 
@@ -105,13 +105,13 @@ async def stream_chat(conversation_id: str, user_message: str):
     )
 
 
-async def stateless_stream_chat(repo_id: str, user_message: str):
+async def stateless_stream_chat(repo_name: str, user_message: str):
     """
-    Stream a reply for a given repo_id and user message, ChatGPT-style.
+    Stream a reply for a given repo_name and user message, ChatGPT-style.
     """
     async for chunk in stream_answer(
         user_question=user_message,
-        repo_id=repo_id
+        repo_name=repo_name
     ):
         yield chunk
 
@@ -119,21 +119,21 @@ async def stateless_stream_chat(repo_id: str, user_message: str):
 # Internal helpers
 # ---------------------------
 
-async def get_rephrased_question(messages: List[Dict[str, str]], repo_id: str):
+async def get_rephrased_question(messages: List[Dict[str, str]], repo_name: str):
     # If it's the first user message, no rephrasing needed
     if len(messages) <= 2:
         return messages[-1]["content"]
     
-    system_prompt = f"""You are a question rephraser. Your ONLY job is to rephrase the last user message into a standalone question.
+    system_prompt = f"""You are a message rephraser. Your ONLY job is to rephrase the last user message into a standalone message.
 
-        REPOSITORY ID: {repo_id}
+        REPOSITORY NAME: {repo_name}
 
         CRITICAL RULES:
-        - Output ONLY the rephrased question - nothing else
-        - Do NOT answer the question
+        - Output ONLY the rephrased message - nothing else
+        - Do NOT answer the message
         - Do NOT provide information about the codebase
         - Do NOT say whether something exists or not
-        - JUST rephrase the question to be self-contained
+        - JUST rephrase the message to be self-contained
 
         Resolve pronouns and references using conversation context, but do not add any analysis or answers."""
 
@@ -155,7 +155,7 @@ async def get_rephrased_question(messages: List[Dict[str, str]], repo_id: str):
     )
 
 
-async def stream_answer(user_question: str, repo_id: str):
+async def stream_answer(user_question: str, repo_name: str):
 
     async def _select_files_for_query(
         repo_context: str,
@@ -178,7 +178,7 @@ async def stream_answer(user_question: str, repo_id: str):
         Your task is to decide WHICH repository files (if any) must be examined in full
         in order to accurately answer a user's question about the codebase.
 
-        REPOSITORY ID: {repo_id}
+        REPOSITORY NAME: {repo_name}
 
         AVAILABLE CONTEXT
         ────────────────────────────────────────────
@@ -287,7 +287,7 @@ async def stream_answer(user_question: str, repo_id: str):
         """
 
         user_prompt = f"""
-            CODE REPOSITORY NAME: {repo_id}
+            REPOSITORY NAME: {repo_name}
 
             FILE SUMMARIES:
             {repo_context}
@@ -394,7 +394,7 @@ async def stream_answer(user_question: str, repo_id: str):
 
     arch_doc = await asyncio.to_thread(
         mental_model_col.find_one,
-        {"repo_id": repo_id, "document_type": "REPO_CONTEXT"},
+        {"repo_name": repo_name, "document_type": "REPO_CONTEXT"},
         {"_id": 0, "context": 1},
     )
     repo_context = (arch_doc or {}).get("context", "")

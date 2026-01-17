@@ -39,7 +39,7 @@ PROMPT_SYSTEM = (
 
 PROMPT_USER_TEMPLATE = """
 Repository:
-{repo_id}
+{repo_name}
 
 File:
 {file_path}
@@ -81,21 +81,21 @@ class MentalModelStage:
         self.batch_size = int(config.get("batch_size", 20))
         self.max_concurrency = int(config.get("max_concurrency", 10))
 
-    async def run(self, repo_id: str, local_repo_path: Path):
+    async def run(self, repo_name: str, local_repo_path: Path):
         self.neo4j_client: Neo4jClient = get_neo4j_client()
-        logger.info("Job %s: starting mental model generation for %s", self.job_id, repo_id)
+        logger.info("Job %s: starting mental model generation for %s", self.job_id, repo_name)
 
         try:
-            dir_tree = self._build_dir_tree(repo_id)
-            critical_files, ignored_files = await self.identify_critical_files(dir_tree, repo_id)
+            dir_tree = self._build_dir_tree(repo_name)
+            critical_files, ignored_files = await self.identify_critical_files(dir_tree, repo_name)
             logger.info(
                 "Job %s: generated overview with %s insights, ignored %s files",
                 self.job_id,
                 len(critical_files),
                 len(ignored_files),
             )
-            await self._set_potential_entry_points(critical_files, repo_id)
-            repo_context_token_count = await self.create_repo_context(repo_id)
+            await self._set_potential_entry_points(critical_files, repo_name)
+            repo_context_token_count = await self.create_repo_context(repo_name)
 
             return len(critical_files), len(ignored_files), repo_context_token_count
 
@@ -104,7 +104,7 @@ class MentalModelStage:
             traceback.print_exc()
             raise e
 
-    async def _set_potential_entry_points(self, insights: List[dict], repo_id: str) -> List[str]:
+    async def _set_potential_entry_points(self, insights: List[dict], repo_name: str) -> List[str]:
         """Get potential entry points for the repo based on insights."""
         potential_entry_points = set()
         insights_files = {i.get("file_path") for i in insights if i.get("file_path")}
@@ -128,7 +128,7 @@ class MentalModelStage:
         # Add potential entry points to the DB
         for file_path in potential_entry_points:
             document = {
-                "repo_id": repo_id,
+                "repo_name": repo_name,
                 "file_path": file_path,
                 "document_type": MENTAL_MODEL_TYPES["ENTRY"],
             }
@@ -136,7 +136,7 @@ class MentalModelStage:
 
         return sorted(list(potential_entry_points))
 
-    async def identify_critical_files(self, dir_tree: List[str], repo_id: str) -> Tuple[List[Dict[str, str]], Set[str]]:
+    async def identify_critical_files(self, dir_tree: List[str], repo_name: str) -> Tuple[List[Dict[str, str]], Set[str]]:
         """Generate a comprehensive overview of the repo by summarizing critical files, ignoring non-critical ones."""
 
         semaphore = asyncio.Semaphore(self.max_concurrency)
@@ -144,7 +144,7 @@ class MentalModelStage:
         async def summarize_file(file_path: str) -> tuple[str, str]:
             cached = self.mental_model_collection.find_one(
                 {
-                    "repo_id": repo_id,
+                    "repo_name": repo_name,
                     "file_path": file_path,
                     "document_type": {"$in": [MENTAL_MODEL_TYPES["BRIEF"], MENTAL_MODEL_TYPES["IGNORED"]]},
                 },
@@ -161,7 +161,7 @@ class MentalModelStage:
 
             cfi = self.neo4j_client.cross_file_interactions_in_file(
                 file_path=file_path,
-                repo_id=repo_id,
+                repo_name=repo_name,
             )
 
             downstream_info = cfi.get("downstream", {}) or {}
@@ -181,7 +181,7 @@ class MentalModelStage:
             downstream_block = "\n".join(f"- {i}" for i in (downstream_interactions or [])) or "—"
 
             user_prompt = PROMPT_USER_TEMPLATE.format(
-                repo_id=repo_id,
+                repo_name=repo_name,
                 file_path=file_path,
                 code=code,
                 upstream=upstream_block,
@@ -213,7 +213,7 @@ class MentalModelStage:
                     ignored.add(fp)
                     self._upsert_document(
                         {
-                            "repo_id": repo_id,
+                            "repo_name": repo_name,
                             "file_path": fp,
                             "document_type": MENTAL_MODEL_TYPES["IGNORED"],
                             "data": "IGNORE",
@@ -223,7 +223,7 @@ class MentalModelStage:
                     insights.append({"file_path": fp, "summary": summary})
                     self._upsert_document(
                         {
-                            "repo_id": repo_id,
+                            "repo_name": repo_name,
                             "file_path": fp,
                             "document_type": MENTAL_MODEL_TYPES["BRIEF"],
                             "data": summary,
@@ -236,7 +236,7 @@ class MentalModelStage:
 
         for insight in insights:
             file_path = insight["file_path"]
-            dependency_info = self._cross_file_interactions_in_file(file_path, repo_id)
+            dependency_info = self._cross_file_interactions_in_file(file_path, repo_name)
             insight["downstream_dep_interactions"] = dependency_info["downstream"]["interactions"]
             insight["downstream_dep_files"] = list(dependency_info["downstream"]["files"])
             insight["upstream_dep_interactions"] = dependency_info["upstream"]["interactions"]
@@ -244,50 +244,53 @@ class MentalModelStage:
 
         return insights, ignored
 
-    async def create_repo_context(self, repo_id: str) -> int:
-        critical_files = set(self.mongo_client.get_critical_file_paths(repo_id))
+    async def create_repo_context(self, repo_name: str) -> int:
+        critical_files = set(self.mongo_client.get_critical_file_paths(repo_name))
         context_parts: list[str] = []
 
         for file_path in critical_files:
-            brief = self.mongo_client.get_brief_file_overview(repo_id, file_path)
+            brief = self.mongo_client.get_brief_file_overview(repo_name, file_path)
             if brief:
                 context_parts.append(brief)
 
         repo_context = "\n\n".join(context_parts)
-        repo_context_token_count = self.llm.count_tokens(repo_context)
-        # Store as REPO_CONTEXT document
+        repo_context_token_count = self.llm_client.count_tokens(repo_context)
+
         doc = {
-            "repo_id": repo_id,
+            "repo_name": repo_name,
             "document_type": "REPO_CONTEXT",
             "context": repo_context,
         }
-        self.mental.update_one(
-            {"repo_id": repo_id, "document_type": "REPO_CONTEXT"},
+        self.mental_model_collection.update_one(
+            {
+                "repo_name": repo_name,
+                "document_type": "REPO_CONTEXT",
+            },
             {"$set": doc},
             upsert=True,
         )
 
         return repo_context_token_count
 
-    def _build_dir_tree(self, repo_id: str) -> List[str]:
+    def _build_dir_tree(self, repo_name: str) -> List[str]:
         """Build a nested dict representing the directory tree from file paths in Neo4j or MongoDB."""
         # Query Neo4j for all unique file_paths
         query = """
-        MATCH (n:ASTNode {repo_id: $repo_id})
+        MATCH (n:ASTNode {repo_name: $repo_name})
         RETURN DISTINCT n.file_path AS file_path
         """
         with self.neo4j_client.driver.session() as session:
-            result = session.run(query, repo_id=repo_id)
+            result = session.run(query, repo_name=repo_name)
             file_paths = [record["file_path"] for record in result]
         
         return file_paths
 
-    def _cross_file_interactions_in_file(self, file_path: str, repo_id: str):
+    def _cross_file_interactions_in_file(self, file_path: str, repo_name: str):
         """Infer cross-file interactions for a given file by finding references to and from definitions in other files."""
 
         # Downstream: file_path → other files
         downstream_query = """
-        MATCH (ref:ASTNode {repo_id: $repo_id, file_path: $file_path, is_reference: true})
+        MATCH (ref:ASTNode {repo_name: $repo_name, file_path: $file_path, is_reference: true})
         -[:REFERENCES]->(ident:ASTNode)
         WHERE ident.file_path <> $file_path
         MATCH (def:ASTNode)
@@ -297,7 +300,7 @@ class MentalModelStage:
 
         # Upstream: other files → file_path
         upstream_query = """
-        MATCH (ref:ASTNode {repo_id: $repo_id, is_reference: true})
+        MATCH (ref:ASTNode {repo_name: $repo_name, is_reference: true})
         -[:REFERENCES]->(ident:ASTNode {file_path: $file_path})
         MATCH (def:ASTNode)
         WHERE def.node_id = ident.parent_id
@@ -306,7 +309,7 @@ class MentalModelStage:
 
         with self.neo4j_client.driver.session() as session:
             # Downstream
-            downstream_result = list(session.run(downstream_query, repo_id=repo_id, file_path=file_path))
+            downstream_result = list(session.run(downstream_query, repo_name=repo_name, file_path=file_path))
             downstream_interactions = [
                 f"{record['ref_name']} REFERENCES {record['node_type']} IN {record['def_file_path']}"
                 for record in downstream_result
@@ -316,7 +319,7 @@ class MentalModelStage:
             }
 
             # Upstream
-            upstream_result = list(session.run(upstream_query, repo_id=repo_id, file_path=file_path))
+            upstream_result = list(session.run(upstream_query, repo_name=repo_name, file_path=file_path))
             upstream_interactions = [
                 f"{record['ref_name']} IN {record['ref_file_path']} REFERENCES {record['node_type']} IN {file_path}"
                 for record in upstream_result
@@ -340,7 +343,7 @@ class MentalModelStage:
         """Persist a mental model document via upsert."""
         self.mental_model_collection.update_one(
             {
-                "repo_id": document["repo_id"],
+                "repo_name": document["repo_name"],
                 "file_path": document["file_path"],
                 "document_type": document["document_type"],
             },

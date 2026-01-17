@@ -14,9 +14,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 class CodeAnalyzer:
     ANALYZERS = {"scala": ScalaAnalyzer, "python": PythonAnalyzer, "java": JavaAnalyzer, "rust": RustAnalyzer}
 
-    def __init__(self, repo: Path, repo_id: str, job_id: str):
+    def __init__(self, repo: Path, repo_name: str, job_id: str):
         self.repo = repo.resolve()
-        self.base_repo_path = repo_id
+        self.base_repo_path = repo_name
         self.job_id = job_id
 
     def detect(self):

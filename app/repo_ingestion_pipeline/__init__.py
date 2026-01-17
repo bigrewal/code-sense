@@ -142,7 +142,7 @@ async def start_ingestion_pipeline(
         )
 
         await CodeAnalyzer(
-            repo=local_repo_path, repo_id=repo_name, job_id=job_id
+            repo=local_repo_path, repo_name=repo_name, job_id=job_id
         ).analyze()
 
         mongo.upsert_ingestion_job(
@@ -194,7 +194,7 @@ async def start_ingestion_pipeline(
 
         await CreateRepoGraphStage(job_id=job_id).run(
             local_path=local_repo_path,
-            repo_id=repo_name,
+            repo_name=repo_name,
         )
 
         mongo.upsert_ingestion_job(
@@ -245,7 +245,7 @@ async def start_ingestion_pipeline(
         )
 
         critical_file_count, ignored_files_count, repo_context_token_count = await MentalModelStage(llm_grok=llm, config={"job_id": job_id}).run(
-            repo_id=repo_name,
+            repo_name=repo_name,
             local_repo_path=local_repo_path,
         )
 
