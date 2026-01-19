@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 if Path(".env.local").exists():
     # Optional local-only overrides; production should rely on env vars.
@@ -104,6 +104,18 @@ class Config:
 
     # Disable query logging in production for security
     LOG_DB_QUERIES: bool = os.getenv("LOG_DB_QUERIES", "false").lower() == "true"
+
+    # CORS allowed origins
+    ALLOWED_ORIGINS: List[str] = os.getenv(
+        "ALLOWED_ORIGINS",
+        "http://localhost:3000,http://localhost:8000"
+    ).split(",")
+
+    # ========== Timeout Configuration ==========
+
+    DB_OPERATION_TIMEOUT: int = int(os.getenv("DB_OPERATION_TIMEOUT", "30"))  # 30s
+    LLM_OPERATION_TIMEOUT: int = int(os.getenv("LLM_OPERATION_TIMEOUT", "120"))  # 2 min
+    STREAMING_TIMEOUT: int = int(os.getenv("STREAMING_TIMEOUT", "300"))  # 5 min
 
 
 def validate_required_settings() -> None:
