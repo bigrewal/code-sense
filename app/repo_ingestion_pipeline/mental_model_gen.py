@@ -30,9 +30,9 @@ PROMPT_SYSTEM = (
     "- configuration-only or boilerplate with no domain logic\n"
     "- thin wrappers with no meaningful behavior\n\n"
     "If the file is NOT critical, output exactly: IGNORE\n\n"
-    "If the file IS critical, write a concise 1–4 sentence, plain-English description that explains:\n"
-    "- what the file defines\n"
-    "- its main responsibility\n"
+    "If the file IS critical, write a concise and accurate summary that explains:\n"
+    "- the files main purpose\n"
+    "- its main components and what they do\n"
     "- how it interacts with other important files or components\n\n"
     "Do not quote code. Do not explain your reasoning. Do not add extra commentary."
 )
@@ -56,10 +56,10 @@ Downstream dependencies (what this file calls or uses):
 Instructions:
 - Decide whether this file is CRITICAL to the repository’s core functionality.
 - If NOT critical, output exactly: IGNORE
-- If CRITICAL, write 1–4 concise sentences in plain English.
+- If CRITICAL, write a concise and accurate summary.
 
 Preferred format for critical files:
-"`{file_path}` defines <key components> that <primary responsibility>. "
+"`{file_path}` <main purpose>. It defines <key components> that <primary responsibility>. "
 "It works with <other files or modules> to <explain the interaction or flow>."
 
 Output rules:
