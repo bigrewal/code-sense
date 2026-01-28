@@ -2,6 +2,15 @@
 MATCH (n)-[r]-() DELETE r
 MATCH (n) DELETE n
 
+CALL apoc.periodic.commit(
+  "MATCH (n:ASTNode)
+   WHERE n.repo_name = 'astropy'
+   WITH n LIMIT 10000
+   DETACH DELETE n
+   RETURN count(n)"
+);
+
+
 CALL {
   MATCH ()-[r]-()
   RETURN r

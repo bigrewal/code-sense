@@ -11,6 +11,7 @@ if Path(".env.local").exists():
 
 class Config:
     XAI_API_KEY = os.getenv("XAI_API_KEY")
+    VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY")
     GROK_4_NON_REASONING_MODEL = "grok-4-1-fast-non-reasoning"
     GROK_4_REASONING_MODEL = "grok-4-1-fast-reasoning"
     LLM_TEMPERATURE = 0.7
@@ -53,6 +54,24 @@ class Config:
         ".java": "java",
         ".scala": "scala",
         ".rs": "rust",
+    }
+
+    LANGUAGE_DEFINITION_MAP: dict = {
+        "python": {"function_definition", "class_definition", "assignment"},
+        "rust": {
+            "struct_item", "enum_item", "union_item", "type_item",
+            "function_item", "trait_item", "mod_item", "macro_definition"
+        },
+        "scala": {
+            "package_clause", "trait_definition", "enum_definition",
+            "simple_enum_case", "full_enum_case", "class_definition",
+            "object_definition", "function_definition", "val_definition",
+            "given_definition", "var_definition", "val_declaration",
+            "var_declaration", "type_definition", "class_parameter"
+        },
+        "java": {
+            "class_declaration", "method_declaration", "interface_declaration"
+        }
     }
 
     min_supported_cov_ratio: float = 0.5
@@ -108,7 +127,7 @@ class Config:
     # CORS allowed origins
     ALLOWED_ORIGINS: List[str] = os.getenv(
         "ALLOWED_ORIGINS",
-        "http://localhost:3000,http://localhost:8000"
+        "http://localhost:5173,http://localhost:8000"
     ).split(",")
 
     # ========== Timeout Configuration ==========

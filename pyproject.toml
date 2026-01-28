@@ -18,6 +18,8 @@ dependencies = [
     "tree-sitter-languages==1.10.2",
     "uvicorn>=0.35.0",
     "xai-sdk>=1.4.0",
+    "chromadb>=0.4.0",
+    "voyageai>=0.3.0",
 ]
 
 [project.optional-dependencies]

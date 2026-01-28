@@ -13,6 +13,7 @@ import json
 
 from .db import get_mongo_client
 from .llm_grok import GrokLLM
+from .contextual_retrieval import ContextualRetrieval
 
 MENTAL_MODEL_COL = "mental_model"
 CONVERSATIONS_COL = "conversations"
@@ -159,6 +160,7 @@ async def stream_answer(user_question: str, repo_name: str):
 
     async def _select_files_for_query(
         repo_context: str,
+        chunk_context: str = "",
     ) -> List[Dict[str, str]]:
         """
         Ask Grok to identify which files need to be fetched to answer the user's question.
@@ -172,6 +174,13 @@ async def stream_answer(user_question: str, repo_name: str):
         Returns empty list if summaries alone can answer the question or on parse failure.
         """
         
+        chunk_section = f"""
+        RELEVANT CODE CHUNKS (from semantic search):
+        ────────────────────────────────────────────
+        {chunk_context.strip()}
+        ────────────────────────────────────────────
+        """ if chunk_context else ""
+
         system_prompt = f"""
         You are a senior codebase analysis agent.
 
@@ -185,6 +194,7 @@ async def stream_answer(user_question: str, repo_name: str):
         FILE SUMMARIES (may be incomplete or lossy):
         {repo_context.strip()}
         ────────────────────────────────────────────
+        {chunk_section}
 
         TASK
         ────────────────────────────────────────────
@@ -399,8 +409,16 @@ async def stream_answer(user_question: str, repo_name: str):
     )
     repo_context = (arch_doc or {}).get("context", "")
 
-    # Stage 1: Find out if we need to fetch code of various files to answer the question 
-    additional_info_required: List[Dict[str, str]] = await _select_files_for_query(repo_context=repo_context)
+    # Stage 0: Vector search for relevant code chunks
+    retrieval = ContextualRetrieval(repo_name)
+    relevant_chunks = retrieval.search(user_question, n=20)
+    chunk_context = "\n".join([
+        f"[{c['file_path']}]: {c['content']}..."
+        for c in relevant_chunks
+    ]) if relevant_chunks else ""
+
+    # Stage 1: Find out if we need to fetch code of various files to answer the question
+    additional_info_required: List[Dict[str, str]] = await _select_files_for_query(repo_context=repo_context, chunk_context=chunk_context)
     
 
     # Stage 2: Fetch the information required 

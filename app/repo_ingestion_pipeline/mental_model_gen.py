@@ -8,6 +8,7 @@ from tqdm import tqdm
 
 from ..db import Neo4jClient, get_mongo_client, get_neo4j_client
 from ..llm_grok import GrokLLM
+from ..contextual_retrieval import ContextualRetrieval
 
 logger = logging.getLogger(__name__)
 
@@ -140,8 +141,15 @@ class MentalModelStage:
         """Generate a comprehensive overview of the repo by summarizing critical files, ignoring non-critical ones."""
 
         semaphore = asyncio.Semaphore(self.max_concurrency)
+        retrieval = ContextualRetrieval(repo_name)
 
-        async def summarize_file(file_path: str) -> tuple[str, str]:
+        async def summarize_file(file_path: str) -> tuple[str, str, str | None]:
+            try:
+                code = Path(file_path).read_text(encoding="utf-8")
+            except Exception:
+                logger.warning("Job %s: unable to read %s; marking ignored", self.job_id, file_path)
+                return file_path, "IGNORE", None
+
             cached = self.mental_model_collection.find_one(
                 {
                     "repo_name": repo_name,
@@ -151,13 +159,7 @@ class MentalModelStage:
                 {"_id": 0, "data": 1},
             )
             if cached:
-                return file_path, cached["data"]
-
-            try:
-                code = Path(file_path).read_text(encoding="utf-8")
-            except Exception:
-                logger.warning("Job %s: unable to read %s; marking ignored", self.job_id, file_path)
-                return file_path, "IGNORE"
+                return file_path, cached["data"], code
 
             cfi = self.neo4j_client.cross_file_interactions_in_file(
                 file_path=file_path,
@@ -194,7 +196,7 @@ class MentalModelStage:
                     system_prompt=PROMPT_SYSTEM,
                     temperature=0.0,
                 )
-            return file_path, response.strip()
+            return file_path, response.strip(), code
 
         all_files = dir_tree
 
@@ -208,7 +210,8 @@ class MentalModelStage:
             tasks = [summarize_file(fp) for fp in batch]
             results = await asyncio.gather(*tasks)
 
-            for fp, summary in results:
+            files_to_index: list[tuple[str, str]] = []
+            for fp, summary, code in results:
                 if summary == "IGNORE":
                     ignored.add(fp)
                     self._upsert_document(
@@ -229,6 +232,23 @@ class MentalModelStage:
                             "data": summary,
                         }
                     )
+                    if code is not None:
+                        files_to_index.append((fp, code))
+
+            # Index files for contextual retrieval in parallel
+            if files_to_index:
+                # index_tasks = [retrieval.index_file(fp, code) for fp, code in files_to_index]
+                # index_results = await asyncio.gather(*index_tasks, return_exceptions=True)
+                # for (fp, _), result in zip(files_to_index, index_results):
+                #     if isinstance(result, Exception):
+                #         logger.warning("Job %s: failed to index %s: %s", self.job_id, fp, result)
+
+                for fp, code in files_to_index:
+                    try:
+                        logger.info("Job %s: indexing file %s for contextual retrieval", self.job_id, fp)
+                        await retrieval.index_file(fp, code)
+                    except Exception as e:
+                        logger.warning("Job %s: failed to index %s: %s", self.job_id, fp, e)
 
             pbar.update(len(batch))
 

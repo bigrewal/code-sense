@@ -27,24 +27,6 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 
-LANGUAGE_DEFINITION_MAP = {
-    "python": {"function_definition", "class_definition", "assignment"},
-    "rust": {
-        "struct_item", "enum_item", "union_item", "type_item",
-        "function_item", "trait_item", "mod_item", "macro_definition"
-    },
-    "scala": {
-        "package_clause", "trait_definition", "enum_definition",
-        "simple_enum_case", "full_enum_case", "class_definition",
-        "object_definition", "function_definition", "val_definition",
-        "given_definition", "var_definition", "val_declaration",
-        "var_declaration", "type_definition", "class_parameter"
-    },
-    "java": {
-        "class_declaration", "method_declaration", "interface_declaration"
-    }
-}
-
 
 class CreateRepoGraphStage():
     """Stage for AST creation and graph database population."""
@@ -55,7 +37,7 @@ class CreateRepoGraphStage():
         self.mongo_client = get_mongo_client()
 
         self.job_id = job_id
-        self.language_defs = LANGUAGE_DEFINITION_MAP
+        self.language_defs = Config.LANGUAGE_DEFINITION_MAP
 
         # Parser cache: language -> parser
         self._parsers: Dict[str, Any] = {}
