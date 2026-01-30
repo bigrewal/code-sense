@@ -74,36 +74,68 @@ class ContextualRetrieval:
         return result.embeddings
 
     def _chunk_code(self, code: str, file_path: str) -> List[str]:
-        """Split code into chunks by function/class definitions using tree-sitter."""
+        """Split code into chunks using tree-sitter, while preserving non-definition regions."""
         suffix = Path(file_path).suffix.lower()
         language = Config.SUPPORTED_LANGUAGES.get(suffix)
 
+        # Embedding models have much smaller limits than Grok; keep chunks compact.
+        max_chars = 8000
+        overlap_chars = 1000
+
+        def split_text(text: str) -> List[str]:
+            text = text.strip()
+            if not text:
+                return []
+            if len(text) <= max_chars:
+                return [text]
+            parts = []
+            start = 0
+            while start < len(text):
+                end = min(len(text), start + max_chars)
+                parts.append(text[start:end].strip())
+                if end == len(text):
+                    break
+                start = max(0, end - overlap_chars)
+            return [p for p in parts if p]
+
         if not language:
-            # Fallback for unsupported languages
-            lines = code.split('\n')
-            return ['\n'.join(lines[i:i+50]) for i in range(0, len(lines), 40) if lines[i:i+50]]
+            # Fallback for unsupported languages: chunk by size with overlap.
+            return split_text(code)
 
         parser = get_parser(language)
-        tree = parser.parse(bytes(code, "utf8"))
+        code_bytes = bytes(code, "utf8")
+        tree = parser.parse(code_bytes)
         definition_types = Config.LANGUAGE_DEFINITION_MAP.get(language, set())
 
-        chunks = []
-        code_bytes = bytes(code, "utf8")
+        def_nodes = []
 
         def extract_definitions(node):
             if node.type in definition_types:
-                chunk_text = code_bytes[node.start_byte:node.end_byte].decode("utf8")
-                if chunk_text.strip():
-                    chunks.append(chunk_text.strip())
+                def_nodes.append(node)
             for child in node.children:
                 extract_definitions(child)
 
         extract_definitions(tree.root_node)
 
-        if not chunks:
-            # Fallback if no definitions found
-            lines = code.split('\n')
-            chunks = ['\n'.join(lines[i:i+50]) for i in range(0, len(lines), 40) if lines[i:i+50]]
+        if not def_nodes:
+            return split_text(code)
+
+        def_nodes.sort(key=lambda n: n.start_byte)
+        chunks = []
+        cursor = 0
+
+        # Build chunks from gaps + definitions so no code is dropped.
+        for node in def_nodes:
+            if node.start_byte > cursor:
+                gap = code_bytes[cursor:node.start_byte].decode("utf8")
+                chunks.extend(split_text(gap))
+            definition = code_bytes[node.start_byte:node.end_byte].decode("utf8")
+            chunks.extend(split_text(definition))
+            cursor = max(cursor, node.end_byte)
+
+        if cursor < len(code_bytes):
+            tail = code_bytes[cursor:].decode("utf8")
+            chunks.extend(split_text(tail))
 
         return chunks
 
@@ -120,11 +152,21 @@ class ContextualRetrieval:
 
         # Generate contexts in batches with single LLM calls
         all_contexts = {}
-        for i in range(0, len(chunks), 10):
-            batch_chunks = chunks[i:i+10]
-            batch_contexts = await self.generate_context(code, batch_chunks)
-            for local_idx, context in batch_contexts.items():
-                all_contexts[i + local_idx] = context
+        batches = [chunks[i:i+10] for i in range(0, len(chunks), 10)]
+
+        for group_start in range(0, len(batches), 10):
+            group = batches[group_start:group_start + 10]
+
+            # Launch 10 concurrent generate_context calls
+            results = await asyncio.gather(
+                *(self.generate_context(code, batch_chunks) for batch_chunks in group)
+            )
+
+            # Merge results back into all_contexts with global indices
+            for batch_idx_in_group, batch_contexts in enumerate(results):
+                batch_global_idx = (group_start + batch_idx_in_group) * 10  # starting chunk index for this batch
+                for local_idx, context in batch_contexts.items():
+                    all_contexts[batch_global_idx + local_idx] = context
 
         # Prepare texts, metadata, and IDs for embedding
         for i, chunk in enumerate(chunks):
@@ -136,7 +178,7 @@ class ContextualRetrieval:
             metadatas.append({
                 "file_path": file_path,
                 "context": context,
-                "content": chunk[:2000],
+                "content": chunk,
             })
 
         # Embed and upsert in batches

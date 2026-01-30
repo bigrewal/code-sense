@@ -412,6 +412,7 @@ async def stream_answer(user_question: str, repo_name: str):
     # Stage 0: Vector search for relevant code chunks
     retrieval = ContextualRetrieval(repo_name)
     relevant_chunks = retrieval.search(user_question, n=20)
+    print(f"Found {len(relevant_chunks)} relevant code chunks from vector search.")
     chunk_context = "\n".join([
         f"[{c['file_path']}]: {c['content']}..."
         for c in relevant_chunks

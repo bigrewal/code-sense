@@ -237,15 +237,9 @@ class MentalModelStage:
 
             # Index files for contextual retrieval in parallel
             if files_to_index:
-                # index_tasks = [retrieval.index_file(fp, code) for fp, code in files_to_index]
-                # index_results = await asyncio.gather(*index_tasks, return_exceptions=True)
-                # for (fp, _), result in zip(files_to_index, index_results):
-                #     if isinstance(result, Exception):
-                #         logger.warning("Job %s: failed to index %s: %s", self.job_id, fp, result)
-
                 for fp, code in files_to_index:
                     try:
-                        logger.info("Job %s: indexing file %s for contextual retrieval", self.job_id, fp)
+                        logger.info(f"Indexing file for contextual retrieval: {fp}")
                         await retrieval.index_file(fp, code)
                     except Exception as e:
                         logger.warning("Job %s: failed to index %s: %s", self.job_id, fp, e)
