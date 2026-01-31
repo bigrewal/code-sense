@@ -6,16 +6,5 @@ services:
     volumes:
       - mongo_data:/data/db
 
-  neo4j:
-    image: neo4j:5.22.0
-    ports:
-      - "7474:7474"   # browser
-      - "7687:7687"   # bolt
-    environment:
-      - NEO4J_AUTH=${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-password}
-    volumes:
-      - neo4j_data:/data
-
 volumes:
   mongo_data:
-  neo4j_data:

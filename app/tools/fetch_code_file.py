@@ -3,14 +3,11 @@ import traceback
 import json
 from ..config import Config
 
-def fetch_code_file(file_path: str) -> str:
+def fetch_code_file(repo_name: str, file_path: str) -> str:
     if not file_path:
         return json.dumps({"error": "Missing file_path parameter"})
 
-    if not file_path.startswith(f"{Config.BASE_REPO_DIR}/"):
-        return json.dumps({"error": f"File path not valid: {file_path}"})
-
-    full_path = Path(file_path)
+    full_path = Path(Config.BASE_REPO_DIR) / repo_name / file_path
     try:
         if not full_path.exists():
             return json.dumps({"error": f"File not found: {str(full_path)}"})

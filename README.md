@@ -33,11 +33,10 @@ The goal is to give the LLM an **integrated understanding of the entire codebase
 ## How is the mental model created
 
 1. **Parse the repository** (tree-sitter) to capture structure.
-2. **Resolve cross-file symbol references** (LSP) to capture semantics.
-3. **Construct a repo graph** (Neo4j) from AST structure + LSP reference edges.
-4. **Generate a “mental model”**: classify files (CRITICAL vs IGNORE) and summarize critical files with upstream/downstream interactions.
-5. **Compress to global context**: traverse from entry points and assemble a repo-wide context that fits comfortably in the LLM context window.
-6. **Answer questions** using the global context (no doc reliance required).
+2. **Resolve cross-file symbol references** (LSP) to capture semantics in a local SQLite cache.
+3. **Generate a "mental model"**: classify files (CRITICAL vs IGNORE) and summarize critical files with upstream/downstream interactions using the LSP reference cache.
+4. **Compress to global context**: traverse from entry points and assemble a repo-wide context that fits comfortably in the LLM context window.
+5. **Answer questions** using the global context (no doc reliance required).
 
 ---
 
@@ -58,15 +57,14 @@ Search-based approaches inevitably expose the model to only a small subset of th
 
 * **Pre-ingestion analysis**: scans files, filters directories, estimates size/budget.
 * **LSP reference extraction**: builds a persistent SQLite cache of symbol reference edges.
-* **Repo graph construction**: stores nodes/edges in Neo4j.
-* **Mental model generation**: uses graph queries + an LLM to produce short file-level “briefs” and criticality.
+* **Reference verification**: verifies the LSP cache is available for cross-file analysis.
+* **Mental model generation**: queries the SQLite cache + an LLM to produce short file-level "briefs" and criticality.
 * **Repo context builder**: performs BFS from entry points to assemble a **global repo context** stored in MongoDB.
 
 **Storage**
 
-* **Neo4j**: repo dependency graph (AST + semantic reference edges)
+* **SQLite**: LSP reference cache (per-repository, stores cross-file dependencies)
 * **MongoDB**: brief summaries + global repo context (document store)
-* **SQLite**: LSP reference cache
 
 
 ## Evaluation
@@ -97,8 +95,8 @@ I compared our tool against **DeepWiki** (Cognition Labs / Devin-powered reposit
 ### Key Takeaways
 - **DeepWiki** relies heavily on human-written markdown documentation for accurate high-level reasoning and architectural synthesis. When documentation is removed, its answers become shallow, incomplete, and miss critical system components.
 - Our system **excels in the code-only setting** — deriving deeper, more accurate architectural understanding directly from:
-  - LSP-resolved cross-file references
-  - Tree-sitter AST + pruned Neo4j graph
+  - LSP-resolved cross-file references (stored in SQLite)
+  - Tree-sitter AST + semantic dependency analysis
   - Dependency-aware critical file selection & summarization
   - BFS-ordered repo context from inferred entry points
 
@@ -157,7 +155,6 @@ Make sure you have the following installed:
    Then update the following values in `.env.local`:
 
    * `XAI_API_KEY`
-   * `NEO4J_PASSWORD`
 
 4. Make scripts executable:
 
@@ -201,7 +198,7 @@ Make sure you have the following installed:
 
 ### Shutdown Services
 
-To stop and remove Neo4j and MongoDB containers (including volumes):
+To stop and remove MongoDB containers (including volumes):
 
 ```bash
 docker compose down -v
@@ -221,7 +218,6 @@ docker compose down -v
 **Endpoints**
 
 * API: [http://localhost:8000](http://localhost:8000)
-* Neo4j UI: [http://localhost:7474](http://localhost:7474)
 * MongoDB: mongodb://localhost:27017
 * CodeSense UI: http://localhost:5173/
 

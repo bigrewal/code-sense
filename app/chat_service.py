@@ -259,8 +259,8 @@ async def stream_answer(user_question: str, repo_name: str):
             print(f"Error in file selection: {e}")
             return []
         
-    async def _read_file_and_fetch_info(file_path: str, info_needed: str):
-        code = fetch_code_file(file_path=file_path)
+    async def _read_file_and_fetch_info(repo_name: str, file_path: str, info_needed: str):
+        code = fetch_code_file(repo_name=repo_name, file_path=file_path)
 
         system_prompt = "Your task is to only fetch the information requested from the provided code"
 
@@ -363,8 +363,7 @@ async def stream_answer(user_question: str, repo_name: str):
 
         RULES (STRICT)
         ────────────────────────────────────────────
-        - Present ALL information from the gathered context.
-        - Do NOT omit, summarize, compress, or generalize any technical detail.
+        - Answer the user's question coherently based on the gathered context.
         - Preserve exact wording for:
         - code snippets
         - function names
@@ -427,6 +426,7 @@ async def stream_answer(user_question: str, repo_name: str):
     for file_info in additional_info_required:
         print(f"Fetching info from file: {file_info['file_path']}")
         tasks.append(_read_file_and_fetch_info(
+            repo_name=repo_name,
             file_path=file_info["file_path"],
             info_needed=file_info["info_needed"],
         ))

@@ -7,7 +7,6 @@ requires-python = ">=3.11.0"
 dependencies = [
     "fastapi>=0.116.1",
     "loguru>=0.7.3",
-    "neo4j>=5.28.2",
     "pydantic>=2.11.7",
     "pylsp-rope>=0.1.17",
     "pymongo==4.13.0",

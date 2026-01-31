@@ -1,35 +1,31 @@
-import asyncio
+import json
 import logging
+import sqlite3
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from bson import ObjectId
-from neo4j import GraphDatabase
 from pymongo import MongoClient
 
 from .config import Config
 from .db_exceptions import (
     ConnectionError as DBConnectionError,
     QueryError,
-    ValidationError,
     InvalidParameterError,
-    AuthenticationError,
     InvalidConnectionStringError,
 )
-from .db_retry import with_retry, with_retry_async
+from .db_retry import with_retry
 from .db_metrics import DatabaseMetrics
 from .utils import now_ts
-from .models.data_model import ASTNode, IngestionJobStatus, IngestionStage
+from .models.data_model import IngestionJobStatus, IngestionStage
 
 logger = logging.getLogger(__name__)
 
 # Module-level metrics collector (singleton)
 _db_metrics = DatabaseMetrics(slow_query_threshold_ms=Config.SLOW_QUERY_THRESHOLD_MS)
-
-## Silence WARNING:neo4j.notifications: 
-logging.getLogger("neo4j.notifications").setLevel(logging.WARNING)
 
 INGESTION_JOBS_COLLECTION = "ingestion_jobs"
 INGESTED_REPOS_COLLECTION = "ingested_repos"
@@ -68,514 +64,119 @@ def _filter_stage_metrics(job: Dict[str, Any]) -> Dict[str, Any]:
 
     return job
 
-class Neo4jClient:
-    """
-    Neo4j database client wrapper with connection pooling, retry logic, and health monitoring.
 
-    Features:
-    - Singleton pattern for application-wide connection reuse
-    - Automatic retry on transient failures
-    - Connection pool monitoring
-    - Query performance tracking
-    - Comprehensive error handling
+class LSPCacheReader:
+    """Minimal SQLite reader for querying LSP reference cache."""
 
-    Example:
-        client = get_neo4j_client()
-        await client.batch_create_nodes(nodes, repo_name="my-repo")
-    """
-
-    _instance = None  # Singleton instance
-    _lock = threading.Lock()  # Thread-safe singleton initialization
-
-    def __new__(cls, *args, **kwargs):
-        """Enforce thread-safe singleton pattern."""
-        if cls._instance is None:
-            with cls._lock:
-                # Double-check locking pattern
-                if cls._instance is None:
-                    cls._instance = super(Neo4jClient, cls).__new__(cls)
-        return cls._instance
-
-    def __init__(self):
-        """Initialize Neo4j client with connection pooling and retry logic."""
-        # Prevent re-initialization on subsequent instantiations
-        if getattr(self, "_initialized", False):
-            return
-
-        self.driver = None
-        self.batch_size = Config.NEO4J_BATCH_SIZE
-        self._metrics = _db_metrics
-
-        # SECURITY: Don't log credentials
-        logger.info("Initializing Neo4jClient connection")
-
-        try:
-            # VALIDATION: Check connection configuration
-            self._validate_connection_config()
-
-            # PERFORMANCE: Configure connection pool
-            self.driver = GraphDatabase.driver(
-                Config.NEO4J_URI,
-                auth=(Config.NEO4J_USER, Config.NEO4J_PASSWORD),
-                max_connection_lifetime=Config.NEO4J_MAX_CONNECTION_LIFETIME,
-                max_connection_pool_size=Config.NEO4J_MAX_POOL_SIZE,
-                connection_timeout=Config.NEO4J_CONNECTION_TIMEOUT,
-                keep_alive=True,
-            )
-
-            # Test connection with retry
-            self._initialize_database_with_retry()
-
-            logger.info("Neo4j connection established successfully")
-
-        except DBConnectionError as e:
-            logger.error("Neo4j connection failed: %s", str(e))
-            raise
-        except Exception as e:
-            logger.exception("Unexpected error during Neo4j initialization")
-            raise DBConnectionError(f"Failed to initialize Neo4j client: {str(e)}") from e
-
-        self._initialized = True
-
-    def _validate_connection_config(self):
-        """
-        Validate Neo4j connection configuration.
-
-        Raises:
-            InvalidConnectionStringError: If connection URI is invalid
-            AuthenticationError: If credentials are not configured
-        """
-        if not Config.NEO4J_URI:
-            raise InvalidConnectionStringError("NEO4J_URI not configured")
-
-        valid_schemes = ("bolt://", "neo4j://", "bolt+s://", "neo4j+s://")
-        if not Config.NEO4J_URI.startswith(valid_schemes):
-            raise InvalidConnectionStringError(
-                f"Invalid Neo4j URI scheme. Must start with one of: {valid_schemes}"
-            )
-
-        if not Config.NEO4J_USER or not Config.NEO4J_PASSWORD:
-            raise AuthenticationError("Neo4j credentials not configured")
-
-    @with_retry(max_attempts=3, initial_delay=2.0)
-    def _initialize_database_with_retry(self):
-        """
-        Initialize database with index creation (with retry for transient failures).
-
-        Raises:
-            DBConnectionError: If initialization fails after retries
-        """
-        try:
-            with self.driver.session() as session:
-                self._create_indexes(session)
-                session.run("CALL db.awaitIndexes()")
-                session.run("RETURN 1")
-        except Exception as e:
-            raise DBConnectionError(f"Failed to initialize database: {str(e)}") from e
-
-    async def init_graph_for_repo(self, repo_name: str):
-        if not self.driver:
-            logger.error("Neo4j driver not initialized")
-            raise Exception("Neo4j driver not initialized")
-
-        def _initialise():
-            try:
-                logger.info("Initialising graph for repo: %s", repo_name)
-                with self.driver.session() as session:
-                    self.clear_repo_data(session, repo_name)
-            except Exception as exc:
-                logger.error("Neo4j initialisation failed: %s", exc)
-                raise
-
-        await asyncio.to_thread(_initialise)
-
-    def _create_indexes(self, session):
-        """Create necessary indexes for performance."""
-        indexes = [
-            "CREATE INDEX IF NOT EXISTS FOR (n:ASTNode) ON (n.node_id)",
-            "CREATE INDEX IF NOT EXISTS FOR (n:ASTNode) ON (n.repo_name)",
-            "CREATE INDEX IF NOT EXISTS FOR (n:ASTNode) ON (n.repo_name, n.node_id)",
-            "CREATE INDEX IF NOT EXISTS FOR (n:ASTNode) ON (n.file_path)",
-            "CREATE INDEX IF NOT EXISTS FOR (n:ASTNode) ON (n.node_type)",
-        ]
-
-        for index_query in indexes:
-            session.run(index_query).consume()
-
-    def clear_repo_data(self, session, repo_name: str):
-        """Clear existing data for a repository."""
-        try:
-            query = """
-            MATCH (n:ASTNode {repo_name: $repo_name})
-            DETACH DELETE n
-            """
-            session.run(query, repo_name=repo_name)
-            logger.info(f"Cleared existing data for repo: {repo_name}")
-        except Exception as e:
-            logger.warning(f"Failed to clear repo data: {e}")
-
-    def _serialize_nodes(self, nodes: List[ASTNode], repo_name: str) -> List[Dict[str, Any]]:
-        """
-        Serialize AST nodes to dictionaries with validation.
+    def __init__(self, repo_path: str):
+        """Initialize reader for a specific repository.
 
         Args:
-            nodes: List of ASTNode objects to serialize
-            repo_name: Repository identifier for validation
-
-        Returns:
-            List of node dictionaries ready for Neo4j insertion
-
-        Raises:
-            ValidationError: If node validation fails
+            repo_path: Path to repository root (where .lsp_ref_cache.sqlite is located)
         """
-        node_dicts = []
+        self.repo_path = Path(repo_path)
+        self.db_path = self.repo_path / ".lsp_ref_cache.sqlite"
+        if not self.db_path.exists():
+            raise FileNotFoundError(f"LSP cache not found: {self.db_path}")
+        # LSP cache stores paths with repo folder name prefix (e.g., "dictquery/dictquery/__init__.py")
+        self.repo_folder_name = self.repo_path.name
 
-        for idx, node in enumerate(nodes):
-            # VALIDATION: Type checking
-            if not isinstance(node, ASTNode):
-                raise ValidationError(
-                    f"Node at index {idx} is not an ASTNode: {type(node).__name__}"
-                )
+    def _get_connection(self) -> sqlite3.Connection:
+        """Get a read-only connection to the cache database."""
+        conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
 
-            # VALIDATION: Required fields
-            if not node.node_id:
-                raise ValidationError(f"Node at index {idx} missing node_id")
-            if not node.file_path:
-                raise ValidationError(f"Node at index {idx} missing file_path")
+    def _to_cache_path(self, file_path: str) -> str:
+        """Convert relative file path to LSP cache path format (with repo folder prefix)."""
+        return f"{self.repo_folder_name}/{file_path}"
 
-            node_dict = {
-                'node_id': node.node_id,
-                'node_type': node.node_type,
-                'start_line': node.start_line,
-                'start_column': node.start_column,
-                'end_line': node.end_line,
-                'end_column': node.end_column,
-                'parent_id': node.parent_id,
-                'file_path': node.file_path,
-                'is_definition': node.is_definition,
-                'is_reference': node.is_reference,
-                'repo_name': repo_name,
-                'name': node.name,
-            }
-            node_dicts.append(node_dict)
+    def _from_cache_path(self, cache_path: str) -> str:
+        """Convert LSP cache path to relative file path (strip repo folder prefix)."""
+        prefix = f"{self.repo_folder_name}/"
+        if cache_path.startswith(prefix):
+            return cache_path[len(prefix):]
+        return cache_path
 
-        return node_dicts
-
-    @with_retry_async(max_attempts=3, initial_delay=1.0)
-    async def batch_create_nodes(
-        self,
-        nodes: List[ASTNode],
-        repo_name: str,
-        batch_size: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """
-        Create AST nodes in batches with retry and monitoring.
+    def cross_file_interactions(self, file_path: str) -> Dict[str, Any]:
+        """Get cross-file interactions for a given file.
 
         Args:
-            nodes: List of AST nodes to create
-            repo_name: Repository identifier
-            batch_size: Optional batch size override (default: Config.NEO4J_BATCH_SIZE)
+            file_path: Relative path to file within repository
 
         Returns:
-            Dict with operation summary: {
-                "total_nodes": int,
-                "batches_processed": int,
-                "duration_ms": float,
-                "errors": List[str],
-            }
-
-        Raises:
-            InvalidParameterError: If inputs are invalid
-            QueryError: If batch creation fails after retries
-            DBConnectionError: If driver not initialized
-
-        Example:
-            result = await client.batch_create_nodes(nodes, "my-repo")
-            logger.info("Created %d nodes in %d batches",
-                        result["total_nodes"], result["batches_processed"])
+            Dict with 'downstream' and 'upstream' keys containing interactions
         """
-        start_time = time.time()
-        operation = self._metrics.start_operation("batch_create_nodes")
-
-        # VALIDATION: Input checking
-        if not repo_name or not isinstance(repo_name, str):
-            raise InvalidParameterError("repo_name must be a non-empty string")
-
-        if not nodes:
-            logger.warning("batch_create_nodes called with empty node list for repo: %s", repo_name)
-            return {"total_nodes": 0, "batches_processed": 0, "duration_ms": 0.0, "errors": []}
-
-        if not isinstance(nodes, list):
-            raise InvalidParameterError("nodes must be a list of ASTNode objects")
-
-        # Driver check
-        if not self.driver:
-            raise DBConnectionError("Neo4j driver not initialized")
-
-        batch_size = batch_size or self.batch_size
-        total_batches = (len(nodes) + batch_size - 1) // batch_size
-        errors = []
-        batches_processed = 0
+        conn = self._get_connection()
+        # Convert to LSP cache format (with repo folder prefix)
+        cache_file_path = self._to_cache_path(file_path)
 
         try:
-            for i in range(0, len(nodes), batch_size):
-                batch_num = (i // batch_size) + 1
-                batch = nodes[i:i + batch_size]
-
-                batch_start = time.time()
-
-                # Convert nodes to dictionaries with validation
-                node_dicts = self._serialize_nodes(batch, repo_name)
-
-                query = """
-                UNWIND $nodes AS node
-                CREATE (n:ASTNode)
-                SET n = node
-                WITH n, node
-                WHERE node.is_definition = true
-                SET n:Definition
-                WITH n, node
-                WHERE node.is_reference = true
-                SET n:Reference
-                """
-
-                def _write_nodes():
-                    with self.driver.session() as session:
-                        session.run(query, nodes=node_dicts)
-
-                try:
-                    await asyncio.to_thread(_write_nodes)
-                    batches_processed += 1
-
-                    batch_duration_ms = (time.time() - batch_start) * 1000
-
-                    # MONITORING: Track slow batches
-                    if batch_duration_ms > Config.SLOW_QUERY_THRESHOLD_MS:
-                        logger.warning(
-                            "Slow batch operation: repo_name=%s, batch=%d/%d, nodes=%d, duration_ms=%.2f",
-                            repo_name, batch_num, total_batches, len(batch), batch_duration_ms
-                        )
-
-                    logger.debug(
-                        "Created node batch: repo_name=%s, batch=%d/%d, nodes=%d, duration_ms=%.2f",
-                        repo_name, batch_num, total_batches, len(batch), batch_duration_ms
-                    )
-
-                except Exception as e:
-                    error_msg = f"Batch {batch_num}/{total_batches} failed: {str(e)}"
-                    errors.append(error_msg)
-                    logger.error(
-                        "Failed to create node batch: repo_name=%s, batch=%d/%d, error=%s",
-                        repo_name, batch_num, total_batches, str(e)
-                    )
-                    raise QueryError(error_msg) from e
-
-            duration_ms = (time.time() - start_time) * 1000
-            self._metrics.end_operation(operation, success=True)
-
-            return {
-                "total_nodes": len(nodes),
-                "batches_processed": batches_processed,
-                "duration_ms": duration_ms,
-                "errors": errors,
-            }
-
-        except Exception as e:
-            self._metrics.end_operation(operation, success=False, error=e)
-            raise
-
-    @with_retry_async(max_attempts=3, initial_delay=1.0)
-    async def batch_create_edges(
-        self,
-        edges: List[Dict[str, Any]],
-        repo_name: str,
-        batch_size: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """
-        Create edges in batches with retry and monitoring.
-
-        Args:
-            edges: List of edge dictionaries with 'source', 'target', 'type', 'sequence'
-            repo_name: Repository identifier
-            batch_size: Optional batch size override (default: Config.NEO4J_BATCH_SIZE)
-
-        Returns:
-            Dict with operation summary: {
-                "total_edges": int,
-                "batches_processed": int,
-                "duration_ms": float,
-                "errors": List[str],
-            }
-
-        Raises:
-            InvalidParameterError: If inputs are invalid
-            QueryError: If batch creation fails after retries
-            DBConnectionError: If driver not initialized
-
-        Example:
-            result = await client.batch_create_edges(edges, "my-repo")
-            logger.info("Created %d edges in %d batches",
-                        result["total_edges"], result["batches_processed"])
-        """
-        start_time = time.time()
-        operation = self._metrics.start_operation("batch_create_edges")
-
-        # VALIDATION: Input checking
-        if not repo_name or not isinstance(repo_name, str):
-            raise InvalidParameterError("repo_name must be a non-empty string")
-
-        if not edges:
-            logger.info("No edges to create for repo: %s", repo_name)
-            return {"total_edges": 0, "batches_processed": 0, "duration_ms": 0.0, "errors": []}
-
-        if not isinstance(edges, list):
-            raise InvalidParameterError("edges must be a list of dictionaries")
-
-        # Driver check
-        if not self.driver:
-            raise DBConnectionError("Neo4j driver not initialized")
-
-        batch_size = batch_size or self.batch_size
-        total_batches = (len(edges) + batch_size - 1) // batch_size
-        errors = []
-        batches_processed = 0
-
-        try:
-            for i in range(0, len(edges), batch_size):
-                batch_num = (i // batch_size) + 1
-                batch = edges[i:i + batch_size]
-
-                batch_start = time.time()
-
-                # Validate and prepare edges
-                edges_payload = []
-                for idx, e in enumerate(batch):
-                    if not isinstance(e, dict):
-                        raise ValidationError(f"Edge at index {idx} is not a dictionary")
-                    if "source" not in e or "target" not in e or "type" not in e:
-                        raise ValidationError(f"Edge at index {idx} missing required fields")
-
-                    edges_payload.append({
-                        "source": e["source"],
-                        "target": e["target"],
-                        "sequence": e.get("sequence", 1),
-                        "type": e["type"],
-                    })
-
-                query = """
-                UNWIND $edges AS edge
-                MATCH (s:ASTNode {repo_name: $repo_name, node_id: edge.source})
-                MATCH (t:ASTNode {repo_name: $repo_name, node_id: edge.target})
-                CALL {
-                    WITH s, t, edge
-                    WITH s, t, edge WHERE edge.type = 'CONTAINS'
-                    CREATE (s)-[:CONTAINS {sequence: edge.sequence}]->(t)
-                }
-                CALL {
-                    WITH s, t, edge
-                    WITH s, t, edge WHERE edge.type = 'REFERENCES'
-                    CREATE (s)-[:REFERENCES {sequence: edge.sequence}]->(t)
-                }
-                """
-
-                def _write_edges():
-                    with self.driver.session() as session:
-                        session.execute_write(
-                            lambda tx: tx.run(query, edges=edges_payload, repo_name=repo_name)
-                        )
-
-                try:
-                    await asyncio.to_thread(_write_edges)
-                    batches_processed += 1
-
-                    batch_duration_ms = (time.time() - batch_start) * 1000
-
-                    # MONITORING: Track slow batches
-                    if batch_duration_ms > Config.SLOW_QUERY_THRESHOLD_MS:
-                        logger.warning(
-                            "Slow batch operation: repo_name=%s, batch=%d/%d, edges=%d, duration_ms=%.2f",
-                            repo_name, batch_num, total_batches, len(edges_payload), batch_duration_ms
-                        )
-
-                    logger.debug(
-                        "Created edge batch: repo_name=%s, batch=%d/%d, edges=%d, duration_ms=%.2f",
-                        repo_name, batch_num, total_batches, len(edges_payload), batch_duration_ms
-                    )
-
-                except Exception as e:
-                    error_msg = f"Batch {batch_num}/{total_batches} failed: {str(e)}"
-                    errors.append(error_msg)
-                    logger.error(
-                        "Failed to create edge batch: repo_name=%s, batch=%d/%d, error=%s",
-                        repo_name, batch_num, total_batches, str(e)
-                    )
-                    raise QueryError(error_msg) from e
-
-            duration_ms = (time.time() - start_time) * 1000
-            self._metrics.end_operation(operation, success=True)
-
-            return {
-                "total_edges": len(edges),
-                "batches_processed": batches_processed,
-                "duration_ms": duration_ms,
-                "errors": errors,
-            }
-
-        except Exception as e:
-            self._metrics.end_operation(operation, success=False, error=e)
-            raise
-
-    def cross_file_interactions_in_file(self, file_path: str, repo_name: str):
-        """Infer cross-file interactions for a given file by finding references to and from definitions in other files."""
-
-        if not self.driver:
-            logger.error("Neo4j driver not initialized")
-            raise Exception("Neo4j driver not initialized")
-
-        # Downstream: file_path → other files
-        downstream_query = """
-        MATCH (ref:ASTNode {repo_name: $repo_name, file_path: $file_path, is_reference: true})
-        -[:REFERENCES]->(ident:ASTNode)
-        WHERE ident.file_path <> $file_path
-        MATCH (def:ASTNode)
-        WHERE def.node_id = ident.parent_id
-        RETURN DISTINCT ref.name AS ref_name, def.node_type AS node_type, def.file_path AS def_file_path
-        """
-
-        # Upstream: other files → file_path
-        upstream_query = """
-        MATCH (ref:ASTNode {repo_name: $repo_name, is_reference: true})
-        -[:REFERENCES]->(ident:ASTNode {file_path: $file_path})
-        MATCH (def:ASTNode)
-        WHERE def.node_id = ident.parent_id
-        RETURN DISTINCT ref.file_path AS ref_file_path, ref.name AS ref_name, def.node_type AS node_type
-        """
-
-        with self.driver.session() as session:
-            # Downstream
-            downstream_result = list(session.run(downstream_query, repo_name=repo_name, file_path=file_path))
+            # Downstream: file_path → other files
             downstream_interactions: Dict[str, List[str]] = {}
-            for record in downstream_result:
-                def_file = record["def_file_path"]
-                interaction = f"{record['ref_name']} REFERENCES {record['node_type']} IN {def_file}"
-                downstream_interactions.setdefault(def_file, []).append(interaction)
+            downstream_files = set()
 
-            downstream_files = {
-                record["def_file_path"] for record in downstream_result if record["def_file_path"] != file_path
-            }
+            # Note: LSP cache uses language-specific namespaces (e.g., "PythonAnalyzer:pylsp")
+            # not repo names, so we don't filter by namespace
+            cursor = conn.execute(
+                "SELECT ref_path, data FROM mappings WHERE ref_path = ?",
+                (cache_file_path,)
+            )
 
-            # Upstream
-            upstream_result = list(session.run(upstream_query, repo_name=repo_name, file_path=file_path))
+            for row in cursor.fetchall():
+                data = json.loads(row["data"])
+                definitions = data.get("definitions", [])
+                if not definitions:
+                    continue
+
+                ref = data.get("reference", {})
+                ref_loc = f"{file_path}:{ref.get('line', '?')}:{ref.get('column', '?')}"
+
+                for defn in definitions:
+                    def_file_cache = defn.get("file_path")
+                    if def_file_cache and def_file_cache != cache_file_path:
+                        # Convert from cache path to relative path
+                        def_file = self._from_cache_path(def_file_cache)
+                        def_loc = f"{def_file}:{defn.get('line', '?')}:{defn.get('column', '?')}"
+                        interaction = f"{ref_loc} -> {def_loc}"
+                        downstream_interactions.setdefault(def_file, []).append(interaction)
+                        downstream_files.add(def_file)
+
+            # Upstream: other files → file_path
             upstream_interactions: Dict[str, List[str]] = {}
-            for record in upstream_result:
-                ref_file = record["ref_file_path"]
-                interaction = f"{record['ref_name']} IN {ref_file} REFERENCES {record['node_type']} IN {file_path}"
-                upstream_interactions.setdefault(ref_file, []).append(interaction)
+            upstream_files = set()
 
-            upstream_files = {
-                record["ref_file_path"] for record in upstream_result if record["ref_file_path"] != file_path
-            }
+            # Query for references that point to definitions in this file
+            cursor = conn.execute("""
+                SELECT m.ref_path, m.data
+                FROM mappings m
+                JOIN def_index d ON d.namespace = m.namespace
+                    AND d.ref_path = m.ref_path
+                    AND d.ref_line = m.ref_line
+                    AND d.ref_column = m.ref_column
+                WHERE d.def_path = ?
+            """, (cache_file_path,))
 
+            for row in cursor.fetchall():
+                data = json.loads(row["data"])
+                ref = data.get("reference", {})
+                ref_file_cache = ref.get("file_path")
+                if not ref_file_cache or ref_file_cache == cache_file_path:
+                    continue
+
+                # Convert from cache path to relative path
+                ref_file = self._from_cache_path(ref_file_cache)
+                ref_loc = f"{ref_file}:{ref.get('line', '?')}:{ref.get('column', '?')}"
+                definitions = data.get("definitions", [])
+
+                for defn in definitions:
+                    def_file_cache = defn.get("file_path")
+                    if def_file_cache == cache_file_path:
+                        def_loc = f"{file_path}:{defn.get('line', '?')}:{defn.get('column', '?')}"
+                        interaction = f"{ref_loc} -> {def_loc}"
+                        upstream_interactions.setdefault(ref_file, []).append(interaction)
+                        upstream_files.add(ref_file)
+                        
             return {
                 "downstream": {
                     "interactions": downstream_interactions,
@@ -587,84 +188,8 @@ class Neo4jClient:
                 },
             }
 
-    def health_check(self) -> Dict[str, Any]:
-        """
-        Perform health check on Neo4j connection.
-
-        Returns:
-            Dict with health status: {
-                "status": "healthy" | "unhealthy",
-                "response_time_ms": float,
-                "connection_pool": {"in_use": int, "idle": int},
-                "error": Optional[str],
-            }
-
-        Example:
-            health = client.health_check()
-            if health["status"] == "unhealthy":
-                logger.error("Neo4j is down: %s", health.get("error"))
-        """
-        start_time = time.time()
-        
-        if not self.driver:
-            return {
-                "status": "unhealthy",
-                "error": "Driver not initialized",
-                "response_time_ms": 0.0,
-            }
-
-        try:
-            # Simple query to test connectivity
-            with self.driver.session() as session:
-                result = session.run("RETURN 1 AS health_check")
-                result.single()
-
-            response_time_ms = (time.time() - start_time) * 1000
-
-            # Get connection pool metrics (placeholder for future enhancement)
-            pool_stats = {"in_use": 0, "idle": 0}
-
-            health_status = {
-                "status": "healthy",
-                "response_time_ms": response_time_ms,
-                "connection_pool": pool_stats,
-            }
-
-            return health_status
-
-        except Exception as e:
-            logger.error("Neo4j health check failed: %s", str(e))
-            return {
-                "status": "unhealthy",
-                "error": str(e),
-                "response_time_ms": (time.time() - start_time) * 1000,
-            }
-
-    def close(self):
-        """
-        Close the Neo4j connection gracefully.
-
-        Ensures all in-flight operations complete before closing.
-        Should be called during application shutdown.
-        """
-        if not self.driver:
-            logger.warning("close() called but driver was not initialized")
-            return
-
-        try:
-            logger.info("Closing Neo4j connection")
-
-            # Give in-flight operations time to complete
-            time.sleep(0.5)
-
-            self.driver.close()
-            logger.info("Neo4j connection closed successfully")
-
-        except Exception as e:
-            logger.error("Error closing Neo4j connection: %s", str(e))
-            raise
         finally:
-            self.driver = None
+            conn.close()
 
 
 class MyMongoClient:
@@ -1263,17 +788,6 @@ class MyMongoClient:
             self._client = None
             self._db = None
 
-
-def init_neo4j_client() -> Neo4jClient:
-    """Initialise the global Neo4jClient singleton (if not already)."""
-    client = Neo4jClient()
-    return client
-
-def get_neo4j_client() -> Neo4jClient:
-    """Get the Neo4jClient singleton instance."""
-    if Neo4jClient._instance is None:
-        init_neo4j_client()
-    return Neo4jClient._instance
 
 def init_mongo_client():
     client = MyMongoClient()

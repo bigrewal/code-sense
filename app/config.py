@@ -17,11 +17,6 @@ class Config:
     LLM_TEMPERATURE = 0.7
     LLM_MAX_TOKENS = 10240
 
-    # New Neo4j configs
-    NEO4J_URI: str = os.getenv("NEO4J_URI")
-    NEO4J_USER: str = os.getenv("NEO4J_USER")
-    NEO4J_PASSWORD: str = os.getenv("NEO4J_PASSWORD")
-
     # Base directory to store cloned repositories
     BASE_REPO_DIR: str = "data"
 
@@ -78,16 +73,6 @@ class Config:
 
     # ========== Database Connection Pool Configuration ==========
 
-    # Neo4j Connection Pool Settings
-    NEO4J_MAX_POOL_SIZE: int = int(os.getenv("NEO4J_MAX_POOL_SIZE", "50"))
-    NEO4J_MAX_CONNECTION_LIFETIME: int = int(
-        os.getenv("NEO4J_MAX_CONNECTION_LIFETIME", "3600")
-    )  # 1 hour in seconds
-    NEO4J_CONNECTION_TIMEOUT: int = int(
-        os.getenv("NEO4J_CONNECTION_TIMEOUT", "30")
-    )  # 30 seconds
-    NEO4J_BATCH_SIZE: int = int(os.getenv("NEO4J_BATCH_SIZE", "1000"))
-
     # MongoDB Connection Pool Settings
     MONGO_MAX_POOL_SIZE: int = int(os.getenv("MONGO_MAX_POOL_SIZE", "50"))
     MONGO_MIN_POOL_SIZE: int = int(os.getenv("MONGO_MIN_POOL_SIZE", "10"))
@@ -142,9 +127,6 @@ def validate_required_settings() -> None:
     # Check required environment variables
     required = {
         "XAI_API_KEY": Config.XAI_API_KEY,
-        "NEO4J_URI": Config.NEO4J_URI,
-        "NEO4J_USER": Config.NEO4J_USER,
-        "NEO4J_PASSWORD": Config.NEO4J_PASSWORD,
         "MONGO_URI": Config.MONGO_URI,
     }
     missing = [name for name, value in required.items() if not value]
@@ -154,12 +136,6 @@ def validate_required_settings() -> None:
         )
 
     # Validate numeric ranges for database configuration
-    if Config.NEO4J_MAX_POOL_SIZE < 1:
-        raise ValueError("NEO4J_MAX_POOL_SIZE must be >= 1")
-
-    if Config.NEO4J_BATCH_SIZE < 1:
-        raise ValueError("NEO4J_BATCH_SIZE must be >= 1")
-
     if Config.MONGO_MAX_POOL_SIZE < Config.MONGO_MIN_POOL_SIZE:
         raise ValueError(
             f"MONGO_MAX_POOL_SIZE ({Config.MONGO_MAX_POOL_SIZE}) must be >= "

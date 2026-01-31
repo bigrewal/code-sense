@@ -19,9 +19,7 @@ from .chat_service import stream_chat, stateless_stream_chat
 from .config import Config, validate_required_settings
 from .db import (
     get_mongo_client,
-    get_neo4j_client,
     init_mongo_client,
-    init_neo4j_client,
 )
 from .repo_ingestion_pipeline import start_ingestion_pipeline
 from .validators import validate_repo_name, validate_conversation_id, validate_job_id
@@ -63,7 +61,6 @@ app.add_middleware(
 async def on_startup():
     logger.info("Initializing clients")
     validate_required_settings()
-    init_neo4j_client()
     init_mongo_client()
 
 
@@ -73,14 +70,6 @@ async def on_shutdown():
     Graceful shutdown: close database connections and cleanup resources.
     """
     logger.info("Shutting down application - closing database connections")
-
-    try:
-        neo4j_client = get_neo4j_client()
-        if neo4j_client:
-            neo4j_client.close()
-            logger.info("Neo4j connection closed")
-    except Exception as e:
-        logger.error("Error closing Neo4j connection: %s", str(e))
 
     try:
         mongo_client = get_mongo_client()
@@ -550,7 +539,7 @@ async def health():
 
     Response includes:
         - Overall status
-        - Component health (Neo4j, MongoDB)
+        - Component health (MongoDB)
         - Response times
         - Connection pool status
         - Metrics (if enabled)
@@ -559,17 +548,6 @@ async def health():
 
     overall_status = "healthy"
     components = {}
-
-    # Check Neo4j
-    try:
-        neo4j_client = get_neo4j_client()
-        neo4j_health = neo4j_client.health_check()
-        components["neo4j"] = neo4j_health
-        if neo4j_health["status"] != "healthy":
-            overall_status = "unhealthy"
-    except Exception as e:
-        components["neo4j"] = {"status": "unhealthy", "error": str(e)}
-        overall_status = "unhealthy"
 
     # Check MongoDB
     try:
