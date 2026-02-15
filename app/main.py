@@ -12,9 +12,13 @@ from fastapi.responses import StreamingResponse
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from pydantic import BaseModel, Field, validator, constr
+try:
+    from tqdm import tqdm
+except Exception:
+    tqdm = None
 
-from .models.data_model import JobAborted, IngestionStage, IngestionStageStatus, IngestionJobStatus
-from .utils import get_repo_path, now_ts
+from .models.data_model import IngestionStage, IngestionStageStatus, IngestionJobStatus
+from .utils import get_repo_path
 from .chat_service import stream_chat, stateless_stream_chat
 from .config import Config, validate_required_settings
 from .db import (
@@ -22,6 +26,8 @@ from .db import (
     init_mongo_client,
 )
 from .repo_ingestion_pipeline import start_ingestion_pipeline
+from .repo_ingestion_pipeline.file_state import build_repo_file_changes
+from .contextual_retrieval import ContextualRetrieval
 from .validators import validate_repo_name, validate_conversation_id, validate_job_id
 from .timeouts import with_timeout
 from .error_handlers import (
@@ -122,8 +128,12 @@ class ConversationMessagesResponse(BaseModel):
     messages: List[MessageModel]
 
 class IngestRequest(BaseModel):
-    repo_names: List[str]
+    repo_name: str
+    retrieval_enabled: bool = Field(default=True, description="Whether to enable contextual retrieval for this repo")
 
+class ContextualRetrievalBackfillRequest(BaseModel):
+    force_reindex: bool = False
+    
 
 @app.post("/conversations", response_model=ConversationCreateResponse)
 async def create_conversation(req: ConversationCreateRequest):
@@ -263,107 +273,216 @@ async def stateless_chat(req: StatelessChatRequest):
 @app.post("/ingest", responses={404: {"model": ErrorResponse}})
 async def ingest_repo(
     background_tasks: BackgroundTasks,
-    repo_names: IngestRequest = None,
+    ingest_request: IngestRequest = None,
 ):
-    if len(repo_names.repo_names) < 1:
-        raise HTTPException(status_code=400, detail="Provide repo_names")
+    if not ingest_request or not ingest_request.repo_name:
+        raise HTTPException(status_code=400, detail="Provide repo_name")
 
-    repos = repo_names.repo_names
-
-    # Validate repo names for security
-    for r in repos:
-        validate_repo_name(r)
-
-    # Validate repos exist and build paths
-    repo_paths: List[Path] = []
-    validated_repo_names: List[str] = []
+    repo_name = validate_repo_name(ingest_request.repo_name)
     mongo = get_mongo_client()
-    for r in repos:
-        logger.info(f"Processing repo for ingestion: {r}")
-        local_repo_path = get_repo_path(r)
-        if not local_repo_path.exists():
-            raise HTTPException(status_code=404, detail=f"Repository not found: {local_repo_path}")
+    logger.info(f"Processing repo for ingestion: {repo_name}")
+    local_repo_path = get_repo_path(repo_name)
+    if not local_repo_path.exists():
+        raise HTTPException(status_code=404, detail=f"Repository not found: {local_repo_path}")
 
-        repo_paths.append(local_repo_path)
-        validated_repo_names.append(r)
+    job_id = str(uuid4())
 
-    # Multiple repos: create batch + queued jobs, run sequentially in ONE task
-    batch_id = str(uuid4())
-    jobs = []
-
-    for idx, (path, repo_name) in enumerate(zip(repo_paths, validated_repo_names)):
-        job_id = str(uuid4())
-
-        job = IngestionJobStatus(
-            job_id=job_id,
-            repo_name=repo_name,
-            status="queued",
-            current_stage=IngestionStage.PRECHECK,
-            stage_status={
-                IngestionStage.PRECHECK: IngestionStageStatus.PENDING,
-                IngestionStage.RESOLVE_REFS: IngestionStageStatus.PENDING,
-                IngestionStage.REPO_GRAPH: IngestionStageStatus.PENDING,
-                IngestionStage.MENTAL_MODEL: IngestionStageStatus.PENDING,
-            },
-        )
-
-        await with_timeout(
-            asyncio.to_thread(mongo.upsert_ingestion_job, job, extra_fields={"batch_id": batch_id, "batch_index": idx}),
-            timeout_seconds=Config.DB_OPERATION_TIMEOUT,
-            operation_name="Create ingestion job"
-        )
-        jobs.append({"job_id": job_id, "repo_name": repo_name, "status": "queued", "batch_index": idx})
-
-    background_tasks.add_task(run_batch_sequentially, batch_id=batch_id)
-
-    return {"batch_id": batch_id, "jobs": jobs}
-
-
-async def run_batch_sequentially(batch_id: str):
-    mongo = get_mongo_client()
-
-    jobs = await asyncio.to_thread(
-        lambda: list(
-            mongo._db["ingestion_jobs"]
-            .find({"batch_id": batch_id}, {"_id": 0})
-            .sort("batch_index", 1)
-        )
+    job = IngestionJobStatus(
+        job_id=job_id,
+        repo_name=repo_name,
+        status="queued",
+        current_stage=IngestionStage.PRECHECK,
+        stage_status={
+            IngestionStage.PRECHECK: IngestionStageStatus.PENDING,
+            IngestionStage.RESOLVE_REFS: IngestionStageStatus.PENDING,
+            IngestionStage.REPO_GRAPH: IngestionStageStatus.PENDING,
+            IngestionStage.MENTAL_MODEL: IngestionStageStatus.PENDING,
+        },
     )
 
-    for job_doc in jobs:
-        job_id = job_doc["job_id"]
-        repo_name = job_doc["repo_name"]
-        local_repo_path = get_repo_path(repo_name)
+    await with_timeout(
+        asyncio.to_thread(
+            mongo.upsert_ingestion_job,
+            job,
+            extra_fields={
+                "operation": "full_ingest",
+                "retrieval_enabled": ingest_request.retrieval_enabled,
+            },
+        ),
+        timeout_seconds=Config.DB_OPERATION_TIMEOUT,
+        operation_name="Create ingestion job"
+    )
 
-        # If user aborted while queued, mark and skip
-        abort_requested = await asyncio.to_thread(mongo.is_abort_requested, job_id)
-        if abort_requested:
-            await asyncio.to_thread(
-                mongo.upsert_ingestion_job,
-                IngestionJobStatus(
-                    job_id=job_id,
-                    repo_name=repo_name,
-                    status="aborted",
-                    current_stage=IngestionStage.PRECHECK,
-                    stage_status={IngestionStage.PRECHECK: IngestionStageStatus.ABORTED},
-                ),
-                extra_fields={"aborted_before_start": True, "aborted_at": now_ts()},
-            )
-            continue
+    background_tasks.add_task(
+        start_ingestion_pipeline,
+        local_repo_path=local_repo_path,
+        repo_name=repo_name,
+        job_id=job_id,
+        retrieval_enabled=ingest_request.retrieval_enabled,
+    )
 
-        try:
-            await start_ingestion_pipeline(
-                local_repo_path=local_repo_path,
-                repo_name=repo_name,
+    return {"job_id": job_id, "repo_name": repo_name, "status": "queued"}
+
+@app.post("/repos/{repo_name}/contextual-retrieval", responses={404: {"model": ErrorResponse}})
+async def backfill_contextual_retrieval(
+    repo_name: str,
+    background_tasks: BackgroundTasks,
+    request: ContextualRetrievalBackfillRequest = None,
+):
+    request = request or ContextualRetrievalBackfillRequest()
+    repo_name = validate_repo_name(repo_name)
+    mongo = get_mongo_client()
+    local_repo_path = get_repo_path(repo_name)
+    if not local_repo_path.exists():
+        raise HTTPException(status_code=404, detail=f"Repository not found: {local_repo_path}")
+
+    is_ingested = await with_timeout(
+        asyncio.to_thread(mongo.is_repo_ingested, repo_name),
+        timeout_seconds=Config.DB_OPERATION_TIMEOUT,
+        operation_name="Check repo ingested"
+    )
+    if not is_ingested:
+        raise HTTPException(status_code=409, detail="Repository is not ingested yet")
+
+    job_id = str(uuid4())
+    mode = "force" if request.force_reindex else "incremental"
+    job = IngestionJobStatus(
+        job_id=job_id,
+        repo_name=repo_name,
+        status="queued",
+        current_stage=IngestionStage.MENTAL_MODEL,
+        stage_status={IngestionStage.MENTAL_MODEL: IngestionStageStatus.PENDING},
+    )
+    await with_timeout(
+        asyncio.to_thread(
+            mongo.upsert_ingestion_job,
+            job,
+            extra_fields={
+                "operation": "contextual_retrieval_backfill",
+                "retrieval_enabled": True,
+                "retrieval": {
+                    "mode": mode,
+                    "files_considered": 0,
+                    "files_indexed": 0,
+                    "files_skipped": 0,
+                },
+            },
+        ),
+        timeout_seconds=Config.DB_OPERATION_TIMEOUT,
+        operation_name="Create contextual retrieval job"
+    )
+
+    background_tasks.add_task(
+        run_contextual_retrieval_backfill,
+        repo_name=repo_name,
+        local_repo_path=local_repo_path,
+        job_id=job_id,
+        force_reindex=request.force_reindex,
+    )
+
+    return {
+        "job_id": job_id,
+        "repo_name": repo_name,
+        "status": "queued",
+        "operation": "contextual_retrieval_backfill",
+    }
+
+async def run_contextual_retrieval_backfill(
+    repo_name: str,
+    local_repo_path: Path,
+    job_id: str,
+    force_reindex: bool = False,
+):
+    mongo = get_mongo_client()
+    mode = "force" if force_reindex else "incremental"
+    try:
+        mongo.upsert_ingestion_job(
+            IngestionJobStatus(
                 job_id=job_id,
-            )
+                repo_name=repo_name,
+                status="running",
+                current_stage=IngestionStage.MENTAL_MODEL,
+                stage_status={IngestionStage.MENTAL_MODEL: IngestionStageStatus.RUNNING},
+            ),
+            extra_fields={"operation": "contextual_retrieval_backfill", "retrieval_enabled": True, "retrieval.mode": mode},
+        )
 
-        except JobAborted:
-            # already marked aborted in pipeline
-            continue
-        except Exception as e:
-            logger.exception("Ingestion pipeline failed", exc_info=e)
-            continue
+        previous_state = mongo.get_repo_file_states(repo_name)
+        changes = build_repo_file_changes(local_repo_path, previous_state)
+        retrieval = ContextualRetrieval(repo_name)
+        retrieval.delete_files(sorted(changes.deleted_files))
+
+        candidates = set()
+        if force_reindex:
+            candidates.update(rel for rel, entry in changes.current_files.items() if entry.supported)
+        else:
+            candidates.update(changes.new_files)
+            candidates.update(changes.changed_files)
+            for rel, entry in changes.current_files.items():
+                if entry.supported and rel not in candidates and not retrieval.has_file(rel):
+                    candidates.add(rel)
+
+        files_indexed = 0
+        files_skipped = 0
+        sorted_candidates = sorted(candidates)
+        pbar = tqdm(total=len(sorted_candidates), desc="Contextual retrieval backfill") if tqdm is not None else None
+        try:
+            for rel in sorted_candidates:
+                entry = changes.current_files.get(rel)
+                if not entry or not entry.supported:
+                    files_skipped += 1
+                    continue
+                try:
+                    code = (local_repo_path / rel).read_text(encoding="utf-8", errors="ignore")
+                    retrieval.delete_file(rel)
+                    await retrieval.index_file(rel, code)
+                    files_indexed += 1
+                except Exception as e:
+                    files_skipped += 1
+                    logger.warning("Contextual retrieval backfill failed for %s: %s", rel, e)
+                finally:
+                    if pbar is not None:
+                        pbar.update(1)
+        finally:
+            if pbar is not None:
+                pbar.close()
+
+        mongo.upsert_ingestion_job(
+            IngestionJobStatus(
+                job_id=job_id,
+                repo_name=repo_name,
+                status="completed",
+                current_stage=IngestionStage.MENTAL_MODEL,
+                stage_status={IngestionStage.MENTAL_MODEL: IngestionStageStatus.COMPLETED},
+            ),
+            extra_fields={
+                "operation": "contextual_retrieval_backfill",
+                "retrieval_enabled": True,
+                "retrieval.mode": mode,
+                "retrieval.files_considered": len(candidates),
+                "retrieval.files_indexed": files_indexed,
+                "retrieval.files_skipped": files_skipped,
+            },
+        )
+        
+    except Exception as e:
+        logger.exception("Contextual retrieval backfill failed", exc_info=e)
+        mongo.upsert_ingestion_job(
+            IngestionJobStatus(
+                job_id=job_id,
+                repo_name=repo_name,
+                status="failed",
+                current_stage=IngestionStage.MENTAL_MODEL,
+                stage_status={
+                    IngestionStage.MENTAL_MODEL: {
+                        "status": IngestionStageStatus.FAILED.value,
+                        "error": str(e),
+                    }
+                },
+            ),
+            error=str(e),
+            extra_fields={"operation": "contextual_retrieval_backfill", "retrieval_enabled": True, "retrieval.mode": mode},
+        )
 
 @app.delete("/repos", responses={404: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
 async def delete_repo(repo_name: str, delete_files: bool = False):
@@ -403,26 +522,9 @@ async def delete_repo(repo_name: str, delete_files: bool = False):
 
     return {"message": f"Repository {repo_name} and its data have been deleted."}
 
-@app.get("/status/batch/{batch_id}")
-async def get_batch_status(batch_id: str):
-    batch_id = validate_job_id(batch_id)
-    mongo = get_mongo_client()
-
-    jobs = await with_timeout(
-        asyncio.to_thread(mongo.get_batch_jobs, batch_id),
-        timeout_seconds=Config.DB_OPERATION_TIMEOUT,
-        operation_name="Get batch status"
-    )
-    if not jobs:
-        raise HTTPException(status_code=404, detail="Batch not found")
-
-    return {"batch_id": batch_id, "jobs": jobs}
-
-
 @app.get("/status")
 async def get_status(
     job_id: Optional[str] = None,
-    batch_id: Optional[str] = None,
     status: Optional[str] = None,
     repo_name: Optional[str] = None,
     limit: int = Query(50, ge=1, le=MAX_LIMIT),
@@ -430,8 +532,6 @@ async def get_status(
 ):
     if job_id:
         job_id = validate_job_id(job_id)
-    if batch_id:
-        batch_id = validate_job_id(batch_id)
     if repo_name:
         repo_name = validate_repo_name(repo_name)
 
@@ -450,7 +550,6 @@ async def get_status(
     jobs, total = await with_timeout(
         asyncio.to_thread(
             mongo.list_jobs,
-            batch_id=batch_id,
             status=status,
             repo_name=repo_name,
             limit=limit,
@@ -464,7 +563,6 @@ async def get_status(
         "jobs": jobs,
         "count": len(jobs),
         "total": total,
-        "batch_id": batch_id,
         "skip": skip,
         "limit": limit,
     }

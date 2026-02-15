@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import logging
 from pathlib import Path
 import traceback
@@ -82,7 +83,14 @@ class MentalModelStage:
         self.batch_size = int(config.get("batch_size", 20))
         self.max_concurrency = int(config.get("max_concurrency", 10))
 
-    async def run(self, repo_name: str, local_repo_path: Path):
+    async def run(
+        self,
+        repo_name: str,
+        local_repo_path: Path,
+        file_changes: Optional[dict] = None,
+        resolver_changes: Optional[dict] = None,
+        retrieval_enabled: bool = True,
+    ):
         self.lsp_cache = LSPCacheReader(str(local_repo_path))
         self.repo_name = repo_name
         self.local_repo_path = local_repo_path
@@ -90,10 +98,22 @@ class MentalModelStage:
 
         try:
             dir_tree = self._build_dir_tree()
-            critical_files, ignored_files = await self.identify_critical_files(dir_tree, repo_name)
+            files_to_process = self._select_files_to_process(
+                repo_name=repo_name,
+                all_files=dir_tree,
+                file_changes=file_changes,
+                resolver_changes=resolver_changes,
+            )
+            deleted_files = sorted((file_changes or {}).get("deleted_files", []))
+            await self._delete_removed_artifacts(repo_name, deleted_files, retrieval_enabled=retrieval_enabled)
+
+            critical_files, ignored_files = await self.identify_critical_files(
+                files_to_process, repo_name, retrieval_enabled=retrieval_enabled
+            )
             logger.info(
-                "Job %s: generated overview with %s critical files, ignored %s files",
+                "Job %s: generated overview from %s files with %s critical files, ignored %s files",
                 self.job_id,
+                len(files_to_process),
                 len(critical_files),
                 len(ignored_files),
             )
@@ -106,31 +126,38 @@ class MentalModelStage:
             traceback.print_exc()
             raise e
 
-    async def identify_critical_files(self, dir_tree: List[str], repo_name: str) -> Tuple[List[Dict[str, str]], Set[str]]:
+    async def identify_critical_files(
+        self,
+        dir_tree: List[str],
+        repo_name: str,
+        retrieval_enabled: bool = True,
+    ) -> Tuple[List[Dict[str, str]], Set[str]]:
         """Generate a comprehensive overview of the repo by summarizing critical files, ignoring non-critical ones."""
 
         semaphore = asyncio.Semaphore(self.max_concurrency)
-        retrieval = ContextualRetrieval(repo_name)
+        retrieval = ContextualRetrieval(repo_name) if retrieval_enabled else None
 
-        async def summarize_file(file_path: str) -> tuple[str, str, str | None]:
+        async def summarize_file(file_path: str) -> tuple[str, str, str | None, str | None]:
             try:
-                # file_path is relative to repo root, resolve it
                 full_path = self.local_repo_path / file_path
-                code = full_path.read_text(encoding="utf-8")
+                code_bytes = full_path.read_bytes()
+                code = code_bytes.decode("utf-8")
+                sha1 = hashlib.sha1(code_bytes).hexdigest()
             except Exception:
                 logger.warning("Job %s: unable to read %s; marking ignored", self.job_id, file_path)
-                return file_path, "IGNORE", None
+                return file_path, "IGNORE", None, None
 
             cached = self.mental_model_collection.find_one(
                 {
                     "repo_name": repo_name,
                     "file_path": file_path,
                     "document_type": {"$in": [MENTAL_MODEL_TYPES["BRIEF"], MENTAL_MODEL_TYPES["IGNORED"]]},
+                    "sha1": sha1,
                 },
                 {"_id": 0, "data": 1},
             )
             if cached:
-                return file_path, cached["data"], code
+                return file_path, cached["data"], code, sha1
 
             cfi = self.lsp_cache.cross_file_interactions(file_path)
             downstream_info = cfi.get("downstream", {}) or {}
@@ -163,7 +190,7 @@ class MentalModelStage:
                     system_prompt=PROMPT_SYSTEM,
                     temperature=0.0,
                 )
-            return file_path, response.strip(), code
+            return file_path, response.strip(), code, sha1
 
         all_files = dir_tree
 
@@ -171,49 +198,40 @@ class MentalModelStage:
         ignored: Set[str] = set()
 
         pbar = tqdm(total=len(all_files), desc="Processing files")
+        files_to_index: list[tuple[str, str]] = []
 
         for i in range(0, len(all_files), self.batch_size):
             batch = all_files[i : i + self.batch_size]
             tasks = [summarize_file(fp) for fp in batch]
             results = await asyncio.gather(*tasks)
 
-            files_to_index: list[tuple[str, str]] = []
-            for fp, summary, code in results:
+            for fp, summary, code, sha1 in results:
                 if summary == "IGNORE":
                     ignored.add(fp)
-                    self._upsert_document(
-                        {
-                            "repo_name": repo_name,
-                            "file_path": fp,
-                            "document_type": MENTAL_MODEL_TYPES["IGNORED"],
-                            "data": "IGNORE",
-                        }
-                    )
+                    if sha1:
+                        self._replace_file_document(repo_name, fp, MENTAL_MODEL_TYPES["IGNORED"], "IGNORE", sha1)
                 else:
                     insights.append({"file_path": fp, "summary": summary})
-                    self._upsert_document(
-                        {
-                            "repo_name": repo_name,
-                            "file_path": fp,
-                            "document_type": MENTAL_MODEL_TYPES["BRIEF"],
-                            "data": summary,
-                        }
-                    )
+                    if sha1:
+                        self._replace_file_document(repo_name, fp, MENTAL_MODEL_TYPES["BRIEF"], summary, sha1)
                     if code is not None:
                         files_to_index.append((fp, code))
-
-            # Index files for contextual retrieval in parallel
-            if files_to_index:
-                for fp, code in files_to_index:
-                    try:
-                        logger.info(f"Indexing file for contextual retrieval: {fp}")
-                        await retrieval.index_file(fp, code)
-                    except Exception as e:
-                        logger.warning("Job %s: failed to index %s: %s", self.job_id, fp, e)
 
             pbar.update(len(batch))
 
         pbar.close()
+
+        # Index files for contextual retrieval in parallel
+        if retrieval_enabled and retrieval is not None:
+            retrieval_pbar = tqdm(total=len(files_to_index), desc="Contextual retrieval")
+            for fp, code in files_to_index:
+                try:
+                    retrieval.delete_file(fp)
+                    await retrieval.index_file(fp, code)
+                    retrieval_pbar.update(1)
+                except Exception as e:
+                    logger.warning("Job %s: failed to index %s: %s", self.job_id, fp, e)
+            retrieval_pbar.close()
 
         for insight in insights:
             file_path = insight["file_path"]
@@ -288,3 +306,61 @@ class MentalModelStage:
             {"$set": document},
             upsert=True,
         )
+
+    def _replace_file_document(self, repo_name: str, file_path: str, doc_type: str, data: str, sha1: str):
+        self.mental_model_collection.delete_many(
+            {
+                "repo_name": repo_name,
+                "file_path": file_path,
+                "document_type": {"$in": [MENTAL_MODEL_TYPES["BRIEF"], MENTAL_MODEL_TYPES["IGNORED"]]},
+            }
+        )
+        self._upsert_document(
+            {
+                "repo_name": repo_name,
+                "file_path": file_path,
+                "document_type": doc_type,
+                "data": data,
+                "sha1": sha1,
+            }
+        )
+
+    async def _delete_removed_artifacts(
+        self,
+        repo_name: str,
+        deleted_files: List[str],
+        retrieval_enabled: bool = True,
+    ):
+        if not deleted_files:
+            return
+        self.mental_model_collection.delete_many(
+            {
+                "repo_name": repo_name,
+                "file_path": {"$in": deleted_files},
+                "document_type": {"$in": [MENTAL_MODEL_TYPES["BRIEF"], MENTAL_MODEL_TYPES["IGNORED"]]},
+            }
+        )
+        if retrieval_enabled:
+            retrieval = ContextualRetrieval(repo_name)
+            retrieval.delete_files(deleted_files)
+
+    def _select_files_to_process(
+        self,
+        repo_name: str,
+        all_files: List[str],
+        file_changes: Optional[dict],
+        resolver_changes: Optional[dict],
+    ) -> List[str]:
+        if not file_changes and not resolver_changes:
+            return all_files
+
+        selected: Set[str] = set()
+        selected.update(file_changes.get("new_files", []) if file_changes else [])
+        selected.update(file_changes.get("changed_files", []) if file_changes else [])
+
+        prefix = f"{repo_name}/"
+        for path in (resolver_changes or {}).get("impacted_ref_files", []):
+            selected.add(path[len(prefix):] if path.startswith(prefix) else path)
+
+        allowed = set(all_files)
+        return sorted([p for p in selected if p in allowed])

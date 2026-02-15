@@ -53,3 +53,9 @@ export PATH="$HOME/.local/bin:$PATH"
 ## Install Rust Server
 
 brew install rust-analyzer
+
+
+## Install typescript language server
+
+npm install -g typescript-language-server typescript
+

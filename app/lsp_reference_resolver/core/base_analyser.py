@@ -54,6 +54,9 @@ class BaseLSPAnalyzer:
         self.cache: Optional[Cache] = None
         self.cache_lock: Optional[asyncio.Lock] = None
         self.changed_files: Set[str] = set()
+        self.content_changed_files: Set[str] = set()
+        self.impacted_ref_files: Set[str] = set()
+        self.deleted_files: Set[str] = set()
         self._doc_versions = {}
         self.server_list: List[LSPClient] = []
 
@@ -198,6 +201,7 @@ class BaseLSPAnalyzer:
             current_files = {f"{self.base_repo_path}/{str(f.relative_to(self.repo_path))}" for f in files}
             cached_files = self.cache.get_all_cached_file_paths()
             deleted_files = cached_files - current_files
+            self.deleted_files = set(deleted_files)
             if deleted_files:
                 logger.info(f"Found {len(deleted_files)} deleted files, cleaning cache...")
                 mongo_client = get_mongo_client()
@@ -247,6 +251,8 @@ class BaseLSPAnalyzer:
                     impacted_ref_files.update(impacted)
 
         files_to_recompute: Set[str] = set(content_changed_files) | set(impacted_ref_files)
+        self.content_changed_files = set(content_changed_files)
+        self.impacted_ref_files = set(impacted_ref_files)
         self.changed_files = set(files_to_recompute)
 
         logger.info(f"{len(files_to_recompute)}/{len(files)} need to be recomputed")

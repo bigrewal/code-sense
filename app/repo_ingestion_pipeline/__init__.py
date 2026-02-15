@@ -1,6 +1,7 @@
 import logging
 from pathlib import Path
 from time import time
+from dataclasses import asdict
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
@@ -10,6 +11,7 @@ from ..utils import now_ts
 from ..llm_grok import GrokLLM
 from ..lsp_reference_resolver.run import CodeAnalyzer
 from .create_repo_graph import CreateRepoGraphStage
+from .file_state import build_repo_file_changes
 from .mental_model_gen import MentalModelStage
 from .pre_ingestion_analysis import PreIngestionAnalysisError, PreIngestionAnalysisStage
 
@@ -39,6 +41,7 @@ async def start_ingestion_pipeline(
     local_repo_path: Path,
     repo_name: str,
     job_id: Optional[str] = None,
+    retrieval_enabled: bool = True,
 ) -> any:
     llm = GrokLLM()
 
@@ -60,6 +63,16 @@ async def start_ingestion_pipeline(
         )
     )
 
+    previous_state = mongo.get_repo_file_states(repo_name)
+    file_changes_obj = build_repo_file_changes(local_repo_path, previous_state)
+    file_changes = asdict(file_changes_obj)
+    resolver_changes: Dict[str, List[str]] = {
+        "changed_files": [],
+        "content_changed_files": [],
+        "impacted_ref_files": [],
+        "deleted_files": [],
+    }
+
     # ---------- PRECHECK ----------
     _abort_if_requested(job_id, repo_name, IngestionStage.PRECHECK)
     try:
@@ -76,7 +89,19 @@ async def start_ingestion_pipeline(
         pre_ingestion_stage = PreIngestionAnalysisStage(
             llm_grok=llm, job_id=job_id, repo_name=repo_name
         )
-        analysis_summary = await pre_ingestion_stage.run(repo_path=local_repo_path)
+        analysis_summary = await pre_ingestion_stage.run(
+            repo_path=local_repo_path,
+            file_changes=file_changes_obj,
+            previous_state=previous_state,
+        )
+        analysis_summary.update(
+            {
+                "new_files": len(file_changes["new_files"]),
+                "changed_files": len(file_changes["changed_files"]),
+                "deleted_files": len(file_changes["deleted_files"]),
+                "unchanged_files": len(file_changes["unchanged_files"]),
+            }
+        )
 
         mongo.upsert_ingestion_job(
             IngestionJobStatus(
@@ -141,7 +166,7 @@ async def start_ingestion_pipeline(
             )
         )
 
-        await CodeAnalyzer(
+        resolver_changes = await CodeAnalyzer(
             repo=local_repo_path, repo_name=repo_name, job_id=job_id
         ).analyze()
 
@@ -154,6 +179,12 @@ async def start_ingestion_pipeline(
                 stage_status={
                     IngestionStage.RESOLVE_REFS: {
                         "status": IngestionStageStatus.COMPLETED.value,
+                        "metrics": {
+                            "changed_files": len(resolver_changes.get("changed_files", [])),
+                            "content_changed_files": len(resolver_changes.get("content_changed_files", [])),
+                            "impacted_ref_files": len(resolver_changes.get("impacted_ref_files", [])),
+                            "deleted_files": len(resolver_changes.get("deleted_files", [])),
+                        },
                     }
                 },  
             )
@@ -192,9 +223,10 @@ async def start_ingestion_pipeline(
             )
         )
 
-        await CreateRepoGraphStage(job_id=job_id).run(
+        repo_graph_metrics = await CreateRepoGraphStage(job_id=job_id).run(
             local_path=local_repo_path,
             repo_name=repo_name,
+            resolver_changes=resolver_changes,
         )
 
         mongo.upsert_ingestion_job(
@@ -205,7 +237,8 @@ async def start_ingestion_pipeline(
                 current_stage=IngestionStage.REPO_GRAPH,
                 stage_status={
                     IngestionStage.REPO_GRAPH: {
-                        "status": IngestionStageStatus.COMPLETED.value
+                        "status": IngestionStageStatus.COMPLETED.value,
+                        "metrics": repo_graph_metrics,
                     }
                 },
             )
@@ -247,6 +280,9 @@ async def start_ingestion_pipeline(
         critical_file_count, ignored_files_count, repo_context_token_count = await MentalModelStage(llm_grok=llm, config={"job_id": job_id}).run(
             repo_name=repo_name,
             local_repo_path=local_repo_path,
+            file_changes=file_changes,
+            resolver_changes=resolver_changes,
+            retrieval_enabled=retrieval_enabled,
         )
 
         mongo.upsert_ingestion_job(
@@ -292,5 +328,3 @@ async def start_ingestion_pipeline(
     mongo.add_ingested_repo(repo_name=repo_name, job_id=job_id)
 
     return {"status": "completed", "job_id": job_id}
-
-

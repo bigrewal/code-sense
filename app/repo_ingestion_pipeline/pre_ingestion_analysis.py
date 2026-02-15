@@ -2,12 +2,13 @@ import logging
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
-from collections import Counter
 import asyncio
 
 from tqdm import tqdm
+from ..db import get_mongo_client
 from ..llm_grok import GrokLLM
 from ..config import Config
+from .file_state import RepoFileChanges, build_repo_file_changes
 
 logger = logging.getLogger(__name__)
 
@@ -47,87 +48,76 @@ class PreIngestionAnalysisStage:
         self.job_id = job_id
         self.repo_name = repo_name
 
-    async def run(self, repo_path: Path) -> Dict[str, Any]:
-        file_metrics, scan_stats = await self.scan(repo_path)
+    async def run(
+        self,
+        repo_path: Path,
+        file_changes: Optional[RepoFileChanges] = None,
+        previous_state: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        mongo = get_mongo_client()
+        previous_state = previous_state if previous_state is not None else mongo.get_repo_file_states(self.repo_name)
+        file_changes = file_changes or build_repo_file_changes(repo_path=repo_path, previous_state=previous_state)
+
+        file_metrics, scan_stats, state_rows = await self.scan(
+            repo_path=repo_path,
+            file_changes=file_changes,
+            previous_state=previous_state,
+        )
+        mongo.upsert_repo_file_states(self.repo_name, state_rows)
+        mongo.delete_repo_file_states(self.repo_name, list(file_changes.deleted_files))
+
         summary = self.summarize(file_metrics=file_metrics, scan_stats=scan_stats)
+        summary["new_files"] = len(file_changes.new_files)
+        summary["changed_files"] = len(file_changes.changed_files)
+        summary["deleted_files"] = len(file_changes.deleted_files)
+        summary["unchanged_files"] = len(file_changes.unchanged_files)
         self.validate(summary)
         return summary
 
-    def _is_excluded(self, path: Path, repo_path: Path) -> bool:
-        if path.suffix in {".sqlite", ".sqlite-shm", ".sqlite-wal"}:
-            return True
-        try:
-            relative_parts = path.relative_to(repo_path).parts
-        except ValueError:
-            return False
-        return any(marker in relative_parts for marker in Config.IGNORE_FOLDERS)
-
-    def _classify_language(self, path: Path) -> Optional[str]:
-        # Map suffix -> language name (supported languages only)
-        return Config.SUPPORTED_LANGUAGES.get(path.suffix.lower())
-
-
-    async def scan(self, repo_path: Path) -> Tuple[List[FileMetric], Dict[str, Any]]:
+    async def scan(
+        self,
+        repo_path: Path,
+        file_changes: RepoFileChanges,
+        previous_state: Dict[str, Any],
+    ) -> Tuple[List[FileMetric], Dict[str, Any], List[Dict[str, Any]]]:
         """
         Enumerate files and compute per-file token metrics using the LLM tokenizer.
 
         Async tokenization with a max of 10 concurrent count_tokens() calls.
         Shows a progress bar for files pending/processed.
         """
-        repo_path = Path(repo_path)
-
         metrics: List[FileMetric] = []
-        excluded_file_count = 0
-        excluded_paths_counter: Counter[str] = Counter()
-
-        total_files_seen = 0
+        state_rows: List[Dict[str, Any]] = []
+        total_files_seen = len(file_changes.current_files)
         total_files_tokenized = 0
         tokenization_errors = 0
-
-        # ---- First pass: enumerate + apply exclusions (fast) ----
-        to_process: List[tuple[Path, str, bool, str]] = []
-        # items are: (file_path, language_label, supported, rel_path_str)
-
-        for file_path in repo_path.rglob("*"):
-            if not file_path.is_file():
-                continue
-
-            total_files_seen += 1
-
-            if self._is_excluded(file_path, repo_path=repo_path):
-                excluded_file_count += 1
-                try:
-                    rel_parts = file_path.relative_to(repo_path).parts
-                    if rel_parts:
-                        excluded_paths_counter[rel_parts[0]] += 1
-                except Exception:
-                    pass
-                continue
-
-            language = self._classify_language(file_path)
-            supported = bool(language)
-            language_label = language if supported else "unsupported/unknown"
-            rel = str(file_path.relative_to(repo_path))
-            to_process.append((file_path, language_label, supported, rel))
 
         # ---- Second pass: async processing with bounded concurrency ----
         sem = asyncio.Semaphore(10)
         lock = asyncio.Lock()
 
-        pbar = tqdm(total=len(to_process), desc="Pre-analysis file scan", unit="file")
+        changed_or_new = set(file_changes.changed_files) | set(file_changes.new_files)
+        pbar = tqdm(total=len(file_changes.current_files), desc="Pre-analysis file scan", unit="file")
 
-        async def process_one(file_path: Path, language_label: str, supported: bool, rel: str) -> None:
+        async def process_one(rel: str) -> None:
             nonlocal tokenization_errors, total_files_tokenized
 
-            try:
-                content = await asyncio.to_thread(file_path.read_text, encoding="utf-8", errors="ignore")
+            entry = file_changes.current_files[rel]
+            supported = entry.supported
+            language_label = entry.language if supported else "unsupported/unknown"
 
+            try:
                 if supported:
-                    # Limit only the expensive tokenizer call
-                    async with sem:
-                        tok = await asyncio.to_thread(self.llm_grok.count_tokens, content)
-                    async with lock:
-                        total_files_tokenized += 1
+                    if rel in changed_or_new or (previous_state.get(rel) or {}).get("token_count") is None:
+                        content = await asyncio.to_thread(
+                            (Path(repo_path) / rel).read_text, encoding="utf-8", errors="ignore"
+                        )
+                        async with sem:
+                            tok = await asyncio.to_thread(self.llm_grok.count_tokens, content)
+                        async with lock:
+                            total_files_tokenized += 1
+                    else:
+                        tok = int((previous_state.get(rel) or {}).get("token_count", 0))
                 else:
                     tok = 0
 
@@ -140,9 +130,18 @@ class PreIngestionAnalysisStage:
 
                 async with lock:
                     metrics.append(metric)
+                    state_rows.append(
+                        {
+                            "file_path": rel,
+                            "sha1": entry.sha1,
+                            "language": entry.language,
+                            "supported": supported,
+                            "token_count": tok,
+                        }
+                    )
 
             except Exception as e:
-                logger.warning(f"Tokenization error for file {file_path}: {e}")
+                logger.warning(f"Tokenization error for file {rel}: {e}")
                 async with lock:
                     tokenization_errors += 1
             finally:
@@ -150,7 +149,7 @@ class PreIngestionAnalysisStage:
                 pbar.update(1)
 
         try:
-            tasks = [asyncio.create_task(process_one(*item)) for item in to_process]
+            tasks = [asyncio.create_task(process_one(rel)) for rel in sorted(file_changes.current_files.keys())]
             await asyncio.gather(*tasks)
         finally:
             pbar.close()
@@ -159,14 +158,11 @@ class PreIngestionAnalysisStage:
             "total_files_seen": total_files_seen,
             "total_files_tokenized": total_files_tokenized,
             "tokenization_errors": tokenization_errors,
-            "excluded_file_count": excluded_file_count,
-            "excluded_paths_top": [
-                {"path": p, "count": c}
-                for p, c in excluded_paths_counter.most_common(10)
-            ],
+            "excluded_file_count": 0,
+            "excluded_paths_top": [],
             "ignore_folders": list(Config.IGNORE_FOLDERS),
         }
-        return metrics, scan_stats
+        return metrics, scan_stats, state_rows
 
     def summarize(self, file_metrics: List[FileMetric], scan_stats: Dict[str, Any]) -> Dict[str, Any]:
         tokens_by_lang: Dict[str, int] = {}
@@ -233,7 +229,7 @@ class PreIngestionAnalysisStage:
 
             "supported_file_count": supported_file_count,
             "unsupported_file_count": unsupported_file_count,
-            "coverage_ratio": total_files_tokenized/total_files_seen,
+            "coverage_ratio": (total_files_tokenized / total_files_seen) if total_files_seen else 0,
 
             # Token totals
             "supported_tokens": supported_tokens,
@@ -267,9 +263,9 @@ class PreIngestionAnalysisStage:
         }
 
     def validate(self, summary: Dict[str, Any]) -> None:
-        total_files_tokenized = int(summary.get("total_files_tokenized") or 0)
+        supported_tokens = int(summary.get("supported_tokens") or 0)
 
-        if total_files_tokenized <= 0:
+        if supported_tokens <= 0:
             summary["passes_precheck"] = False
             summary.setdefault("recommendations", []).append(
                 "No tokens counted. Ensure the repository contains supported files."

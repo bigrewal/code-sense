@@ -196,6 +196,18 @@ class ContextualRetrieval:
                 metadatas=batch_metadatas,
             )
 
+    def delete_file(self, file_path: str):
+        """Delete all indexed chunks for a file."""
+        self.collection.delete(where={"file_path": file_path})
+
+    def delete_files(self, file_paths: List[str]):
+        for file_path in file_paths:
+            self.delete_file(file_path)
+
+    def has_file(self, file_path: str) -> bool:
+        result = self.collection.get(where={"file_path": file_path}, limit=1, include=[])
+        return bool(result.get("ids"))
+
     def search(self, query: str, n: int = 20) -> List[Dict[str, Any]]:
         """Search for relevant chunks with Voyage reranking."""
         # Vector search - get more candidates for reranking

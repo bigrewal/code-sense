@@ -15,7 +15,7 @@ class CreateRepoGraphStage:
     def __init__(self, job_id: str):
         self.job_id = job_id
 
-    async def run(self, local_path: Path, repo_name: str) -> None:
+    async def run(self, local_path: Path, repo_name: str, resolver_changes: dict | None = None) -> dict:
         """
         Verify LSP reference cache exists.
 
@@ -33,4 +33,7 @@ class CreateRepoGraphStage:
                 "The RESOLVE_REFS stage should have created this cache."
             )
 
+        changed = len((resolver_changes or {}).get("changed_files", []))
+        skipped = changed == 0
         logger.info("Job %s: LSP reference cache verified at %s", self.job_id, cache_path)
+        return {"skipped_due_to_no_changes": skipped, "changed_files_count": changed}

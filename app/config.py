@@ -49,6 +49,8 @@ class Config:
         ".java": "java",
         ".scala": "scala",
         ".rs": "rust",
+        ".ts": "typescript",
+        ".tsx": "typescript",
     }
 
     LANGUAGE_DEFINITION_MAP: dict = {
@@ -66,6 +68,11 @@ class Config:
         },
         "java": {
             "class_declaration", "method_declaration", "interface_declaration"
+        },
+        "typescript": {
+            "function_declaration", "class_declaration", "interface_declaration",
+            "type_alias_declaration", "lexical_declaration", "method_definition",
+            "enum_declaration"
         }
     }
 

@@ -18,20 +18,19 @@ from .db_exceptions import (
     InvalidConnectionStringError,
 )
 from .db_retry import with_retry
-from .db_metrics import DatabaseMetrics
 from .utils import now_ts
 from .models.data_model import IngestionJobStatus, IngestionStage
 
 logger = logging.getLogger(__name__)
 
 # Module-level metrics collector (singleton)
-_db_metrics = DatabaseMetrics(slow_query_threshold_ms=Config.SLOW_QUERY_THRESHOLD_MS)
 
 INGESTION_JOBS_COLLECTION = "ingestion_jobs"
 INGESTED_REPOS_COLLECTION = "ingested_repos"
 CONVERSATIONS_COLLECTION = "conversations"
 MESSAGES_COLLECTION = "messages"
 MENTAL_MODEL_COLLECTION = "mental_model"
+INGESTION_FILE_STATE_COLLECTION = "ingestion_file_state"
 
 
 def _serialize_job(job_doc: Dict[str, Any]) -> Dict[str, Any]:
@@ -42,6 +41,9 @@ def _serialize_job(job_doc: Dict[str, Any]) -> Dict[str, Any]:
         "current_stage": job_doc.get("current_stage"),
         "stages": job_doc.get("stages", {}),
         "error": job_doc.get("error"),
+        "operation": job_doc.get("operation"),
+        "retrieval_enabled": job_doc.get("retrieval_enabled"),
+        "retrieval": job_doc.get("retrieval"),
         "created_at": job_doc.get("created_at"),
         "updated_at": job_doc.get("updated_at"),
     }
@@ -250,7 +252,6 @@ class MyMongoClient:
             )
 
             self._db = None
-            self._metrics = _db_metrics
             self._initialized = True
 
             logger.info("MongoDB client initialized successfully")
@@ -351,6 +352,42 @@ class MyMongoClient:
         })
         return [doc.get("file_path") for doc in docs if doc.get("file_path")]
 
+    def get_repo_file_states(self, repo_name: str) -> Dict[str, Dict[str, Any]]:
+        docs = self._db[INGESTION_FILE_STATE_COLLECTION].find(
+            {"repo_name": repo_name},
+            {"_id": 0, "file_path": 1, "sha1": 1, "language": 1, "supported": 1, "token_count": 1},
+        )
+        return {d["file_path"]: d for d in docs if d.get("file_path")}
+
+    def upsert_repo_file_states(self, repo_name: str, rows: List[Dict[str, Any]]) -> None:
+        collection = self._db[INGESTION_FILE_STATE_COLLECTION]
+        now = now_ts()
+        for row in rows:
+            file_path = row["file_path"]
+            update = {
+                "repo_name": repo_name,
+                "file_path": file_path,
+                "sha1": row["sha1"],
+                "language": row.get("language"),
+                "supported": bool(row.get("supported")),
+                "token_count": int(row.get("token_count", 0)),
+                "updated_at": now,
+                "last_seen_at": now,
+            }
+            collection.update_one(
+                {"repo_name": repo_name, "file_path": file_path},
+                {"$set": update, "$setOnInsert": {"created_at": now}},
+                upsert=True,
+            )
+
+    def delete_repo_file_states(self, repo_name: str, file_paths: List[str]) -> int:
+        if not file_paths:
+            return 0
+        result = self._db[INGESTION_FILE_STATE_COLLECTION].delete_many(
+            {"repo_name": repo_name, "file_path": {"$in": file_paths}}
+        )
+        return int(result.deleted_count)
+
     @with_retry(max_attempts=3, initial_delay=1.0)
     def delete_repo_data(self, repo_name: str) -> Dict[str, Any]:
         """
@@ -375,7 +412,6 @@ class MyMongoClient:
             result = client.delete_repo_data("my-repo")
             logger.info("Deleted %d documents", result["total_deleted"])
         """
-        operation = self._metrics.start_operation("delete_repo_data")
         start_time = time.time()
 
         # VALIDATION: Input checking
@@ -393,7 +429,8 @@ class MyMongoClient:
                 CONVERSATIONS_COLLECTION,
                 MESSAGES_COLLECTION,
                 MENTAL_MODEL_COLLECTION,
-                INGESTED_REPOS_COLLECTION
+                INGESTED_REPOS_COLLECTION,
+                INGESTION_FILE_STATE_COLLECTION,
             ]
             total_deleted = 0
 
@@ -416,7 +453,6 @@ class MyMongoClient:
             )
 
             duration_ms = (time.time() - start_time) * 1000
-            self._metrics.end_operation(operation, success=True)
 
             logger.info(
                 "Completed repo data deletion: repo_name=%s, total_deleted=%d, duration_ms=%.2f",
@@ -431,7 +467,6 @@ class MyMongoClient:
             }
 
         except Exception as e:
-            self._metrics.end_operation(operation, success=False, error=e)
             logger.error("Failed to delete repo data: repo_name=%s, error=%s", repo_name, str(e))
             raise QueryError(f"Failed to delete repo data: {str(e)}") from e
 
@@ -458,7 +493,6 @@ class MyMongoClient:
             result = client.create_conversation(repo_name="my-repo")
             conv_id = result["conversation_id"]
         """
-        operation = self._metrics.start_operation("create_conversation")
         start_time = time.time()
 
         # VALIDATION: Input checking
@@ -482,7 +516,6 @@ class MyMongoClient:
             result = collection.insert_one(new_conversation_doc)
 
             duration_ms = (time.time() - start_time) * 1000
-            self._metrics.end_operation(operation, success=True)
 
             logger.info(
                 "Created conversation: conversation_id=%s, repo_name=%s, duration_ms=%.2f",
@@ -496,7 +529,6 @@ class MyMongoClient:
             }
 
         except Exception as e:
-            self._metrics.end_operation(operation, success=False, error=e)
             logger.error("Failed to create conversation: repo_name=%s, error=%s", repo_name, str(e))
             raise QueryError(f"Failed to create conversation: {str(e)}") from e
     
@@ -580,7 +612,6 @@ class MyMongoClient:
     def list_jobs(
         self,
         *,
-        batch_id: Optional[str] = None,
         status: Optional[str] = None,
         repo_name: Optional[str] = None,
         limit: int = 50,
@@ -588,8 +619,6 @@ class MyMongoClient:
         include_total: bool = False,
     ) -> Union[List[Dict[str, Any]], Tuple[List[Dict[str, Any]], int]]:
         q: Dict[str, Any] = {}
-        if batch_id:
-            q["batch_id"] = batch_id
         if status:
             q["status"] = status
         if repo_name:
@@ -599,7 +628,7 @@ class MyMongoClient:
             "_id": 0,
             "job_id": 1, "repo_name": 1, "status": 1,
             "current_stage": 1, "error": 1,
-            "batch_id": 1, "batch_index": 1,
+            "operation": 1, "retrieval_enabled": 1, "retrieval": 1,
             "created_at": 1, "updated_at": 1,
         }
 
@@ -675,14 +704,6 @@ class MyMongoClient:
 
         self._db[MESSAGES_COLLECTION].delete_many({"conversation_id": conversation_id})
         self._db[CONVERSATIONS_COLLECTION].delete_one({"_id": oid})
-    
-    def get_batch_jobs(self, batch_id: str) -> List[Dict[str, Any]]:
-        cursor = (
-            self._db[INGESTION_JOBS_COLLECTION]
-            .find({"batch_id": batch_id}, {"_id": 0})
-            .sort("batch_index", 1)
-        )
-        return list(cursor)
     
     def get_job(self, job_id: str) -> dict | None:
         return self._db[INGESTION_JOBS_COLLECTION].find_one({"job_id": job_id}, {"_id": 0})
