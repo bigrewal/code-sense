@@ -221,4 +221,29 @@ docker compose down -v
 * MongoDB: mongodb://localhost:27017
 * CodeSense UI: http://localhost:5173/
 
+## Deep Code Bench Eval
+
+Run the benchmark evaluator against CodeSense's stateless chat API:
+
+```bash
+uv sync --extra eval
+uv run python evals/deep_code_bench.py \
+  --base-url http://localhost:8000 \
+  --split test \
+  --limit 5
+```
+
+Run on a single repository URL from dataset metadata:
+
+```bash
+uv run python evals/deep_code_bench.py \
+  --repo-url https://github.com/owner/repo
+```
+
+Requirements:
+
+* CodeSense API running and target repo already ingested
+* `XAI_API_KEY` set (LLM judge is required)
+* Internet access to download `Qodo/deep_code_bench` from Hugging Face
+
 ---

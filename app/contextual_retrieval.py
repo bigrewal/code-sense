@@ -81,6 +81,7 @@ class ContextualRetrieval:
         # Embedding models have much smaller limits than Grok; keep chunks compact.
         max_chars = 8000
         overlap_chars = 1000
+        min_chunk_chars = 400
 
         def split_text(text: str) -> List[str]:
             text = text.strip()
@@ -88,19 +89,61 @@ class ContextualRetrieval:
                 return []
             if len(text) <= max_chars:
                 return [text]
+
             parts = []
             start = 0
             while start < len(text):
-                end = min(len(text), start + max_chars)
+                hard_end = min(len(text), start + max_chars)
+                if hard_end == len(text):
+                    end = hard_end
+                else:
+                    # Prefer cutting at a newline to avoid slicing through tokens.
+                    candidate = text.rfind("\n", start + max_chars // 2, hard_end)
+                    end = candidate if candidate > start else hard_end
                 parts.append(text[start:end].strip())
                 if end == len(text):
                     break
-                start = max(0, end - overlap_chars)
+                next_start = max(0, end - overlap_chars)
+                if next_start > 0:
+                    # Re-align overlaps to line starts where possible.
+                    next_newline = text.find(
+                        "\n", next_start, min(len(text), next_start + overlap_chars)
+                    )
+                    if next_newline != -1:
+                        next_start = next_newline + 1
+                start = next_start if next_start > start else end
             return [p for p in parts if p]
+
+        def merge_small_chunks(chunks: List[str]) -> List[str]:
+            merged: List[str] = []
+            buffer = ""
+
+            for raw in chunks:
+                chunk = raw.strip()
+                if not chunk:
+                    continue
+
+                if not buffer:
+                    buffer = chunk
+                    continue
+
+                can_merge = len(buffer) + 2 + len(chunk) <= max_chars
+                if can_merge and (
+                    len(buffer) < min_chunk_chars or len(chunk) < min_chunk_chars // 2
+                ):
+                    buffer = f"{buffer}\n\n{chunk}"
+                    continue
+
+                merged.append(buffer)
+                buffer = chunk
+
+            if buffer:
+                merged.append(buffer)
+            return merged
 
         if not language:
             # Fallback for unsupported languages: chunk by size with overlap.
-            return split_text(code)
+            return merge_small_chunks(split_text(code))
 
         parser = get_parser(language)
         code_bytes = bytes(code, "utf8")
@@ -108,36 +151,75 @@ class ContextualRetrieval:
         definition_types = Config.LANGUAGE_DEFINITION_MAP.get(language, set())
 
         def_nodes = []
+        assignment_like_types = {
+            "assignment",
+            "lexical_declaration",
+            "val_definition",
+            "var_definition",
+            "val_declaration",
+            "var_declaration",
+        }
+        callable_types = {
+            "function_definition",
+            "function_item",
+            "function_declaration",
+            "method_declaration",
+            "method_definition",
+        }
+
+        def is_inside_callable(node) -> bool:
+            parent = node.parent
+            while parent:
+                if parent.type in callable_types:
+                    return True
+                parent = parent.parent
+            return False
 
         def extract_definitions(node):
             if node.type in definition_types:
-                def_nodes.append(node)
+                if node.type in assignment_like_types and is_inside_callable(node):
+                    pass
+                else:
+                    def_nodes.append(node)
             for child in node.children:
                 extract_definitions(child)
 
         extract_definitions(tree.root_node)
 
         if not def_nodes:
-            return split_text(code)
+            return merge_small_chunks(split_text(code))
 
-        def_nodes.sort(key=lambda n: n.start_byte)
+        # Keep a non-overlapping set of smallest spans to reduce duplicated content.
+        selected = []
+        selected_spans = []
+        for node in sorted(def_nodes, key=lambda n: (n.end_byte - n.start_byte, n.start_byte)):
+            overlaps = any(
+                not (node.end_byte <= start or node.start_byte >= end)
+                for start, end in selected_spans
+            )
+            if overlaps:
+                continue
+            selected.append(node)
+            selected_spans.append((node.start_byte, node.end_byte))
+
+        def_nodes = sorted(selected, key=lambda n: n.start_byte)
         chunks = []
         cursor = 0
 
         # Build chunks from gaps + definitions so no code is dropped.
         for node in def_nodes:
             if node.start_byte > cursor:
-                gap = code_bytes[cursor:node.start_byte].decode("utf8")
+                gap = code_bytes[cursor:node.start_byte].decode("utf8", errors="replace")
                 chunks.extend(split_text(gap))
-            definition = code_bytes[node.start_byte:node.end_byte].decode("utf8")
+            definition = code_bytes[node.start_byte:node.end_byte].decode("utf8", errors="replace")
             chunks.extend(split_text(definition))
             cursor = max(cursor, node.end_byte)
 
         if cursor < len(code_bytes):
-            tail = code_bytes[cursor:].decode("utf8")
+            tail = code_bytes[cursor:].decode("utf8", errors="replace")
             chunks.extend(split_text(tail))
 
-        return chunks
+        return merge_small_chunks(chunks)
 
     async def index_file(self, file_path: str, code: str):
         """Index a file's chunks with contextual embeddings."""
@@ -150,27 +232,11 @@ class ContextualRetrieval:
         metadatas = []
         ids = []
 
-        # Generate contexts in batches with single LLM calls
-        all_contexts = {}
-        batches = [chunks[i:i+10] for i in range(0, len(chunks), 10)]
-
-        for group_start in range(0, len(batches), 10):
-            group = batches[group_start:group_start + 10]
-
-            # Launch 10 concurrent generate_context calls
-            results = await asyncio.gather(
-                *(self.generate_context(code, batch_chunks) for batch_chunks in group)
-            )
-
-            # Merge results back into all_contexts with global indices
-            for batch_idx_in_group, batch_contexts in enumerate(results):
-                batch_global_idx = (group_start + batch_idx_in_group) * 10  # starting chunk index for this batch
-                for local_idx, context in batch_contexts.items():
-                    all_contexts[batch_global_idx + local_idx] = context
+        file_overview = self.mongo_client.get_brief_file_overview(self.repo_name, file_path)
 
         # Prepare texts, metadata, and IDs for embedding
         for i, chunk in enumerate(chunks):
-            context = all_contexts.get(i, "")
+            context = file_overview or ""
             contextualized = f"{context}\n\n{chunk}" if context else chunk
             texts_to_embed.append(contextualized)
             chunk_id = hashlib.md5(f"{file_path}:{i}:{chunk}".encode()).hexdigest()

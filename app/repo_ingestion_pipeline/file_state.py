@@ -1,7 +1,7 @@
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Set
+from typing import Dict, List, Optional, Set
 
 from ..config import Config
 
@@ -34,6 +34,16 @@ def _is_excluded(path: Path, repo_path: Path) -> bool:
 
 def _sha1_bytes(path: Path) -> str:
     return hashlib.sha1(path.read_bytes()).hexdigest()
+
+
+def list_contextual_retrieval_candidates(repo_path: Path) -> List[str]:
+    repo_path = Path(repo_path)
+    candidates: List[str] = []
+    for path in repo_path.rglob("*"):
+        if not path.is_file() or _is_excluded(path, repo_path):
+            continue
+        candidates.append(str(path.relative_to(repo_path)))
+    return sorted(candidates)
 
 
 def build_repo_file_changes(repo_path: Path, previous_state: Dict[str, dict]) -> RepoFileChanges:

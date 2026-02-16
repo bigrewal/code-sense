@@ -414,12 +414,12 @@ async def run_contextual_retrieval_backfill(
 
         candidates = set()
         if force_reindex:
-            candidates.update(rel for rel, entry in changes.current_files.items() if entry.supported)
+            candidates.update(changes.current_files.keys())
         else:
             candidates.update(changes.new_files)
             candidates.update(changes.changed_files)
             for rel, entry in changes.current_files.items():
-                if entry.supported and rel not in candidates and not retrieval.has_file(rel):
+                if rel not in candidates and not retrieval.has_file(rel):
                     candidates.add(rel)
 
         files_indexed = 0
@@ -429,11 +429,11 @@ async def run_contextual_retrieval_backfill(
         try:
             for rel in sorted_candidates:
                 entry = changes.current_files.get(rel)
-                if not entry or not entry.supported:
+                if not entry:
                     files_skipped += 1
                     continue
                 try:
-                    code = (local_repo_path / rel).read_text(encoding="utf-8", errors="ignore")
+                    code = (local_repo_path / rel).read_bytes().decode("utf-8")
                     retrieval.delete_file(rel)
                     await retrieval.index_file(rel, code)
                     files_indexed += 1

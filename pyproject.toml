@@ -29,3 +29,6 @@ test = [
     "pytest-mock>=3.11.0",
     "freezegun>=1.2.2",
 ]
+eval = [
+    "datasets>=2.21.0",
+]

@@ -10,6 +10,7 @@ from tqdm import tqdm
 from ..db import LSPCacheReader, get_mongo_client
 from ..llm_grok import GrokLLM
 from ..contextual_retrieval import ContextualRetrieval
+from .file_state import list_contextual_retrieval_candidates
 
 logger = logging.getLogger(__name__)
 
@@ -118,8 +119,9 @@ class MentalModelStage:
                 len(ignored_files),
             )
             repo_context_token_count = await self.create_repo_context(repo_name)
+            critical_total, ignored_total = self._get_repo_file_classification_counts(repo_name)
 
-            return len(critical_files), len(ignored_files), repo_context_token_count
+            return critical_total, ignored_total, repo_context_token_count
 
         except Exception as e:
             logger.exception("Job %s: mental model generation error", self.job_id)
@@ -198,14 +200,13 @@ class MentalModelStage:
         ignored: Set[str] = set()
 
         pbar = tqdm(total=len(all_files), desc="Processing files")
-        files_to_index: list[tuple[str, str]] = []
 
         for i in range(0, len(all_files), self.batch_size):
             batch = all_files[i : i + self.batch_size]
             tasks = [summarize_file(fp) for fp in batch]
             results = await asyncio.gather(*tasks)
 
-            for fp, summary, code, sha1 in results:
+            for fp, summary, _code, sha1 in results:
                 if summary == "IGNORE":
                     ignored.add(fp)
                     if sha1:
@@ -214,8 +215,6 @@ class MentalModelStage:
                     insights.append({"file_path": fp, "summary": summary})
                     if sha1:
                         self._replace_file_document(repo_name, fp, MENTAL_MODEL_TYPES["BRIEF"], summary, sha1)
-                    if code is not None:
-                        files_to_index.append((fp, code))
 
             pbar.update(len(batch))
 
@@ -223,14 +222,17 @@ class MentalModelStage:
 
         # Index files for contextual retrieval in parallel
         if retrieval_enabled and retrieval is not None:
-            retrieval_pbar = tqdm(total=len(files_to_index), desc="Contextual retrieval")
-            for fp, code in files_to_index:
+            retrieval_candidates = list_contextual_retrieval_candidates(self.local_repo_path)
+            retrieval_pbar = tqdm(total=len(retrieval_candidates), desc="Contextual retrieval")
+            for fp in retrieval_candidates:
                 try:
+                    code = (self.local_repo_path / fp).read_bytes().decode("utf-8")
                     retrieval.delete_file(fp)
                     await retrieval.index_file(fp, code)
-                    retrieval_pbar.update(1)
                 except Exception as e:
                     logger.warning("Job %s: failed to index %s: %s", self.job_id, fp, e)
+                finally:
+                    retrieval_pbar.update(1)
             retrieval_pbar.close()
 
         for insight in insights:
@@ -270,6 +272,15 @@ class MentalModelStage:
         )
 
         return repo_context_token_count
+
+    def _get_repo_file_classification_counts(self, repo_name: str) -> tuple[int, int]:
+        critical_total = self.mental_model_collection.count_documents(
+            {"repo_name": repo_name, "document_type": MENTAL_MODEL_TYPES["BRIEF"]}
+        )
+        ignored_total = self.mental_model_collection.count_documents(
+            {"repo_name": repo_name, "document_type": MENTAL_MODEL_TYPES["IGNORED"]}
+        )
+        return critical_total, ignored_total
 
     def _build_dir_tree(self) -> List[str]:
         """Build a list of code file paths by walking the repository."""
