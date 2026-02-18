@@ -88,18 +88,19 @@ class Cache:
         self.conn.commit()
 
     def _ensure_namespace(self):
-        cur = self.conn.execute("SELECT value FROM meta WHERE key = 'namespace'")
-        row = cur.fetchone()
-        if not row or row[0] != self.namespace:
-            # Soft-reset this namespace only
-            self.conn.execute("DELETE FROM files WHERE namespace = ?", (self.namespace,))
-            self.conn.execute("DELETE FROM mappings WHERE namespace = ?", (self.namespace,))
-            self.conn.execute("DELETE FROM def_index WHERE namespace = ?", (self.namespace,))
-            self.conn.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES('namespace', ?)",
-                (self.namespace,),
-            )
-            self.conn.commit()
+        """
+        Ensure namespace marker exists.
+
+        Important: tables are already keyed by `namespace`, so data from different
+        analyzers can coexist safely. Using a single global `meta.namespace` key
+        causes analyzers to wipe each other's namespace on startup, which forces
+        near-full recomputation on subsequent ingests.
+        """
+        self.conn.execute(
+            "INSERT OR IGNORE INTO meta(key, value) VALUES(?, ?)",
+            (f"namespace::{self.namespace}", "1"),
+        )
+        self.conn.commit()
 
     # ---------- file SHA helpers ----------
 

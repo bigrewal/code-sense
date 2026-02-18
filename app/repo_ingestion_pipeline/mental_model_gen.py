@@ -22,54 +22,40 @@ MENTAL_MODEL_TYPES = {
 }
 
 PROMPT_SYSTEM = (
-    "You are analyzing a single code file from a repository.\n\n"
-    "First, decide whether this file is CRITICAL to the repository’s core functionality.\n\n"
-    "A file is CRITICAL if it directly implements, coordinates, or enables the primary behavior "
-    "of the system (e.g., core logic, main services, orchestration, key data models, APIs, or entry points).\n\n"
-    "A file is NOT critical if it is primarily:\n"
-    "- tests, mocks, fixtures\n"
-    "- documentation or examples\n"
-    "- tutorials or demos\n"
-    "- configuration-only or boilerplate with no domain logic\n"
-    "- thin wrappers with no meaningful behavior\n\n"
-    "If the file is NOT critical, output exactly: IGNORE\n\n"
-    "If the file IS critical, write a concise and accurate summary that explains:\n"
-    "- the files main purpose\n"
-    "- its main components and what they do\n"
-    "- how it interacts with other important files or components\n\n"
-    "Do not quote code. Do not explain your reasoning. Do not add extra commentary."
+   "You analyze one repository file at a time.\n\n"
+    "Step 1: classify file criticality.\n"
+    "A file is CRITICAL if it directly implements/coordinates core product behavior, API surface, core data model, orchestration, or essential integration flow.\n"
+    "A file is NOT critical if it is primarily tests, fixtures, docs, examples, demos, generated code, config-only, or thin wrappers with no meaningful domain behavior.\n\n"
+    "If NOT critical, output exactly: IGNORE\n\n"
+    "If the file is critical, output exactly a concise summary using the required sentence template.\n"
+    "Be factual and concise. Use only evidence from code and dependency context.\n"
+    "No bullets, no markdown, no extra commentary."
 )
 
 PROMPT_USER_TEMPLATE = """
-Repository:
-{repo_name}
+    Repository: {repo_name}
+    File: {file_path}
 
-File:
-{file_path}
+    Code:
+    {code}
 
-Code:
-{code}
+    Upstream dependencies (who calls/uses this file):
+    {upstream}
 
-Upstream dependencies (who calls or uses this file):
-{upstream}
+    Downstream dependencies (what this file calls/uses):
+    {downstream}
 
-Downstream dependencies (what this file calls or uses):
-{downstream}
+    Instructions:
+    - If NOT critical, output exactly: IGNORE
+    - If CRITICAL, output one concise paragraph in this exact 3-sentence format:
 
-Instructions:
-- Decide whether this file is CRITICAL to the repository’s core functionality.
-- If NOT critical, output exactly: IGNORE
-- If CRITICAL, write a concise and accurate summary.
+    "`{file_path}` <what this file does and why it exists>. It does this by <main components/functions/classes and the core flow>. It interacts upstream with <key callers/modules> and downstream with <key callees/services/files>."
 
-Preferred format for critical files:
-"`{file_path}` <main purpose>. It defines <key components> that <primary responsibility>. "
-"It works with <other files or modules> to <explain the interaction or flow>."
-
-Output rules:
-- Output ONLY the description or IGNORE
-- Be concise, concrete, and readable
-- No bullet points, no markdown, no extra text
-""".strip()
+    Rules:
+    - Keep it very concise: 50-100 words total.
+    - Mention concrete identifiers when available.
+    - No bullets, no markdown, no extra text.
+    """.strip()
 
 
 class MentalModelStage:
@@ -372,6 +358,19 @@ class MentalModelStage:
         prefix = f"{repo_name}/"
         for path in (resolver_changes or {}).get("impacted_ref_files", []):
             selected.add(path[len(prefix):] if path.startswith(prefix) else path)
+
+        # Backfill missing mental-model docs even when there are no file deltas.
+        existing = self.mental_model_collection.find(
+            {
+                "repo_name": repo_name,
+                "document_type": {"$in": [MENTAL_MODEL_TYPES["BRIEF"], MENTAL_MODEL_TYPES["IGNORED"]]},
+            },
+            {"_id": 0, "file_path": 1},
+        )
+        documented_files = {doc.get("file_path") for doc in existing if doc.get("file_path")}
+        for path in all_files:
+            if path not in documented_files:
+                selected.add(path)
 
         allowed = set(all_files)
         return sorted([p for p in selected if p in allowed])

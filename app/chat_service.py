@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 from .tools.fetch_code_file import fetch_code_file
 from pydantic import BaseModel
 
 from bson import ObjectId
-import json
 
 from .db import get_mongo_client
 from .llm_grok import GrokLLM
@@ -32,8 +31,9 @@ class FileSelection(BaseModel):
 
 
 class FileSelectionResponse(BaseModel):
-    files: List[FileSelection]
-    reasoning: str
+    files_to_fetch: List[FileSelection] = []
+    summaries_sufficient: bool
+    reasoning: str = ""
 
 # ---------------------------
 # Public API
@@ -139,10 +139,9 @@ async def get_rephrased_question(messages: List[Dict[str, str]], repo_name: str)
         Resolve pronouns and references using conversation context, but do not add any analysis or answers."""
 
     # Build a user prompt with the conversation
-    conversation_text = "\n".join([
-        f"{msg['role'].upper()}: {msg['content']}" 
-        for msg in messages[1:]  # Skip system message
-    ])
+    conversation_text = "\n".join(
+        f"{msg['role'].upper()}: {msg['content']}" for msg in messages
+    )
     
     user_prompt = f"""CONVERSATION:
     {conversation_text}
@@ -207,9 +206,9 @@ async def stream_answer(user_question: str, repo_name: str):
         RULES
         ────────────────────────────────────────────
         - ONLY select files that are strictly necessary to answer the question.
-        - If the summaries already provide enough information, return:
-        - an empty "files_to_fetch" list
-        - summaries_sufficient = true
+        - Return ONLY valid JSON in this exact shape:
+          {{"files_to_fetch":[{{"file_path":"...","info_needed":"..."}}],"summaries_sufficient":true|false,"reasoning":"..."}}
+        - If the summaries already provide enough information, return "files_to_fetch": [] and "summaries_sufficient": true.
         - Do NOT guess or hallucinate code behavior.
         - Do NOT select files merely to “be safe” unless uncertainty would materially affect correctness.
         - Be explicit: name functions, classes, variables, or code paths when possible.
@@ -252,7 +251,7 @@ async def stream_answer(user_question: str, repo_name: str):
             
             return [
                 {"file_path": f.file_path, "info_needed": f.info_needed}
-                for f in parsed.files
+                for f in parsed.files_to_fetch
             ]
             
         except Exception as e:
@@ -274,11 +273,12 @@ async def stream_answer(user_question: str, repo_name: str):
 
             """
         
-        return await llm.generate_async(
+        insight = await llm.generate_async(
             prompt=user_prompt,
             system_prompt=system_prompt,
             temperature=0.0,
         )
+        return {"file_path": file_path, "insight": insight}
 
     async def _answer_query_using_repo_context(repo_context: str) -> str:
         system_prompt = f"""
@@ -322,8 +322,11 @@ async def stream_answer(user_question: str, repo_name: str):
         """
         # Filter out exceptions from file insights
         valid_file_insights = [
-            insight for insight in file_insights
-            if isinstance(insight, str)
+            insight
+            for insight in file_insights
+            if isinstance(insight, dict)
+            and isinstance(insight.get("file_path"), str)
+            and isinstance(insight.get("insight"), str)
         ]
         
         # Handle summary insight exception
@@ -333,8 +336,8 @@ async def stream_answer(user_question: str, repo_name: str):
         
         if valid_file_insights:
             context_parts.append("INSIGHTS FROM CODE FILES:")
-            for i, insight in enumerate(valid_file_insights, 1):
-                context_parts.append(f"[File {i}]\n{insight}")
+            for insight in valid_file_insights:
+                context_parts.append(f"[{insight['file_path']}]\n{insight['insight']}")
             context_parts.append("")
         
         if summary_insight:
@@ -447,4 +450,3 @@ async def stream_answer(user_question: str, repo_name: str):
         summary_insight=summary_insight
     ):
         yield chunk
-
