@@ -323,7 +323,7 @@ async def ingest_repo(
 
 @app.delete("/repos", responses={404: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
 async def delete_repo(repo_name: str, delete_files: bool = False):
-    """Delete a code repository and its associated data."""
+    """Delete a code repository and its associated data, including ingestion jobs."""
     repo_name = validate_repo_name(repo_name)
     local_repo_path = get_repo_path(repo_name)
 
@@ -334,21 +334,21 @@ async def delete_repo(repo_name: str, delete_files: bool = False):
     if not str(repo_path).startswith(str(base_dir)):
         raise HTTPException(status_code=400, detail="Invalid repo path")
 
-    if not local_repo_path.exists():
-        raise HTTPException(status_code=404, detail=f"Repository not found: {local_repo_path}")
-
     if delete_files:
-        try:
-            import shutil
-            shutil.rmtree(local_repo_path)
-        except Exception as exc:
-            logger.exception("Failed to delete repo files", exc_info=exc)
-            raise HTTPException(status_code=500, detail="Failed to delete repo files")
+        if local_repo_path.exists():
+            try:
+                import shutil
+                shutil.rmtree(local_repo_path)
+            except Exception as exc:
+                logger.exception("Failed to delete repo files", exc_info=exc)
+                raise HTTPException(status_code=500, detail="Failed to delete repo files")
+        else:
+            logger.info("Repo files not found for %s, continuing with DB cleanup", repo_name)
 
     mongo = get_mongo_client()
 
     try:
-        await with_timeout(
+        deletion_result = await with_timeout(
             asyncio.to_thread(mongo.delete_repo_data, repo_name),
             timeout_seconds=Config.DB_OPERATION_TIMEOUT,
             operation_name="Delete repo data"
@@ -357,7 +357,10 @@ async def delete_repo(repo_name: str, delete_files: bool = False):
         logger.exception("Failed to delete repo documents", exc_info=exc)
         raise HTTPException(status_code=500, detail="Failed to delete repo data")
 
-    return {"message": f"Repository {repo_name} and its data have been deleted."}
+    return {
+        "message": f"Repository {repo_name} and its data have been deleted.",
+        "total_deleted": deletion_result.get("total_deleted", 0),
+    }
 
 @app.get("/status")
 async def get_status(
@@ -503,4 +506,3 @@ async def health():
 
     status_code = 200 if overall_status == "healthy" else 503
     return JSONResponse(content=response, status_code=status_code)
-

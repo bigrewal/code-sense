@@ -184,7 +184,6 @@ class BaseLSPAnalyzer:
 
         files = self.get_files()
         logger.info("Found %d source files", len(files))
-        await self.start_server()
 
         timeout_primary = self.get_timeout_seconds()
         timeout_backoff = 0.2
@@ -262,6 +261,14 @@ class BaseLSPAnalyzer:
             if rp in files_to_recompute:
                 await file_queue.put(rp)
                 recompute_list.append(rp)
+
+        if not recompute_list:
+            logger.info("No changed files detected; skipping LSP server startup")
+            if self.cache:
+                self.cache.commit()
+            return
+
+        await self.start_server()
 
         batch_bar = tqdm(total=len(recompute_list), desc="Resolving references", leave=True) if self.show_progress else None
 
