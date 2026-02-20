@@ -170,7 +170,6 @@ class LSPClient:
         try:
             res_msg = await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError:
-            # await self.cancel_request(rid)
             logger.warning("LSP request timed out: %s", method)
             res_msg = {"error": {"code": -32800, "message": "timeout"}}
         finally:
@@ -185,15 +184,6 @@ class LSPClient:
             return None
 
         return res_msg.get("result", {})
-
-    async def cancel_request(self, request_id: int):
-        try:
-            raw = json.dumps({"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id": request_id}})
-            content = f"Content-Length: {len(raw)}\r\n\r\n{raw}"
-            self.process.stdin.write(content.encode())
-            await self.process.stdin.drain()
-        except Exception:
-            logger.debug("Failed to send $/cancelRequest")
 
     async def send_notification(self, method: str, params: dict):
         raw = json.dumps({"jsonrpc":"2.0","method":method,"params":params})

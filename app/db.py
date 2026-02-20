@@ -17,7 +17,6 @@ from .db_exceptions import (
     InvalidParameterError,
     InvalidConnectionStringError,
 )
-from .db_retry import with_retry
 from .utils import now_ts
 from .models.data_model import IngestionJobStatus, IngestionStage
 
@@ -42,14 +41,15 @@ def _serialize_job(job_doc: Dict[str, Any]) -> Dict[str, Any]:
         "stages": job_doc.get("stages", {}),
         "error": job_doc.get("error"),
         "operation": job_doc.get("operation"),
-        "retrieval_enabled": job_doc.get("retrieval_enabled"),
-        "retrieval": job_doc.get("retrieval"),
+        "enable_precheck": job_doc.get("enable_precheck"),
+        "enable_resolve_refs": job_doc.get("enable_resolve_refs"),
         "created_at": job_doc.get("created_at"),
         "updated_at": job_doc.get("updated_at"),
     }
 
 def _filter_stage_metrics(job: Dict[str, Any]) -> Dict[str, Any]:
     ALLOWED_PRECHECK_METRICS = {
+        "skipped",
         "supported_file_count",
         "unsupported_file_count",
         "language_distribution_pct",
@@ -65,6 +65,13 @@ def _filter_stage_metrics(job: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     return job
+
+
+def _validate_repo_name(repo_name: str) -> None:
+    if not repo_name or not isinstance(repo_name, str):
+        raise InvalidParameterError("repo_name must be a non-empty string")
+    if any(char in repo_name for char in ["$", "{", "}"]):
+        raise InvalidParameterError("repo_name contains invalid characters")
 
 
 class LSPCacheReader:
@@ -286,43 +293,6 @@ class MyMongoClient:
     def __getitem__(self, collection_name: str):
         return self._db[collection_name]
 
-    # ========== Former helper functions converted to methods ==========
-
-    def get_potential_entry_points(self, repo_name: str) -> List[str]:
-        collection = self._db[MENTAL_MODEL_COLLECTION]
-        docs = collection.find({
-            "repo_name": repo_name,
-            "document_type": "POTENTIAL_ENTRY_POINTS"
-        })
-        return [doc.get("file_path") for doc in docs if doc.get("file_path")]
-
-    def get_repo_summary(self, repo_name: str) -> str:
-        collection = self._db[MENTAL_MODEL_COLLECTION]
-        doc = collection.find_one({
-            "repo_name": repo_name,
-            "document_type": "REPO_SUMMARY"
-        })
-        return doc.get("data", "") if doc else ""
-
-    def get_brief_file_overviews(self, repo_name: str, file_paths: List[str]) -> List[Dict[str, str]]:
-        collection = self._db[MENTAL_MODEL_COLLECTION]
-        result = []
-
-        for file_path in file_paths:
-            doc = collection.find_one(
-                {
-                    "repo_name": repo_name,
-                    "document_type": "BRIEF_FILE_OVERVIEW",
-                    "file_path": file_path
-                },
-                {"_id": 0, "data": 1},
-            )
-            brief = (doc or {}).get("data", "")
-            if brief:
-                result.append({"file_path": file_path, "brief": brief})
-
-        return result
-
     def get_brief_file_overview(self, repo_name: str, file_path: str) -> str:
         collection = self._db[MENTAL_MODEL_COLLECTION]
         doc = collection.find_one(
@@ -388,7 +358,6 @@ class MyMongoClient:
         )
         return int(result.deleted_count)
 
-    @with_retry(max_attempts=3, initial_delay=1.0)
     def delete_repo_data(self, repo_name: str) -> Dict[str, Any]:
         """
         Delete all data for a repository across collections.
@@ -413,14 +382,7 @@ class MyMongoClient:
             logger.info("Deleted %d documents", result["total_deleted"])
         """
         start_time = time.time()
-
-        # VALIDATION: Input checking
-        if not repo_name or not isinstance(repo_name, str):
-            raise InvalidParameterError("repo_name must be a non-empty string")
-
-        # SECURITY: Sanitize repo_name
-        if any(char in repo_name for char in ['$', '{', '}']):
-            raise InvalidParameterError("repo_name contains invalid characters")
+        _validate_repo_name(repo_name)
 
         try:
             logger.info("Deleting all data for repo_name: %s", repo_name)
@@ -470,7 +432,6 @@ class MyMongoClient:
             logger.error("Failed to delete repo data: repo_name=%s, error=%s", repo_name, str(e))
             raise QueryError(f"Failed to delete repo data: {str(e)}") from e
 
-    @with_retry(max_attempts=3, initial_delay=1.0)
     def create_conversation(self, repo_name: str) -> dict:
         """
         Create a new conversation for a repository.
@@ -494,14 +455,7 @@ class MyMongoClient:
             conv_id = result["conversation_id"]
         """
         start_time = time.time()
-
-        # VALIDATION: Input checking
-        if not repo_name or not isinstance(repo_name, str):
-            raise InvalidParameterError("repo_name must be a non-empty string")
-
-        # SECURITY: Sanitize repo_name (basic check)
-        if any(char in repo_name for char in ['$', '{', '}']):
-            raise InvalidParameterError("repo_name contains invalid characters")
+        _validate_repo_name(repo_name)
 
         try:
             collection = self._db[CONVERSATIONS_COLLECTION]
@@ -603,11 +557,9 @@ class MyMongoClient:
         collection = self._db[INGESTION_JOBS_COLLECTION]
         projection = {"_id": 0}
         job_doc = collection.find_one({"job_id": job_id}, projection)
-        job_unfiltered = _serialize_job(job_doc) if job_doc else None
-        if job_unfiltered:
-            job_filtered = _filter_stage_metrics(job_unfiltered)
-            return job_filtered
-        return None
+        if not job_doc:
+            return None
+        return _filter_stage_metrics(_serialize_job(job_doc))
     
     def list_jobs(
         self,
@@ -628,7 +580,8 @@ class MyMongoClient:
             "_id": 0,
             "job_id": 1, "repo_name": 1, "status": 1,
             "current_stage": 1, "error": 1,
-            "operation": 1, "retrieval_enabled": 1, "retrieval": 1,
+            "operation": 1,
+            "enable_precheck": 1, "enable_resolve_refs": 1,
             "created_at": 1, "updated_at": 1,
         }
 
@@ -717,17 +670,6 @@ class MyMongoClient:
         doc = collection.find_one({"repo_name": repo_name}, {"_id": 1})
         return doc is not None
     
-    def is_repo_being_ingested(self, repo_name: str) -> bool:
-        collection = self._db[INGESTION_JOBS_COLLECTION]
-        doc = collection.find_one(
-            {
-                "repo_name": repo_name,
-                "status": {"$in": ["running", "pending"]}
-            },
-            {"_id": 1}
-        )
-        return doc is not None
-
     def health_check(self) -> Dict[str, Any]:
         """
         Perform health check on MongoDB connection.

@@ -5,18 +5,19 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 from typing import Any, Dict, List
-from .tools.fetch_code_file import fetch_code_file
-from pydantic import BaseModel
+import logging
 
 from bson import ObjectId
+from pydantic import BaseModel, Field
 
 from .db import get_mongo_client
 from .llm_grok import GrokLLM
-from .contextual_retrieval import ContextualRetrieval
+from .tools.fetch_code_file import fetch_code_file
 
 MENTAL_MODEL_COL = "mental_model"
 CONVERSATIONS_COL = "conversations"
 MESSAGES_COL = "messages"
+logger = logging.getLogger(__name__)
 
 llm = GrokLLM()
 
@@ -31,50 +32,33 @@ class FileSelection(BaseModel):
 
 
 class FileSelectionResponse(BaseModel):
-    files_to_fetch: List[FileSelection] = []
-    summaries_sufficient: bool
-    reasoning: str = ""
+    files_to_fetch: List[FileSelection] = Field(default_factory=list)
 
 # ---------------------------
 # Public API
 # ---------------------------
 
 async def stream_chat(conversation_id: str, user_message: str):
-    # 1) Look up conversation to get repo_name
     conv = await asyncio.to_thread(conversations_col.find_one, {"_id": ObjectId(conversation_id)})
     if not conv:
-        # You could also raise an HTTPException at the route level,
-        # but for now we just stream an error message.
         yield "Conversation not found.\n"
         return
 
     repo_name = conv["repo_name"]
 
-    # 3) Load previous messages for this conversation
     history_cursor = messages_col.find(
         {"conversation_id": conversation_id}
     ).sort("created_at", 1)
 
-    messages_for_llm: List[Dict[str, str]] = []
-
     history_docs = await asyncio.to_thread(list, history_cursor)
-    for m in history_docs:
-        messages_for_llm.append(
-            {
-                "role": m["role"],
-                "content": m["content"],
-            }
-        )
-    
-    messages_for_llm.append(
-        {
-            "role": "user",
-            "content": user_message,
-        }
-    )
+    messages_for_llm: List[Dict[str, str]] = [
+        {"role": m["role"], "content": m["content"]}
+        for m in history_docs
+    ]
+    messages_for_llm.append({"role": "user", "content": user_message})
 
     rephrased_user_question = await get_rephrased_question(messages=messages_for_llm, repo_name=repo_name)
-    print(f"Rephrased question: {rephrased_user_question}")
+    logger.debug("Rephrased question for repo=%s", repo_name)
 
     now = datetime.now(timezone.utc)
     await asyncio.to_thread(
@@ -87,13 +71,11 @@ async def stream_chat(conversation_id: str, user_message: str):
         },
     )
 
-    # 6) Stream assistant reply, capturing content so we can save it at the end
     captured: List[str] = []
     async for chunk in stream_answer(user_question=rephrased_user_question, repo_name=repo_name):
         captured.append(chunk)
         yield chunk
 
-    # 7) Save assistant message after streaming completes
     assistant_content = "".join(captured)
     await asyncio.to_thread(
         messages_col.insert_one,
@@ -121,7 +103,6 @@ async def stateless_stream_chat(repo_name: str, user_message: str):
 # ---------------------------
 
 async def get_rephrased_question(messages: List[Dict[str, str]], repo_name: str):
-    # If it's the first user message, no rephrasing needed
     if len(messages) <= 2:
         return messages[-1]["content"]
     
@@ -138,7 +119,6 @@ async def get_rephrased_question(messages: List[Dict[str, str]], repo_name: str)
 
         Resolve pronouns and references using conversation context, but do not add any analysis or answers."""
 
-    # Build a user prompt with the conversation
     conversation_text = "\n".join(
         f"{msg['role'].upper()}: {msg['content']}" for msg in messages
     )
@@ -159,27 +139,7 @@ async def stream_answer(user_question: str, repo_name: str):
 
     async def _select_files_for_query(
         repo_context: str,
-        chunk_context: str = "",
     ) -> List[Dict[str, str]]:
-        """
-        Ask Grok to identify which files need to be fetched to answer the user's question.
-        
-        Returns a list of dicts:
-        [
-            {"file_path": "src/auth/login.py", "info_needed": "How JWT token is validated"},
-            {"file_path": "src/db/users.py", "info_needed": "User table schema"},
-        ]
-        
-        Returns empty list if summaries alone can answer the question or on parse failure.
-        """
-        
-        chunk_section = f"""
-        RELEVANT CODE CHUNKS (from semantic search):
-        ────────────────────────────────────────────
-        {chunk_context.strip()}
-        ────────────────────────────────────────────
-        """ if chunk_context else ""
-
         system_prompt = f"""
         You are a senior codebase analysis agent.
 
@@ -193,7 +153,6 @@ async def stream_answer(user_question: str, repo_name: str):
         FILE SUMMARIES (may be incomplete or lossy):
         {repo_context.strip()}
         ────────────────────────────────────────────
-        {chunk_section}
 
         TASK
         ────────────────────────────────────────────
@@ -254,8 +213,8 @@ async def stream_answer(user_question: str, repo_name: str):
                 for f in parsed.files_to_fetch
             ]
             
-        except Exception as e:
-            print(f"Error in file selection: {e}")
+        except Exception:
+            logger.exception("Error selecting files for query")
             return []
         
     async def _read_file_and_fetch_info(repo_name: str, file_path: str, info_needed: str):
@@ -317,10 +276,6 @@ async def stream_answer(user_question: str, repo_name: str):
         file_insights: List[Any],
         summary_insight: str,
     ):
-        """
-        Synthesize final answer from gathered insights. Returns a streaming generator.
-        """
-        # Filter out exceptions from file insights
         valid_file_insights = [
             insight
             for insight in file_insights
@@ -329,9 +284,6 @@ async def stream_answer(user_question: str, repo_name: str):
             and isinstance(insight.get("insight"), str)
         ]
         
-        # Handle summary insight exception
-        
-        # Build context block
         context_parts = []
         
         if valid_file_insights:
@@ -411,23 +363,11 @@ async def stream_answer(user_question: str, repo_name: str):
     )
     repo_context = (arch_doc or {}).get("context", "")
 
-    # Stage 0: Vector search for relevant code chunks
-    retrieval = ContextualRetrieval(repo_name)
-    relevant_chunks = retrieval.search(user_question, n=20)
-    print(f"Found {len(relevant_chunks)} relevant code chunks from vector search.")
-    chunk_context = "\n".join([
-        f"[{c['file_path']}]: {c['content']}..."
-        for c in relevant_chunks
-    ]) if relevant_chunks else ""
-
-    # Stage 1: Find out if we need to fetch code of various files to answer the question
-    additional_info_required: List[Dict[str, str]] = await _select_files_for_query(repo_context=repo_context, chunk_context=chunk_context)
+    additional_info_required: List[Dict[str, str]] = await _select_files_for_query(repo_context=repo_context)
     
-
-    # Stage 2: Fetch the information required 
     tasks = []
     for file_info in additional_info_required:
-        print(f"Fetching info from file: {file_info['file_path']}")
+        logger.debug("Fetching info from file: %s", file_info["file_path"])
         tasks.append(_read_file_and_fetch_info(
             repo_name=repo_name,
             file_path=file_info["file_path"],
@@ -443,7 +383,6 @@ async def stream_answer(user_question: str, repo_name: str):
     file_insights = results[:-1]
     summary_insight = results[-1]
     
-    # Stage 3: Synthesise the final response
     async for chunk in _synth_final_answer(
         user_question=user_question,
         file_insights=file_insights,

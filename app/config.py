@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import List
 
 if Path(".env.local").exists():
     # Optional local-only overrides; production should rely on env vars.
@@ -11,9 +11,7 @@ if Path(".env.local").exists():
 
 class Config:
     XAI_API_KEY = os.getenv("XAI_API_KEY")
-    VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY")
     GROK_4_NON_REASONING_MODEL = "grok-4-1-fast-non-reasoning"
-    GROK_4_REASONING_MODEL = "grok-4-1-fast-reasoning"
     LLM_TEMPERATURE = 0.7
     LLM_MAX_TOKENS = 10240
 
@@ -24,7 +22,7 @@ class Config:
     MONGO_URI: str = os.getenv("MONGO_URI")
     MONGO_DB_NAME: str = "code_comprehension"
 
-    IGNORE_FOLDERS: dict = {
+    IGNORE_FOLDERS: set[str] = {
         "test",
         "tests",
         "docs",
@@ -44,7 +42,7 @@ class Config:
         "site-packages",
     }
 
-    SUPPORTED_LANGUAGES: dict = {
+    SUPPORTED_LANGUAGES: dict[str, str] = {
         ".py": "python",
         ".java": "java",
         ".scala": "scala",
@@ -53,7 +51,7 @@ class Config:
         ".tsx": "typescript",
     }
 
-    LANGUAGE_DEFINITION_MAP: dict = {
+    LANGUAGE_DEFINITION_MAP: dict[str, set[str]] = {
         "python": {"function_definition", "class_definition", "assignment"},
         "rust": {
             "struct_item", "enum_item", "union_item", "type_item",
@@ -85,31 +83,16 @@ class Config:
     MONGO_MIN_POOL_SIZE: int = int(os.getenv("MONGO_MIN_POOL_SIZE", "10"))
     MONGO_MAX_IDLE_TIME_MS: int = int(
         os.getenv("MONGO_MAX_IDLE_TIME_MS", "300000")
-    )  # 5 minutes
+    ) 
     MONGO_SERVER_SELECTION_TIMEOUT_MS: int = int(
         os.getenv("MONGO_SERVER_SELECTION_TIMEOUT_MS", "30000")
-    )  # 30 seconds
+    )
     MONGO_CONNECT_TIMEOUT_MS: int = int(
         os.getenv("MONGO_CONNECT_TIMEOUT_MS", "20000")
-    )  # 20 seconds
+    )
     MONGO_SOCKET_TIMEOUT_MS: int = int(
         os.getenv("MONGO_SOCKET_TIMEOUT_MS", "300000")
-    )  # 5 minutes
-
-    # ========== Retry Configuration ==========
-
-    DB_MAX_RETRY_ATTEMPTS: int = int(os.getenv("DB_MAX_RETRY_ATTEMPTS", "3"))
-    DB_RETRY_INITIAL_DELAY: float = float(os.getenv("DB_RETRY_INITIAL_DELAY", "1.0"))
-    DB_RETRY_BACKOFF_MULTIPLIER: float = float(
-        os.getenv("DB_RETRY_BACKOFF_MULTIPLIER", "2.0")
     )
-
-    # ========== Performance Monitoring ==========
-
-    SLOW_QUERY_THRESHOLD_MS: int = int(
-        os.getenv("SLOW_QUERY_THRESHOLD_MS", "1000")
-    )  # 1 second
-    ENABLE_DB_METRICS: bool = os.getenv("ENABLE_DB_METRICS", "true").lower() == "true"
 
     # ========== Security ==========
 
@@ -122,11 +105,7 @@ class Config:
         "http://localhost:5173,http://localhost:8000"
     ).split(",")
 
-    # ========== Timeout Configuration ==========
-
     DB_OPERATION_TIMEOUT: int = int(os.getenv("DB_OPERATION_TIMEOUT", "30"))  # 30s
-    LLM_OPERATION_TIMEOUT: int = int(os.getenv("LLM_OPERATION_TIMEOUT", "120"))  # 2 min
-    STREAMING_TIMEOUT: int = int(os.getenv("STREAMING_TIMEOUT", "300"))  # 5 min
 
 
 def validate_required_settings() -> None:
@@ -148,12 +127,3 @@ def validate_required_settings() -> None:
             f"MONGO_MAX_POOL_SIZE ({Config.MONGO_MAX_POOL_SIZE}) must be >= "
             f"MONGO_MIN_POOL_SIZE ({Config.MONGO_MIN_POOL_SIZE})"
         )
-
-    if Config.DB_MAX_RETRY_ATTEMPTS < 1:
-        raise ValueError("DB_MAX_RETRY_ATTEMPTS must be >= 1")
-
-    if Config.DB_RETRY_INITIAL_DELAY <= 0:
-        raise ValueError("DB_RETRY_INITIAL_DELAY must be > 0")
-
-    if Config.DB_RETRY_BACKOFF_MULTIPLIER <= 1.0:
-        raise ValueError("DB_RETRY_BACKOFF_MULTIPLIER must be > 1.0")

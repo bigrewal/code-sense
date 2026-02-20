@@ -5,17 +5,12 @@ from pathlib import Path
 from typing import List, Optional
 from uuid import uuid4
 
-from bson import ObjectId
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from pydantic import BaseModel, Field, validator, constr
-try:
-    from tqdm import tqdm
-except Exception:
-    tqdm = None
+from pydantic import BaseModel
 
 from .models.data_model import IngestionStage, IngestionStageStatus, IngestionJobStatus
 from .utils import get_repo_path
@@ -26,8 +21,6 @@ from .db import (
     init_mongo_client,
 )
 from .repo_ingestion_pipeline import start_ingestion_pipeline
-from .repo_ingestion_pipeline.file_state import build_repo_file_changes
-from .contextual_retrieval import ContextualRetrieval
 from .validators import validate_repo_name, validate_conversation_id, validate_job_id
 from .timeouts import with_timeout
 from .error_handlers import (
@@ -39,7 +32,6 @@ from .middleware import RequestLoggingMiddleware
 
 MAX_LIMIT = 200
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Code Sense API", version="1.0.0")
@@ -129,10 +121,8 @@ class ConversationMessagesResponse(BaseModel):
 
 class IngestRequest(BaseModel):
     repo_name: str
-    retrieval_enabled: bool = Field(default=True, description="Whether to enable contextual retrieval for this repo")
-
-class ContextualRetrievalBackfillRequest(BaseModel):
-    force_reindex: bool = False
+    enable_precheck: bool = True
+    enable_resolve_refs: bool = True
     
 
 @app.post("/conversations", response_model=ConversationCreateResponse)
@@ -306,7 +296,8 @@ async def ingest_repo(
             job,
             extra_fields={
                 "operation": "full_ingest",
-                "retrieval_enabled": ingest_request.retrieval_enabled,
+                "enable_precheck": ingest_request.enable_precheck,
+                "enable_resolve_refs": ingest_request.enable_resolve_refs,
             },
         ),
         timeout_seconds=Config.DB_OPERATION_TIMEOUT,
@@ -318,171 +309,17 @@ async def ingest_repo(
         local_repo_path=local_repo_path,
         repo_name=repo_name,
         job_id=job_id,
-        retrieval_enabled=ingest_request.retrieval_enabled,
-    )
-
-    return {"job_id": job_id, "repo_name": repo_name, "status": "queued"}
-
-@app.post("/repos/{repo_name}/contextual-retrieval", responses={404: {"model": ErrorResponse}})
-async def backfill_contextual_retrieval(
-    repo_name: str,
-    background_tasks: BackgroundTasks,
-    request: ContextualRetrievalBackfillRequest = None,
-):
-    request = request or ContextualRetrievalBackfillRequest()
-    repo_name = validate_repo_name(repo_name)
-    mongo = get_mongo_client()
-    local_repo_path = get_repo_path(repo_name)
-    if not local_repo_path.exists():
-        raise HTTPException(status_code=404, detail=f"Repository not found: {local_repo_path}")
-
-    is_ingested = await with_timeout(
-        asyncio.to_thread(mongo.is_repo_ingested, repo_name),
-        timeout_seconds=Config.DB_OPERATION_TIMEOUT,
-        operation_name="Check repo ingested"
-    )
-    if not is_ingested:
-        raise HTTPException(status_code=409, detail="Repository is not ingested yet")
-
-    job_id = str(uuid4())
-    mode = "force" if request.force_reindex else "incremental"
-    job = IngestionJobStatus(
-        job_id=job_id,
-        repo_name=repo_name,
-        status="queued",
-        current_stage=IngestionStage.MENTAL_MODEL,
-        stage_status={IngestionStage.MENTAL_MODEL: IngestionStageStatus.PENDING},
-    )
-    await with_timeout(
-        asyncio.to_thread(
-            mongo.upsert_ingestion_job,
-            job,
-            extra_fields={
-                "operation": "contextual_retrieval_backfill",
-                "retrieval_enabled": True,
-                "retrieval": {
-                    "mode": mode,
-                    "files_considered": 0,
-                    "files_indexed": 0,
-                    "files_skipped": 0,
-                },
-            },
-        ),
-        timeout_seconds=Config.DB_OPERATION_TIMEOUT,
-        operation_name="Create contextual retrieval job"
-    )
-
-    background_tasks.add_task(
-        run_contextual_retrieval_backfill,
-        repo_name=repo_name,
-        local_repo_path=local_repo_path,
-        job_id=job_id,
-        force_reindex=request.force_reindex,
+        enable_precheck=ingest_request.enable_precheck,
+        enable_resolve_refs=ingest_request.enable_resolve_refs,
     )
 
     return {
         "job_id": job_id,
         "repo_name": repo_name,
         "status": "queued",
-        "operation": "contextual_retrieval_backfill",
+        "enable_precheck": ingest_request.enable_precheck,
+        "enable_resolve_refs": ingest_request.enable_resolve_refs,
     }
-
-async def run_contextual_retrieval_backfill(
-    repo_name: str,
-    local_repo_path: Path,
-    job_id: str,
-    force_reindex: bool = False,
-):
-    mongo = get_mongo_client()
-    mode = "force" if force_reindex else "incremental"
-    try:
-        mongo.upsert_ingestion_job(
-            IngestionJobStatus(
-                job_id=job_id,
-                repo_name=repo_name,
-                status="running",
-                current_stage=IngestionStage.MENTAL_MODEL,
-                stage_status={IngestionStage.MENTAL_MODEL: IngestionStageStatus.RUNNING},
-            ),
-            extra_fields={"operation": "contextual_retrieval_backfill", "retrieval_enabled": True, "retrieval.mode": mode},
-        )
-
-        previous_state = mongo.get_repo_file_states(repo_name)
-        changes = build_repo_file_changes(local_repo_path, previous_state)
-        retrieval = ContextualRetrieval(repo_name)
-        retrieval.delete_files(sorted(changes.deleted_files))
-
-        candidates = set()
-        if force_reindex:
-            candidates.update(changes.current_files.keys())
-        else:
-            candidates.update(changes.new_files)
-            candidates.update(changes.changed_files)
-            for rel, entry in changes.current_files.items():
-                if rel not in candidates and not retrieval.has_file(rel):
-                    candidates.add(rel)
-
-        files_indexed = 0
-        files_skipped = 0
-        sorted_candidates = sorted(candidates)
-        pbar = tqdm(total=len(sorted_candidates), desc="Contextual retrieval backfill") if tqdm is not None else None
-        try:
-            for rel in sorted_candidates:
-                entry = changes.current_files.get(rel)
-                if not entry:
-                    files_skipped += 1
-                    continue
-                try:
-                    code = (local_repo_path / rel).read_bytes().decode("utf-8")
-                    retrieval.delete_file(rel)
-                    await retrieval.index_file(rel, code)
-                    files_indexed += 1
-                except Exception as e:
-                    files_skipped += 1
-                    logger.warning("Contextual retrieval backfill failed for %s: %s", rel, e)
-                finally:
-                    if pbar is not None:
-                        pbar.update(1)
-        finally:
-            if pbar is not None:
-                pbar.close()
-
-        mongo.upsert_ingestion_job(
-            IngestionJobStatus(
-                job_id=job_id,
-                repo_name=repo_name,
-                status="completed",
-                current_stage=IngestionStage.MENTAL_MODEL,
-                stage_status={IngestionStage.MENTAL_MODEL: IngestionStageStatus.COMPLETED},
-            ),
-            extra_fields={
-                "operation": "contextual_retrieval_backfill",
-                "retrieval_enabled": True,
-                "retrieval.mode": mode,
-                "retrieval.files_considered": len(candidates),
-                "retrieval.files_indexed": files_indexed,
-                "retrieval.files_skipped": files_skipped,
-            },
-        )
-        
-    except Exception as e:
-        logger.exception("Contextual retrieval backfill failed", exc_info=e)
-        mongo.upsert_ingestion_job(
-            IngestionJobStatus(
-                job_id=job_id,
-                repo_name=repo_name,
-                status="failed",
-                current_stage=IngestionStage.MENTAL_MODEL,
-                stage_status={
-                    IngestionStage.MENTAL_MODEL: {
-                        "status": IngestionStageStatus.FAILED.value,
-                        "error": str(e),
-                    }
-                },
-            ),
-            error=str(e),
-            extra_fields={"operation": "contextual_retrieval_backfill", "retrieval_enabled": True, "retrieval.mode": mode},
-        )
 
 @app.delete("/repos", responses={404: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
 async def delete_repo(repo_name: str, delete_files: bool = False):
@@ -658,11 +495,6 @@ async def health():
         components["mongodb"] = {"status": "unhealthy", "error": str(e)}
         overall_status = "unhealthy"
 
-    # Include metrics if enabled
-    if Config.ENABLE_DB_METRICS:
-        from .db import _db_metrics
-        components["metrics"] = _db_metrics.get_summary()
-
     response = {
         "status": overall_status,
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -672,27 +504,3 @@ async def health():
     status_code = 200 if overall_status == "healthy" else 503
     return JSONResponse(content=response, status_code=status_code)
 
-
-@app.get("/metrics")
-async def metrics():
-    """
-    Expose database operation metrics.
-
-    Returns metrics including:
-        - Operation counts by type
-        - Error counts by type
-        - Slow query count
-        - Average response times
-
-    This endpoint is useful for monitoring and alerting.
-    Can be integrated with Prometheus, Grafana, etc.
-    """
-    if not Config.ENABLE_DB_METRICS:
-        raise HTTPException(status_code=404, detail="Metrics disabled")
-
-    from .db import _db_metrics
-
-    return {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "metrics": _db_metrics.get_summary(),
-    }

@@ -1,7 +1,7 @@
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, Optional, Set
 
 from ..config import Config
 
@@ -36,16 +36,6 @@ def _sha1_bytes(path: Path) -> str:
     return hashlib.sha1(path.read_bytes()).hexdigest()
 
 
-def list_contextual_retrieval_candidates(repo_path: Path) -> List[str]:
-    repo_path = Path(repo_path)
-    candidates: List[str] = []
-    for path in repo_path.rglob("*"):
-        if not path.is_file() or _is_excluded(path, repo_path):
-            continue
-        candidates.append(str(path.relative_to(repo_path)))
-    return sorted(candidates)
-
-
 def build_repo_file_changes(repo_path: Path, previous_state: Dict[str, dict]) -> RepoFileChanges:
     repo_path = Path(repo_path)
     current: Dict[str, FileEntry] = {}
@@ -67,14 +57,9 @@ def build_repo_file_changes(repo_path: Path, previous_state: Dict[str, dict]) ->
     deleted = previous_paths - current_paths
     new = current_paths - previous_paths
 
-    changed: Set[str] = set()
-    unchanged: Set[str] = set()
-    for rel in current_paths - new:
-        prev_sha = (previous_state.get(rel) or {}).get("sha1")
-        if prev_sha != current[rel].sha1:
-            changed.add(rel)
-        else:
-            unchanged.add(rel)
+    existing_paths = current_paths - new
+    changed = {rel for rel in existing_paths if (previous_state.get(rel) or {}).get("sha1") != current[rel].sha1}
+    unchanged = existing_paths - changed
 
     return RepoFileChanges(
         current_files=current,

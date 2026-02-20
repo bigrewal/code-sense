@@ -150,13 +150,6 @@ class Cache:
             (self.namespace, rel_path),
         )
 
-    def load_mappings_for_file(self, rel_path: str) -> List[Dict]:
-        cur = self.conn.execute(
-            "SELECT data FROM mappings WHERE namespace = ? AND ref_path = ?",
-            (self.namespace, rel_path),
-        )
-        return [json.loads(row[0]) for row in cur.fetchall()]
-
     def store_mapping(self, mapping: Dict):
         """
         Store mapping and update def_index for its definition locations.

@@ -31,12 +31,6 @@ def mock_config():
     config.MONGO_CONNECT_TIMEOUT_MS = 20000
     config.MONGO_SOCKET_TIMEOUT_MS = 300000
 
-    config.DB_MAX_RETRY_ATTEMPTS = 3
-    config.DB_RETRY_INITIAL_DELAY = 1.0
-    config.DB_RETRY_BACKOFF_MULTIPLIER = 2.0
-
-    config.SLOW_QUERY_THRESHOLD_MS = 1000
-    config.ENABLE_DB_METRICS = True
     config.LOG_DB_QUERIES = False
 
     return config

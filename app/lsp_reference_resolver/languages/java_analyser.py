@@ -1,7 +1,9 @@
 from pathlib import Path
 from typing import List, Tuple
-from tree_sitter_languages import get_parser, get_language
-from app.lsp_reference_resolver.core.base_analyser import BaseLSPAnalyzer
+
+from tree_sitter_languages import get_language, get_parser
+
+from ..core.base_analyser import BaseLSPAnalyzer
 
 JAVA_QUERY = r"""
 (method_invocation
@@ -39,17 +41,6 @@ class JavaAnalyzer(BaseLSPAnalyzer):
     
     def get_timeout_seconds(self) -> float:
         return 120.0
-
-    def is_excluded_definition_path(self, path: Path) -> bool:
-        # Exclude generated files or specific directories if needed
-        return False
-
-    def is_excluded_definition_path(self, path: Path) -> bool:
-        parts = set(path.parts)
-        exclude = {
-            "build", "target", ".gradle", ".idea", "out",
-        }
-        return not parts.isdisjoint(exclude)
 
     def ref_pos_extractor(self, text: str, path: Path) -> List[Tuple[int, int]]:
         lang = get_language("java")

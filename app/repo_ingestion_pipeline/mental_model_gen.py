@@ -1,16 +1,15 @@
 import asyncio
 import hashlib
 import logging
+import os
 from pathlib import Path
-import traceback
 from typing import Dict, List, Optional, Set, Tuple
 
 from tqdm import tqdm
 
+from ..config import Config
 from ..db import LSPCacheReader, get_mongo_client
 from ..llm_grok import GrokLLM
-from ..contextual_retrieval import ContextualRetrieval
-from .file_state import list_contextual_retrieval_candidates
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +17,6 @@ logger = logging.getLogger(__name__)
 MENTAL_MODEL_TYPES = {
     "BRIEF": "BRIEF_FILE_OVERVIEW",
     "IGNORED": "IGNORED_FILE",
-    "ENTRY": "POTENTIAL_ENTRY_POINTS",
 }
 
 PROMPT_SYSTEM = (
@@ -76,7 +74,6 @@ class MentalModelStage:
         local_repo_path: Path,
         file_changes: Optional[dict] = None,
         resolver_changes: Optional[dict] = None,
-        retrieval_enabled: bool = True,
     ):
         self.lsp_cache = LSPCacheReader(str(local_repo_path))
         self.repo_name = repo_name
@@ -92,10 +89,10 @@ class MentalModelStage:
                 resolver_changes=resolver_changes,
             )
             deleted_files = sorted((file_changes or {}).get("deleted_files", []))
-            await self._delete_removed_artifacts(repo_name, deleted_files, retrieval_enabled=retrieval_enabled)
+            await self._delete_removed_artifacts(repo_name, deleted_files)
 
             critical_files, ignored_files = await self.identify_critical_files(
-                files_to_process, repo_name, retrieval_enabled=retrieval_enabled
+                files_to_process, repo_name
             )
             logger.info(
                 "Job %s: generated overview from %s files with %s critical files, ignored %s files",
@@ -109,21 +106,18 @@ class MentalModelStage:
 
             return critical_total, ignored_total, repo_context_token_count
 
-        except Exception as e:
+        except Exception:
             logger.exception("Job %s: mental model generation error", self.job_id)
-            traceback.print_exc()
-            raise e
+            raise
 
     async def identify_critical_files(
         self,
         dir_tree: List[str],
         repo_name: str,
-        retrieval_enabled: bool = True,
     ) -> Tuple[List[Dict[str, str]], Set[str]]:
         """Generate a comprehensive overview of the repo by summarizing critical files, ignoring non-critical ones."""
 
         semaphore = asyncio.Semaphore(self.max_concurrency)
-        retrieval = ContextualRetrieval(repo_name) if retrieval_enabled else None
 
         async def summarize_file(file_path: str) -> tuple[str, str, str | None, str | None]:
             try:
@@ -206,21 +200,6 @@ class MentalModelStage:
 
         pbar.close()
 
-        # Index files for contextual retrieval in parallel
-        if retrieval_enabled and retrieval is not None:
-            retrieval_candidates = list_contextual_retrieval_candidates(self.local_repo_path)
-            retrieval_pbar = tqdm(total=len(retrieval_candidates), desc="Contextual retrieval")
-            for fp in retrieval_candidates:
-                try:
-                    code = (self.local_repo_path / fp).read_bytes().decode("utf-8")
-                    retrieval.delete_file(fp)
-                    await retrieval.index_file(fp, code)
-                except Exception as e:
-                    logger.warning("Job %s: failed to index %s: %s", self.job_id, fp, e)
-                finally:
-                    retrieval_pbar.update(1)
-            retrieval_pbar.close()
-
         for insight in insights:
             file_path = insight["file_path"]
             dependency_info = self.lsp_cache.cross_file_interactions(file_path)
@@ -270,9 +249,6 @@ class MentalModelStage:
 
     def _build_dir_tree(self) -> List[str]:
         """Build a list of code file paths by walking the repository."""
-        import os
-        from ..config import Config
-
         code_files = []
         supported_extensions = set(Config.SUPPORTED_LANGUAGES.keys())
         ignore_folders = Config.IGNORE_FOLDERS
@@ -326,7 +302,6 @@ class MentalModelStage:
         self,
         repo_name: str,
         deleted_files: List[str],
-        retrieval_enabled: bool = True,
     ):
         if not deleted_files:
             return
@@ -337,9 +312,6 @@ class MentalModelStage:
                 "document_type": {"$in": [MENTAL_MODEL_TYPES["BRIEF"], MENTAL_MODEL_TYPES["IGNORED"]]},
             }
         )
-        if retrieval_enabled:
-            retrieval = ContextualRetrieval(repo_name)
-            retrieval.delete_files(deleted_files)
 
     def _select_files_to_process(
         self,

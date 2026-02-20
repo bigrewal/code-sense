@@ -1,13 +1,13 @@
+import asyncio
+from dataclasses import dataclass
 import logging
 from pathlib import Path
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
-import asyncio
 
 from tqdm import tqdm
+from ..config import Config
 from ..db import get_mongo_client
 from ..llm_grok import GrokLLM
-from ..config import Config
 from .file_state import RepoFileChanges, build_repo_file_changes
 
 logger = logging.getLogger(__name__)
@@ -37,15 +37,8 @@ class PreIngestionAnalysisError(ValueError):
 
 
 class PreIngestionAnalysisStage:
-    """Stage to perform pre-ingestion analysis on a repository.
-
-    Note: This stage should NOT upsert job status itself.
-    The pipeline should own status transitions (RUNNING/DONE/FAILED).
-    """
-
-    def __init__(self, llm_grok: GrokLLM, job_id: str, repo_name: str):
+    def __init__(self, llm_grok: GrokLLM, repo_name: str):
         self.llm_grok = llm_grok
-        self.job_id = job_id
         self.repo_name = repo_name
 
     async def run(
@@ -67,10 +60,14 @@ class PreIngestionAnalysisStage:
         mongo.delete_repo_file_states(self.repo_name, list(file_changes.deleted_files))
 
         summary = self.summarize(file_metrics=file_metrics, scan_stats=scan_stats)
-        summary["new_files"] = len(file_changes.new_files)
-        summary["changed_files"] = len(file_changes.changed_files)
-        summary["deleted_files"] = len(file_changes.deleted_files)
-        summary["unchanged_files"] = len(file_changes.unchanged_files)
+        summary.update(
+            {
+                "new_files": len(file_changes.new_files),
+                "changed_files": len(file_changes.changed_files),
+                "deleted_files": len(file_changes.deleted_files),
+                "unchanged_files": len(file_changes.unchanged_files),
+            }
+        )
         self.validate(summary)
         return summary
 
@@ -80,19 +77,12 @@ class PreIngestionAnalysisStage:
         file_changes: RepoFileChanges,
         previous_state: Dict[str, Any],
     ) -> Tuple[List[FileMetric], Dict[str, Any], List[Dict[str, Any]]]:
-        """
-        Enumerate files and compute per-file token metrics using the LLM tokenizer.
-
-        Async tokenization with a max of 10 concurrent count_tokens() calls.
-        Shows a progress bar for files pending/processed.
-        """
         metrics: List[FileMetric] = []
         state_rows: List[Dict[str, Any]] = []
         total_files_seen = len(file_changes.current_files)
         total_files_tokenized = 0
         tokenization_errors = 0
 
-        # ---- Second pass: async processing with bounded concurrency ----
         sem = asyncio.Semaphore(10)
         lock = asyncio.Lock()
 
@@ -109,9 +99,7 @@ class PreIngestionAnalysisStage:
             try:
                 if supported:
                     if rel in changed_or_new or (previous_state.get(rel) or {}).get("token_count") is None:
-                        content = await asyncio.to_thread(
-                            (Path(repo_path) / rel).read_text, encoding="utf-8", errors="ignore"
-                        )
+                        content = await asyncio.to_thread((repo_path / rel).read_text, encoding="utf-8", errors="ignore")
                         async with sem:
                             tok = await asyncio.to_thread(self.llm_grok.count_tokens, content)
                         async with lock:
@@ -141,11 +129,10 @@ class PreIngestionAnalysisStage:
                     )
 
             except Exception as e:
-                logger.warning(f"Tokenization error for file {rel}: {e}")
+                logger.warning("Tokenization error for file %s: %s", rel, e)
                 async with lock:
                     tokenization_errors += 1
             finally:
-                # Always advance the progress bar even on error
                 pbar.update(1)
 
         try:
