@@ -36,6 +36,18 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Code Sense API", version="1.0.0")
 
+
+def _delete_repo_lsp_cache_files(local_repo_path: Path) -> None:
+    """Delete per-repo LSP cache sqlite artifacts if present."""
+    cache_paths = [
+        local_repo_path / ".lsp_ref_cache.sqlite",
+        local_repo_path / ".lsp_ref_cache.sqlite-wal",
+        local_repo_path / ".lsp_ref_cache.sqlite-shm",
+    ]
+    for cache_path in cache_paths:
+        if cache_path.exists():
+            cache_path.unlink()
+
 # Register exception handlers
 app.add_exception_handler(StarletteHTTPException, http_exception_handler)
 app.add_exception_handler(RequestValidationError, validation_exception_handler)
@@ -344,6 +356,12 @@ async def delete_repo(repo_name: str, delete_files: bool = False):
                 raise HTTPException(status_code=500, detail="Failed to delete repo files")
         else:
             logger.info("Repo files not found for %s, continuing with DB cleanup", repo_name)
+    else:
+        try:
+            _delete_repo_lsp_cache_files(local_repo_path)
+        except Exception as exc:
+            logger.exception("Failed to delete repo LSP cache files", exc_info=exc)
+            raise HTTPException(status_code=500, detail="Failed to delete repo LSP cache files")
 
     mongo = get_mongo_client()
 
@@ -412,16 +430,21 @@ async def get_status(
 async def abort_job(job_id: str):
     job_id = validate_job_id(job_id)
     mongo = get_mongo_client()
-    ok = await with_timeout(
+    result = await with_timeout(
         asyncio.to_thread(mongo.request_abort, job_id),
         timeout_seconds=Config.DB_OPERATION_TIMEOUT,
         operation_name="Request abort"
     )
-    if not ok:
+    if result.get("reason") == "not_found":
         raise HTTPException(status_code=404, detail="Job not found")
+
     return {
         "job_id": job_id,
-        "abort_requested": True,
+        "abort_requested": bool(result.get("abort_requested")),
+        "status": result.get("status"),
+        "already_terminal": bool(result.get("already_terminal")),
+        "already_requested": bool(result.get("already_requested")),
+        "message": result.get("message"),
     }
 
 @app.get("/repos")

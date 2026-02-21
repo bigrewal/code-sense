@@ -1,8 +1,9 @@
 import logging
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 from .core.base_analyser import BaseLSPAnalyzer
+from ..models.data_model import JobAborted
 from .languages.java_analyser import JavaAnalyzer
 from .languages.python_analyser import PythonAnalyzer
 from .languages.rust_analyser import RustAnalyzer
@@ -21,15 +22,26 @@ class CodeAnalyzer:
         "typescript": TypeScriptAnalyzer,
     }
 
-    def __init__(self, repo: Path, repo_name: str, job_id: str):
+    def __init__(
+        self,
+        repo: Path,
+        repo_name: str,
+        job_id: str,
+        should_abort: Optional[Callable[[], bool]] = None,
+    ):
         self.repo = repo.resolve()
         self.base_repo_path = repo_name
+        self.should_abort = should_abort
 
     def detect(self) -> list[str]:
         return [
             lang
             for lang, analyzer_cls in self.ANALYZERS.items()
-            if analyzer_cls(self.repo, self.base_repo_path).get_files()
+            if analyzer_cls(
+                self.repo,
+                self.base_repo_path,
+                should_abort=self.should_abort,
+            ).get_files()
         ]
 
     async def analyze(self, langs: Optional[Sequence[str]] = None) -> dict[str, list[str]]:
@@ -40,7 +52,14 @@ class CodeAnalyzer:
         deleted_files: set[str] = set()
 
         for lang in langs:
-            analyzer: BaseLSPAnalyzer = self.ANALYZERS[lang](self.repo, self.base_repo_path)
+            if self.should_abort and self.should_abort():
+                raise JobAborted()
+
+            analyzer: BaseLSPAnalyzer = self.ANALYZERS[lang](
+                self.repo,
+                self.base_repo_path,
+                should_abort=self.should_abort,
+            )
             logger.info("=== Analyzing %s ===", lang)
             await analyzer.analyze()
             changed_files.update(analyzer.changed_files)

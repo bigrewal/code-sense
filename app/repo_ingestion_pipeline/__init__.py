@@ -54,7 +54,7 @@ def _abort_if_requested(job_id: str, repo_name: str, stage: IngestionStage):
                 repo_name=repo_name,
                 status="aborted",
                 current_stage=stage,
-                stage_status={stage: IngestionStageStatus.ABORTED},
+                stage_status={stage: {"status": IngestionStageStatus.ABORTED.value}},
             ),
             extra_fields={
                 "abort_requested": True,
@@ -88,6 +88,10 @@ async def start_ingestion_pipeline(
 
     job_id = job_id or str(uuid4())
     initial_stage = _initial_current_stage(enable_precheck, enable_resolve_refs)
+    should_abort = lambda: mongo.is_abort_requested(job_id)
+
+    # If abort arrives while the job is still queued, stop before running any stage.
+    _abort_if_requested(job_id, repo_name, initial_stage)
 
     # Initialize canonical stages (no string stage names)
     mongo.upsert_ingestion_job(
@@ -130,7 +134,9 @@ async def start_ingestion_pipeline(
             )
 
             pre_ingestion_stage = PreIngestionAnalysisStage(
-                llm_grok=llm, repo_name=repo_name
+                llm_grok=llm,
+                repo_name=repo_name,
+                should_abort=should_abort,
             )
             analysis_summary = await pre_ingestion_stage.run(
                 repo_path=local_repo_path,
@@ -161,6 +167,8 @@ async def start_ingestion_pipeline(
                 )
             )
 
+        except JobAborted:
+            return
         except PreIngestionAnalysisError as pie:
             mongo.upsert_ingestion_job(
                 IngestionJobStatus(
@@ -218,7 +226,10 @@ async def start_ingestion_pipeline(
             )
 
             resolver_changes = await CodeAnalyzer(
-                repo=local_repo_path, repo_name=repo_name, job_id=job_id
+                repo=local_repo_path,
+                repo_name=repo_name,
+                job_id=job_id,
+                should_abort=should_abort,
             ).analyze()
 
             mongo.upsert_ingestion_job(
@@ -333,7 +344,11 @@ async def start_ingestion_pipeline(
             )
         )
 
-        critical_file_count, ignored_files_count, repo_context_token_count = await MentalModelStage(llm_grok=llm, config={"job_id": job_id}).run(
+        critical_file_count, ignored_files_count, repo_context_token_count = await MentalModelStage(
+            llm_grok=llm,
+            config={"job_id": job_id},
+            should_abort=should_abort,
+        ).run(
             repo_name=repo_name,
             local_repo_path=local_repo_path,
             file_changes=file_changes,

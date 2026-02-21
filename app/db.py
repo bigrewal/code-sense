@@ -30,6 +30,7 @@ CONVERSATIONS_COLLECTION = "conversations"
 MESSAGES_COLLECTION = "messages"
 MENTAL_MODEL_COLLECTION = "mental_model"
 INGESTION_FILE_STATE_COLLECTION = "ingestion_file_state"
+TERMINAL_JOB_STATUSES = {"completed", "failed", "aborted"}
 
 
 def _serialize_job(job_doc: Dict[str, Any]) -> Dict[str, Any]:
@@ -43,6 +44,10 @@ def _serialize_job(job_doc: Dict[str, Any]) -> Dict[str, Any]:
         "operation": job_doc.get("operation"),
         "enable_precheck": job_doc.get("enable_precheck"),
         "enable_resolve_refs": job_doc.get("enable_resolve_refs"),
+        "abort_requested": bool(job_doc.get("abort_requested", False)),
+        "abort_requested_at": job_doc.get("abort_requested_at"),
+        "aborted_at": job_doc.get("aborted_at"),
+        "aborted_after_stage": job_doc.get("aborted_after_stage"),
         "created_at": job_doc.get("created_at"),
         "updated_at": job_doc.get("updated_at"),
     }
@@ -582,6 +587,10 @@ class MyMongoClient:
             "current_stage": 1, "error": 1,
             "operation": 1,
             "enable_precheck": 1, "enable_resolve_refs": 1,
+            "abort_requested": 1,
+            "abort_requested_at": 1,
+            "aborted_at": 1,
+            "aborted_after_stage": 1,
             "created_at": 1, "updated_at": 1,
         }
 
@@ -602,14 +611,85 @@ class MyMongoClient:
 
         return jobs
 
-    def request_abort(self, job_id: str) -> bool:
-        res = self._db[INGESTION_JOBS_COLLECTION].update_one(
+    def request_abort(self, job_id: str) -> Dict[str, Any]:
+        collection = self._db[INGESTION_JOBS_COLLECTION]
+        doc = collection.find_one(
             {"job_id": job_id},
+            {"_id": 0, "status": 1, "abort_requested": 1},
+        )
+        if not doc:
+            return {
+                "reason": "not_found",
+                "status": None,
+                "abort_requested": False,
+                "already_terminal": False,
+                "already_requested": False,
+                "message": "Job not found",
+            }
+
+        status = doc.get("status")
+        already_requested = bool(doc.get("abort_requested"))
+        if status in TERMINAL_JOB_STATUSES:
+            return {
+                "reason": "already_terminal",
+                "status": status,
+                "abort_requested": already_requested,
+                "already_terminal": True,
+                "already_requested": already_requested,
+                "message": "Job is already in a terminal state",
+            }
+
+        if already_requested:
+            return {
+                "reason": "already_requested",
+                "status": status,
+                "abort_requested": True,
+                "already_terminal": False,
+                "already_requested": True,
+                "message": "Abort has already been requested",
+            }
+
+        ts = now_ts()
+        result = collection.update_one(
             {
-                "$set": {"abort_requested": True, "abort_requested_at": now_ts(), "updated_at": now_ts()}
+                "job_id": job_id,
+                "abort_requested": {"$ne": True},
+                "status": {"$nin": list(TERMINAL_JOB_STATUSES)},
+            },
+            {
+                "$set": {
+                    "abort_requested": True,
+                    "abort_requested_at": ts,
+                    "status": "aborting",
+                    "updated_at": ts,
+                }
             },
         )
-        return res.matched_count > 0
+
+        if result.matched_count == 0:
+            latest = collection.find_one(
+                {"job_id": job_id},
+                {"_id": 0, "status": 1, "abort_requested": 1},
+            ) or {}
+            latest_status = latest.get("status")
+            latest_abort = bool(latest.get("abort_requested"))
+            return {
+                "reason": "already_requested" if latest_abort else "already_terminal",
+                "status": latest_status,
+                "abort_requested": latest_abort,
+                "already_terminal": latest_status in TERMINAL_JOB_STATUSES,
+                "already_requested": latest_abort,
+                "message": "Abort request was already processed",
+            }
+
+        return {
+            "reason": "requested",
+            "status": "aborting",
+            "abort_requested": True,
+            "already_terminal": False,
+            "already_requested": False,
+            "message": "Abort requested",
+        }
 
     def is_abort_requested(self, job_id: str) -> bool:
         doc = self._db[INGESTION_JOBS_COLLECTION].find_one({"job_id": job_id}, {"_id": 0, "abort_requested": 1})

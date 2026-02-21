@@ -10,6 +10,7 @@ from tqdm import tqdm
 from ..config import Config
 from ..db import LSPCacheReader, get_mongo_client
 from ..llm_grok import GrokLLM
+from ..models.data_model import JobAborted
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +60,7 @@ PROMPT_USER_TEMPLATE = """
 class MentalModelStage:
     """Stage for generating and storing the hierarchical mental model."""
 
-    def __init__(self, llm_grok: GrokLLM, config: Optional[dict] = None):
+    def __init__(self, llm_grok: GrokLLM, config: Optional[dict] = None, should_abort=None):
         config = config or {}
         self.mongo_client = get_mongo_client()
         self.mental_model_collection = self.mongo_client["mental_model"]
@@ -67,6 +68,7 @@ class MentalModelStage:
         self.job_id = config.get("job_id", "unknown")
         self.batch_size = int(config.get("batch_size", 20))
         self.max_concurrency = int(config.get("max_concurrency", 10))
+        self.should_abort = should_abort
 
     async def run(
         self,
@@ -75,6 +77,9 @@ class MentalModelStage:
         file_changes: Optional[dict] = None,
         resolver_changes: Optional[dict] = None,
     ):
+        if self.should_abort and self.should_abort():
+            raise JobAborted()
+
         self.lsp_cache = LSPCacheReader(str(local_repo_path))
         self.repo_name = repo_name
         self.local_repo_path = local_repo_path
@@ -120,6 +125,9 @@ class MentalModelStage:
         semaphore = asyncio.Semaphore(self.max_concurrency)
 
         async def summarize_file(file_path: str) -> tuple[str, str, str | None, str | None]:
+            if self.should_abort and self.should_abort():
+                raise JobAborted()
+
             try:
                 full_path = self.local_repo_path / file_path
                 code_bytes = full_path.read_bytes()
@@ -167,6 +175,8 @@ class MentalModelStage:
             )
 
             async with semaphore:
+                if self.should_abort and self.should_abort():
+                    raise JobAborted()
                 response = await self.llm_client.generate_async(
                     prompt=user_prompt,
                     system_prompt=PROMPT_SYSTEM,
@@ -182,6 +192,8 @@ class MentalModelStage:
         pbar = tqdm(total=len(all_files), desc="Processing files")
 
         for i in range(0, len(all_files), self.batch_size):
+            if self.should_abort and self.should_abort():
+                raise JobAborted()
             batch = all_files[i : i + self.batch_size]
             tasks = [summarize_file(fp) for fp in batch]
             results = await asyncio.gather(*tasks)
@@ -201,6 +213,8 @@ class MentalModelStage:
         pbar.close()
 
         for insight in insights:
+            if self.should_abort and self.should_abort():
+                raise JobAborted()
             file_path = insight["file_path"]
             dependency_info = self.lsp_cache.cross_file_interactions(file_path)
             insight["downstream_dep_interactions"] = dependency_info["downstream"]["interactions"]
@@ -215,6 +229,8 @@ class MentalModelStage:
         context_parts: list[str] = []
 
         for file_path in critical_files:
+            if self.should_abort and self.should_abort():
+                raise JobAborted()
             brief = self.mongo_client.get_brief_file_overview(repo_name, file_path)
             if brief:
                 context_parts.append(brief)

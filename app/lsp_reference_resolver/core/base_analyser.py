@@ -3,13 +3,14 @@ import hashlib
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import unquote, urlparse
 
 from .lsp_client import LSPClient
 from .cache import Cache
 from app.config import Config
 from app.db import get_mongo_client
+from app.models.data_model import JobAborted
 
 try:
     from tqdm import tqdm
@@ -48,7 +49,13 @@ class BaseLSPAnalyzer:
       4) unchanged files served from SQLite cache
     """
 
-    def __init__(self, repo_path: Path, base_repo_path: str, show_progress: bool = True):
+    def __init__(
+        self,
+        repo_path: Path,
+        base_repo_path: str,
+        show_progress: bool = True,
+        should_abort: Optional[Callable[[], bool]] = None,
+    ):
         self.repo_path = repo_path
         self.base_repo_path = base_repo_path
         # self.client: Optional[LSPClient] = None
@@ -61,6 +68,11 @@ class BaseLSPAnalyzer:
         self.deleted_files: Set[str] = set()
         self._doc_versions = {}
         self.server_list: List[LSPClient] = []
+        self.should_abort = should_abort
+
+    def _raise_if_aborted(self) -> None:
+        if self.should_abort and self.should_abort():
+            raise JobAborted()
 
     # --- required by subclasses ---
     def get_server_command(self) -> List[str]:
@@ -177,6 +189,7 @@ class BaseLSPAnalyzer:
 
     # --- main ---
     async def analyze(self) -> None:
+        self._raise_if_aborted()
         self.cache_lock = asyncio.Lock()
         if self.cache is None:
             self.cache = Cache(self.repo_path, self.get_cache_namespace())
@@ -211,6 +224,7 @@ class BaseLSPAnalyzer:
                 self.cache.commit()
 
         for fpath in files:
+            self._raise_if_aborted()
             rel_path = f"{self.base_repo_path}/{str(fpath.relative_to(self.repo_path))}"
             try:
                 text = fpath.read_text(encoding="utf-8")
@@ -268,6 +282,7 @@ class BaseLSPAnalyzer:
                 self.cache.commit()
             return
 
+        self._raise_if_aborted()
         await self.start_server()
 
         batch_bar = tqdm(total=len(recompute_list), desc="Resolving references", leave=True) if self.show_progress else None
@@ -278,6 +293,7 @@ class BaseLSPAnalyzer:
             resolved_queries = []
 
             async def run_one(uri: str, path: Path, pos: Dict):
+                self._raise_if_aborted()
                 k = (uri, pos["line"], pos["character"])
                 if k in pos_cache:
                     return pos_cache[k]
@@ -291,6 +307,7 @@ class BaseLSPAnalyzer:
 
             tasks = [asyncio.create_task(run_one(uri, path, pos)) for (uri, path, pos) in queries]
             for fut in asyncio.as_completed(tasks):
+                self._raise_if_aborted()
                 r = await fut
                 if r:
                     resolved_queries.append(r)
@@ -305,6 +322,8 @@ class BaseLSPAnalyzer:
                     rel_path = file_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
+
+                self._raise_if_aborted()
                 info = file_infos[rel_path]
                 fpath: Path = info["path"]
                 uri: str = info["uri"]
@@ -332,6 +351,7 @@ class BaseLSPAnalyzer:
                 seen_local: Set[Tuple[int, int]] = set()
                 queries: List[Tuple[str, Path, Dict]] = []
                 for (line, col) in self.ref_pos_extractor(text, fpath):
+                    self._raise_if_aborted()
                     if (line, col) in seen_local:
                         continue
                     seen_local.add((line, col))
