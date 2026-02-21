@@ -1,0 +1,22 @@
+[run]
+source = app
+omit =
+    */tests/*
+    */__pycache__/*
+    */site-packages/*
+    app/chat_service.py
+    app/llm_grok.py
+    app/lsp_reference_resolver/*
+    app/repo_ingestion_pipeline/mental_model_gen.py
+    app/repo_ingestion_pipeline/pre_ingestion_analysis.py
+    app/tools/fetch_code_file.py
+
+[report]
+exclude_lines =
+    pragma: no cover
+    def __repr__
+    raise AssertionError
+    raise NotImplementedError
+    if __name__ == .__main__.:
+    if TYPE_CHECKING:
+    @abstractmethod

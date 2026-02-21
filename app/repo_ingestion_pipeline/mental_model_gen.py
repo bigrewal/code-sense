@@ -48,11 +48,12 @@ PROMPT_USER_TEMPLATE = """
     - If NOT critical, output exactly: IGNORE
     - If CRITICAL, output one concise paragraph in this exact 3-sentence format:
 
-    "`{file_path}` <what this file does and why it exists>. It does this by <main components/functions/classes and the core flow>. It interacts upstream with <key callers/modules> and downstream with <key callees/services/files>."
+    "`{file_path}` <what this file does and why it exists>. It does this by <how it works end-to-end, explicitly naming every major component/function/class defined in this file and each component's role>. It interacts upstream with <key files/modules that call or depend on this file> and downstream with <key files/modules/services this file calls or depends on>."
 
     Rules:
-    - Keep it very concise: 50-100 words total.
+    - Keep it very concise: 100-200 words total.
     - Mention concrete identifiers when available.
+    - The second sentence must mention every major component in this file.
     - No bullets, no markdown, no extra text.
     """.strip()
 
@@ -80,7 +81,15 @@ class MentalModelStage:
         if self.should_abort and self.should_abort():
             raise JobAborted()
 
-        self.lsp_cache = LSPCacheReader(str(local_repo_path))
+        try:
+            self.lsp_cache = LSPCacheReader(str(local_repo_path))
+        except FileNotFoundError:
+            logger.warning(
+                "Job %s: LSP cache missing for %s, continuing mental-model generation without dependency interactions",
+                self.job_id,
+                repo_name,
+            )
+            self.lsp_cache = None
         self.repo_name = repo_name
         self.local_repo_path = local_repo_path
         logger.info("Job %s: starting mental model generation for %s", self.job_id, repo_name)
@@ -149,7 +158,7 @@ class MentalModelStage:
             if cached:
                 return file_path, cached["data"], code, sha1
 
-            cfi = self.lsp_cache.cross_file_interactions(file_path)
+            cfi = self._cross_file_interactions(file_path)
             downstream_info = cfi.get("downstream", {}) or {}
             upstream_info = cfi.get("upstream", {}) or {}
 
@@ -216,7 +225,7 @@ class MentalModelStage:
             if self.should_abort and self.should_abort():
                 raise JobAborted()
             file_path = insight["file_path"]
-            dependency_info = self.lsp_cache.cross_file_interactions(file_path)
+            dependency_info = self._cross_file_interactions(file_path)
             insight["downstream_dep_interactions"] = dependency_info["downstream"]["interactions"]
             insight["downstream_dep_files"] = list(dependency_info["downstream"]["files"])
             insight["upstream_dep_interactions"] = dependency_info["upstream"]["interactions"]
@@ -362,3 +371,11 @@ class MentalModelStage:
 
         allowed = set(all_files)
         return sorted([p for p in selected if p in allowed])
+
+    def _cross_file_interactions(self, file_path: str) -> Dict[str, Dict]:
+        if not self.lsp_cache:
+            return {
+                "downstream": {"interactions": {}, "files": set()},
+                "upstream": {"interactions": {}, "files": set()},
+            }
+        return self.lsp_cache.cross_file_interactions(file_path)

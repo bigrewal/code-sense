@@ -8,24 +8,29 @@ class DatabaseError(Exception):
 
 class ConnectionError(DatabaseError):
     def __init__(self, message: str, **kwargs):
-        super().__init__(message, code="CONNECTION_ERROR", **kwargs)
+        kwargs.setdefault("code", "CONNECTION_ERROR")
+        super().__init__(message, **kwargs)
 
 
 class QueryError(DatabaseError):
     def __init__(self, message: str, **kwargs):
-        super().__init__(message, code="QUERY_ERROR", **kwargs)
+        kwargs.setdefault("code", "QUERY_ERROR")
+        super().__init__(message, **kwargs)
 
 
 class ValidationError(DatabaseError):
     def __init__(self, message: str, **kwargs):
-        super().__init__(message, code="VALIDATION_ERROR", **kwargs)
+        kwargs.setdefault("code", "VALIDATION_ERROR")
+        super().__init__(message, **kwargs)
 
 
 class InvalidParameterError(ValidationError):
     def __init__(self, message: str, **kwargs):
-        super().__init__(message, code="INVALID_PARAMETER", **kwargs)
+        kwargs.setdefault("code", "INVALID_PARAMETER")
+        super().__init__(message, **kwargs)
 
 
 class InvalidConnectionStringError(ValidationError):
     def __init__(self, message: str, **kwargs):
-        super().__init__(message, code="INVALID_CONNECTION_STRING", **kwargs)
+        kwargs.setdefault("code", "INVALID_CONNECTION_STRING")
+        super().__init__(message, **kwargs)

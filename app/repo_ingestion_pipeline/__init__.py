@@ -20,7 +20,7 @@ def _initial_current_stage(enable_precheck: bool, enable_resolve_refs: bool) -> 
         return IngestionStage.PRECHECK
     if enable_resolve_refs:
         return IngestionStage.RESOLVE_REFS
-    return IngestionStage.REPO_GRAPH
+    return IngestionStage.MENTAL_MODEL
 
 
 def _mark_stage_skipped(
@@ -65,18 +65,6 @@ def _abort_if_requested(job_id: str, repo_name: str, stage: IngestionStage):
         raise JobAborted()
 
 
-def _verify_lsp_ref_cache(local_repo_path: Path, resolver_changes: dict | None = None) -> dict:
-    cache_path = local_repo_path / ".lsp_ref_cache.sqlite"
-    if not cache_path.exists():
-        raise FileNotFoundError(
-            f"LSP reference cache not found at {cache_path}. "
-            "The RESOLVE_REFS stage should have created this cache."
-        )
-
-    changed = len((resolver_changes or {}).get("changed_files", []))
-    return {"skipped_due_to_no_changes": changed == 0, "changed_files_count": changed}
-
-
 async def start_ingestion_pipeline(
     local_repo_path: Path,
     repo_name: str,
@@ -103,7 +91,6 @@ async def start_ingestion_pipeline(
             stage_status={
                 IngestionStage.PRECHECK: IngestionStageStatus.PENDING,
                 IngestionStage.RESOLVE_REFS: IngestionStageStatus.PENDING,
-                IngestionStage.REPO_GRAPH: IngestionStageStatus.PENDING,
                 IngestionStage.MENTAL_MODEL: IngestionStageStatus.PENDING,
             },
         )
@@ -208,7 +195,7 @@ async def start_ingestion_pipeline(
             job_id=job_id,
             repo_name=repo_name,
             skipped_stage=IngestionStage.PRECHECK,
-            next_stage=IngestionStage.RESOLVE_REFS if enable_resolve_refs else IngestionStage.REPO_GRAPH,
+            next_stage=IngestionStage.RESOLVE_REFS if enable_resolve_refs else IngestionStage.MENTAL_MODEL,
         )
 
     # ---------- RESOLVE / ANALYZE ----------
@@ -275,61 +262,8 @@ async def start_ingestion_pipeline(
             job_id=job_id,
             repo_name=repo_name,
             skipped_stage=IngestionStage.RESOLVE_REFS,
-            next_stage=IngestionStage.REPO_GRAPH,
+            next_stage=IngestionStage.MENTAL_MODEL,
         )
-
-    # ---------- REPO GRAPH ----------
-    _abort_if_requested(job_id, repo_name, IngestionStage.REPO_GRAPH)
-    try:
-        mongo.upsert_ingestion_job(
-            IngestionJobStatus(
-                job_id=job_id,
-                repo_name=repo_name,
-                status="running",
-                current_stage=IngestionStage.REPO_GRAPH,
-                stage_status={IngestionStage.REPO_GRAPH: IngestionStageStatus.RUNNING},
-            )
-        )
-
-        repo_graph_metrics = _verify_lsp_ref_cache(
-            local_repo_path=local_repo_path,
-            resolver_changes=resolver_changes,
-        )
-
-        mongo.upsert_ingestion_job(
-            IngestionJobStatus(
-                job_id=job_id,
-                repo_name=repo_name,
-                status="running",
-                current_stage=IngestionStage.REPO_GRAPH,
-                stage_status={
-                    IngestionStage.REPO_GRAPH: {
-                        "status": IngestionStageStatus.COMPLETED.value,
-                        "metrics": repo_graph_metrics,
-                    }
-                },
-            )
-        )
-    except JobAborted:
-        return
-    
-    except Exception as e:
-        mongo.upsert_ingestion_job(
-            IngestionJobStatus(
-                job_id=job_id,
-                repo_name=repo_name,
-                status="failed",
-                current_stage=IngestionStage.REPO_GRAPH,
-                stage_status={
-                    IngestionStage.REPO_GRAPH: {
-                        "status": IngestionStageStatus.FAILED.value,
-                        "error": str(e),
-                    }
-                },
-            ),
-            error=str(e),
-        )
-        return
 
     # ---------- MENTAL MODEL ----------
     _abort_if_requested(job_id, repo_name, IngestionStage.MENTAL_MODEL)

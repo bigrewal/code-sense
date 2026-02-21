@@ -7,9 +7,9 @@ def test_delete_repo_lsp_cache_files_removes_sqlite_artifacts(tmp_path: Path):
     repo_path = tmp_path / "repo"
     repo_path.mkdir()
 
-    sqlite_file = repo_path / ".lsp_ref_cache.sqlite"
-    wal_file = repo_path / ".lsp_ref_cache.sqlite-wal"
-    shm_file = repo_path / ".lsp_ref_cache.sqlite-shm"
+    sqlite_file = repo_path / ".codesense_ref_index.sqlite"
+    wal_file = repo_path / ".codesense_ref_index.sqlite-wal"
+    shm_file = repo_path / ".codesense_ref_index.sqlite-shm"
     for f in (sqlite_file, wal_file, shm_file):
         f.write_text("x", encoding="utf-8")
 
@@ -26,4 +26,4 @@ def test_delete_repo_lsp_cache_files_is_noop_when_missing(tmp_path: Path):
 
     _delete_repo_lsp_cache_files(repo_path)
 
-    assert not (repo_path / ".lsp_ref_cache.sqlite").exists()
+    assert not (repo_path / ".codesense_ref_index.sqlite").exists()

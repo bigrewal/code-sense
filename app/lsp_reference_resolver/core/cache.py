@@ -18,7 +18,7 @@ class Cache:
     def __init__(self, repo_path: Path, namespace: str):
         self.repo_path = repo_path
         self.namespace = namespace
-        self.db_path = self.repo_path / ".lsp_ref_cache.sqlite"
+        self.db_path = self.repo_path / ".codesense_ref_index.sqlite"
         self.conn = sqlite3.connect(self.db_path)
         self.conn.execute("PRAGMA journal_mode=WAL;")
         self.conn.execute("PRAGMA synchronous=NORMAL;")

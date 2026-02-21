@@ -8,7 +8,6 @@ class IngestionStage(str, Enum):
     QUEUED = "queued"
     PRECHECK = "precheck"
     RESOLVE_REFS = "resolve_refs"
-    REPO_GRAPH = "repo_graph"
     MENTAL_MODEL = "mental_model"
 
 class IngestionStageStatus(str, Enum):

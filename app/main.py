@@ -40,9 +40,9 @@ app = FastAPI(title="Code Sense API", version="1.0.0")
 def _delete_repo_lsp_cache_files(local_repo_path: Path) -> None:
     """Delete per-repo LSP cache sqlite artifacts if present."""
     cache_paths = [
-        local_repo_path / ".lsp_ref_cache.sqlite",
-        local_repo_path / ".lsp_ref_cache.sqlite-wal",
-        local_repo_path / ".lsp_ref_cache.sqlite-shm",
+        local_repo_path / ".codesense_ref_index.sqlite",
+        local_repo_path / ".codesense_ref_index.sqlite-wal",
+        local_repo_path / ".codesense_ref_index.sqlite-shm",
     ]
     for cache_path in cache_paths:
         if cache_path.exists():
@@ -297,7 +297,6 @@ async def ingest_repo(
         stage_status={
             IngestionStage.PRECHECK: IngestionStageStatus.PENDING,
             IngestionStage.RESOLVE_REFS: IngestionStageStatus.PENDING,
-            IngestionStage.REPO_GRAPH: IngestionStageStatus.PENDING,
             IngestionStage.MENTAL_MODEL: IngestionStageStatus.PENDING,
         },
     )

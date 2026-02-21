@@ -10,8 +10,8 @@ CodeSense takes a different approach.
 
 Instead of retrieving isolated snippets, CodeSense:
 
-* builds a **semantic dependency graph directly from code** (AST + LSP),
-* compresses that graph into a **global repository context** that fits within an LLM’s context window. For example: [Astropy on GitHub](https://github.com/astropy/astropy) (~1M Python tokens) is compressed by CodeSense to ~48k tokens.
+* builds a **semantic reference index directly from code** (AST + LSP),
+* compresses cross-file signals into a **global repository context** that fits within an LLM’s context window. For example: [Astropy on GitHub](https://github.com/astropy/astropy) (~1M Python tokens) is compressed by CodeSense to ~48k tokens.
 * and uses this context to answer questions with a **repo-wide mental model**.
 
 > Note: The repo-wide mental model is constructed exclusively from source code (AST + semantic dependencies) and does not rely on repository documentation or Markdown files.
@@ -35,7 +35,7 @@ The goal is to give the LLM an **integrated understanding of the entire codebase
 1. **Parse the repository** (tree-sitter) to capture structure.
 2. **Resolve cross-file symbol references** (LSP) to capture semantics in a local SQLite cache.
 3. **Generate a "mental model"**: classify files (CRITICAL vs IGNORE) and summarize critical files with upstream/downstream interactions using the LSP reference cache.
-4. **Compress to global context**: traverse from entry points and assemble a repo-wide context that fits comfortably in the LLM context window.
+4. **Compress to global context**: assemble a repo-wide context from critical-file summaries and cross-file interactions so it fits comfortably in the LLM context window.
 5. **Answer questions** using the global context (no doc reliance required).
 
 ---
@@ -47,7 +47,7 @@ The goal is to give the LLM an **integrated understanding of the entire codebase
 * **Compression-first**: gives the model a **stable global view**, enabling more reliable cross-file reasoning.
 
 ## TL;DR
-Search-based approaches inevitably expose the model to only a small subset of the repository (e.g., top-k files out of thousands). In large codebases like Twitter’s recommendation system (~6k files), this means answers are constructed from a partial view and can miss critical cross-file interactions. CodeSense instead compresses the entire repository into a global, dependency-aware context, allowing questions to be answered with awareness of all files, not just a retrieved fraction.
+Search-based approaches inevitably expose the model to only a small subset of the repository (e.g., top-k files out of thousands). In large codebases like Twitter’s recommendation system (~6k files), this means answers are constructed from a partial view and can miss critical cross-file interactions. CodeSense instead compresses repository-wide signals into a global context, allowing questions to be answered with awareness of the broader codebase, not just a retrieved fraction.
 
 ---
 
@@ -57,9 +57,8 @@ Search-based approaches inevitably expose the model to only a small subset of th
 
 * **Pre-ingestion analysis**: scans files, filters directories, estimates size/budget.
 * **LSP reference extraction**: builds a persistent SQLite cache of symbol reference edges.
-* **Reference verification**: verifies the LSP cache is available for cross-file analysis.
 * **Mental model generation**: queries the SQLite cache + an LLM to produce short file-level "briefs" and criticality.
-* **Repo context builder**: performs BFS from entry points to assemble a **global repo context** stored in MongoDB.
+* **Repo context builder**: assembles a **global repo context** from critical-file briefs and dependencies, then stores it in MongoDB.
 
 **Storage**
 
@@ -98,7 +97,7 @@ I compared our tool against **DeepWiki** (Cognition Labs / Devin-powered reposit
   - LSP-resolved cross-file references (stored in SQLite)
   - Tree-sitter AST + semantic dependency analysis
   - Dependency-aware critical file selection & summarization
-  - BFS-ordered repo context from inferred entry points
+  - Repository context synthesis from summarized critical files and cross-file interactions
 
 This demonstrates a significant advantage in real-world scenarios where documentation is sparse, outdated, or absent — a common situation in large production codebases.
 
@@ -242,30 +241,3 @@ docker compose down -v
 * API: [http://localhost:8000](http://localhost:8000)
 * MongoDB: mongodb://localhost:27017
 * CodeSense UI: http://localhost:5173/
-
-## Deep Code Bench Eval
-
-Run the benchmark evaluator against CodeSense's stateless chat API:
-
-```bash
-uv sync --extra eval
-uv run python evals/deep_code_bench.py \
-  --base-url http://localhost:8000 \
-  --split test \
-  --limit 5
-```
-
-Run on a single repository URL from dataset metadata:
-
-```bash
-uv run python evals/deep_code_bench.py \
-  --repo-url https://github.com/owner/repo
-```
-
-Requirements:
-
-* CodeSense API running and target repo already ingested
-* `XAI_API_KEY` set (LLM judge is required)
-* Internet access to download `Qodo/deep_code_bench` from Hugging Face
-
----

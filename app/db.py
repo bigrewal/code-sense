@@ -86,10 +86,10 @@ class LSPCacheReader:
         """Initialize reader for a specific repository.
 
         Args:
-            repo_path: Path to repository root (where .lsp_ref_cache.sqlite is located)
+            repo_path: Path to repository root (where .codesense_ref_index.sqlite is located)
         """
         self.repo_path = Path(repo_path)
-        self.db_path = self.repo_path / ".lsp_ref_cache.sqlite"
+        self.db_path = self.repo_path / ".codesense_ref_index.sqlite"
         if not self.db_path.exists():
             raise FileNotFoundError(f"LSP cache not found: {self.db_path}")
         # LSP cache stores paths with repo folder name prefix (e.g., "dictquery/dictquery/__init__.py")
