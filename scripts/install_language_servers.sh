@@ -6,6 +6,7 @@ set -euo pipefail
 # - Python: python-lsp-server (pylsp)
 # - Rust: rust-analyzer
 # - Scala: metals (via coursier)
+# - TypeScript: typescript-language-server
 #
 # Usage:
 #   ./scripts/install_language_servers.sh
@@ -14,6 +15,7 @@ set -euo pipefail
 # - Requires sudo on Linux for apt installs.
 # - On macOS uses Homebrew.
 # - Metals install uses coursier, installed under ~/.local/bin by default.
+# - TypeScript language server requires Node.js + npm.
 
 bold() { printf "\033[1m%s\033[0m\n" "$*"; }
 warn() { printf "\033[33mWARN:\033[0m %s\n" "$*" >&2; }
@@ -75,7 +77,7 @@ install_jdtls_linux() {
   echo "Installing Java 17 + jdtls (Linux)..."
   
   sudo apt-get update
-  sudo apt-get install -y wget openjdk-21-jre
+  sudo apt-get install -y wget openjdk-17-jre-headless
 
   mkdir -p ~/.local/bin
   mkdir -p ~/.local/jdtls
@@ -89,7 +91,7 @@ install_jdtls_linux() {
 #!/usr/bin/env bash
 set -euo pipefail
 JDTLS_HOME="${JDTLS_HOME:-$HOME/.local/jdtls}"
-JAVA_BIN="${JAVA_BIN:-/usr/lib/jvm/java-21-openjdk-amd64/bin/java}"
+JAVA_BIN="${JAVA_BIN:-$(command -v java)}"
 exec "$JAVA_BIN" \
   -Declipse.application=org.eclipse.jdt.ls.core.id1 \
   -Dosgi.bundles.defaultStartLevel=4 \
@@ -130,25 +132,40 @@ install_metals_linux() {
   bold "Installing Scala Metals via coursier (Linux)..."
   ensure_path_local_bin
 
-  local cs_url=""
-  if [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]]; then
-    cs_url="https://github.com/coursier/coursier/releases/latest/download/cs-aarch64-pc-linux.gz"
-  else
-    cs_url="https://github.com/coursier/coursier/releases/latest/download/cs-x86_64-pc-linux.gz"
-  fi
-
-  curl -fLo "$HOME/.local/bin/cs.gz" "$cs_url"
-  gzip -df "$HOME/.local/bin/cs.gz"
+  # JVM-based launcher works on both x86_64 and arm64 Linux.
+  curl -fLo "$HOME/.local/bin/cs" https://git.io/coursier-cli
   chmod +x "$HOME/.local/bin/cs"
 
   "$HOME/.local/bin/cs" setup -y
   "$HOME/.local/bin/cs" install metals
 }
 
+install_typescript_ls_macos() {
+  bold "Installing TypeScript language server (macOS)..."
+  if ! have npm; then
+    have brew || die "npm not found. Install Node.js (e.g. brew install node)."
+    brew install node
+  fi
+  npm install -g typescript-language-server typescript
+}
+
+install_typescript_ls_linux() {
+  bold "Installing TypeScript language server (Linux)..."
+  if ! have npm; then
+    if have apt-get; then
+      sudo apt-get update
+      sudo apt-get install -y nodejs npm
+    else
+      die "npm not found and apt-get unavailable. Install Node.js + npm, then retry."
+    fi
+  fi
+  npm install -g typescript-language-server typescript
+}
+
 verify() {
   bold "Verifying language servers on PATH..."
   local missing=0
-  for cmd in jdtls pylsp rust-analyzer metals; do
+  for cmd in jdtls pylsp rust-analyzer metals typescript-language-server; do
     if have "$cmd"; then
       echo "✅ $cmd -> $(command -v "$cmd")"
     else
@@ -178,11 +195,13 @@ main() {
       install_jdtls_macos
       install_metals_macos
       install_rust_analyzer_macos
+      install_typescript_ls_macos
       ;;
     linux)
       install_jdtls_linux
       install_metals_linux
       install_rust_analyzer_linux
+      install_typescript_ls_linux
       ;;
     *)
       die "Unsupported OS: $OS"

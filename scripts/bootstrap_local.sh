@@ -24,7 +24,7 @@ docker compose version >/dev/null 2>&1 || die "docker compose not available."
 if [[ ! -f .env.local ]]; then
   if [[ -f .env.local.example ]]; then
     cp .env.local.example .env.local
-    warn "Created .env.local from .env.local.example. Edit it (XAI_API_KEY, NEO4J_PASSWORD)."
+    warn "Created .env.local from .env.local.example. Edit it (XAI_API_KEY)."
   else
     die ".env.local missing and .env.local.example not found."
   fi
@@ -42,8 +42,8 @@ bash "$ROOT_DIR/scripts/install_language_servers.sh"
 
 # --- start datastores ---
 if [[ -f docker-compose.yml ]]; then
-  bold "Starting MongoDB + Neo4j (docker compose --env-file .env.local up -d)..."
-  docker compose --env-file .env.local up -d
+  bold "Starting MongoDB (docker compose --env-file .env.local up -d mongo)..."
+  docker compose --env-file .env.local up -d mongo
 else
   warn "docker-compose.yml not found. Skipping datastore startup."
 fi

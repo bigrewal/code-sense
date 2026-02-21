@@ -108,81 +108,95 @@ I believe this is a meaningful step toward more robust, doc-independent reposito
 
 ## Limitations (current)
 
-* **Language support**: CodeSense currently supports Scala, Java, Python, and Rust. Support for additional languages is planned as the ingestion and analysis pipeline is extended.
+* **Language support**: CodeSense currently supports Scala, Java, Python, Rust, and TypeScript. Support for additional languages is planned as the ingestion and analysis pipeline is extended.
 
 * **Context window constraints**: CodeSense relies on fitting the compressed repo-wide mental model within the LLM’s context window. If the compressed representation exceeds the available context, this approach will not scale further without additional hierarchical compression. In practice, this design works well for most real-world repositories; for example, a ~1.2M LoC codebase (~5M raw tokens) was compressed to ~600k tokens, comfortably fitting within Grok’s 2M-token context window.
 --- 
 
 ## Run Locally
 
-### Prerequisites
+### Option A: Docker-first (recommended)
 
-Make sure you have the following installed:
+Make sure you have **Docker** and **Docker Compose** installed.
 
-* **Docker** and **Docker Compose**
-* **`uv`** (Python package manager)
-
----
-
-### Setup Environment
-
-1. Clone the repo and create `data/` dir and clone a repo to ingest. For example: https://github.com/cyberlis/dictquery.git
-
-   ```bash
-   mkdir data
-   git clone https://github.com/cyberlis/dictquery.git
-   ```
-
-
-2. Install dependencies and create the virtual environment:
-
-   ```bash
-   uv sync
-   ```
-
-2. Activate the virtual environment:
-
-   ```bash
-   source .venv/bin/activate
-   ```
-
-3. Create your local environment file:
+1. Create your local environment file:
 
    ```bash
    cp .env.local.example .env.local
    ```
 
-   Then update the following values in `.env.local`:
+   Then set:
 
    * `XAI_API_KEY`
 
-4. Make scripts executable:
+2. Create `data/` and clone a repo to ingest. For example:
+
+   ```bash
+   mkdir -p data
+   git clone https://github.com/cyberlis/dictquery.git data/dictquery
+   ```
+
+3. Start the full stack (API + MongoDB):
+
+   ```bash
+   docker compose up --build
+   ```
+
+4. Verify:
+
+   * API docs: http://localhost:8000/docs#/
+   * MongoDB: `mongodb://localhost:27017`
+
+5. Optional UI:
+
+   ```bash
+   git clone https://github.com/bigrewal/code-sense-ui
+   cd code-sense-ui
+   npm install
+   # Create .env.local and set VITE_API_BASE=http://localhost:8000
+   npm run dev
+   ```
+
+### Option B: Host development workflow
+
+Make sure you have **Docker**, **Docker Compose**, and **`uv`** installed.
+
+1. Install dependencies and create the virtual environment:
+
+   ```bash
+   uv sync
+   source .venv/bin/activate
+   ```
+
+2. Create your local environment file:
+
+   ```bash
+   cp .env.local.example .env.local
+   ```
+
+   Then set:
+
+   * `XAI_API_KEY`
+
+3. Make scripts executable:
 
    ```bash
    chmod +x scripts/bootstrap_local.sh scripts/install_language_servers.sh
    ```
 
-5. Bootstrap the local environment:
+4. Bootstrap local tools and start MongoDB:
 
    ```bash
    ./scripts/bootstrap_local.sh
    ```
 
-6. Run:
-   ```
+5. Run the API:
+
+   ```bash
    uv run uvicorn app.main:app --reload
    ```
 
-
-7. Go to http://localhost:8000/docs#/ to check if the CodeSense API is up.
-
-8. Run `git clone https://github.com/bigrewal/code-sense-ui` and point it to the API:
-
-   ```bash
-   npm install
-   Create .env.local and set VITE_API_BASE=http://localhost:8000
-   npm run dev
-   ```
+6. Verify API docs at http://localhost:8000/docs#/
 
 
 ---
@@ -198,7 +212,13 @@ Make sure you have the following installed:
 
 ### Shutdown Services
 
-To stop and remove MongoDB containers (including volumes):
+To stop the Docker stack (API + MongoDB):
+
+```bash
+docker compose down
+```
+
+To stop and remove volumes as well:
 
 ```bash
 docker compose down -v
@@ -208,12 +228,14 @@ docker compose down -v
 
 **Hard requirements**
 
-* The following language servers **must** be installed or bootstrap will fail:
+* Docker image path: language servers are preinstalled in the API image.
+* Host development path: the following language servers **must** be installed or bootstrap will fail:
 
   * `jdtls` (Java)
   * `pylsp` (Python)
   * `rust-analyzer` (Rust)
   * `metals` (Scala)
+  * `typescript-language-server` (TypeScript)
 
 **Endpoints**
 
