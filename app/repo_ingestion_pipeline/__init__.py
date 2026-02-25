@@ -3,9 +3,8 @@ from dataclasses import asdict
 from typing import Dict, List, Optional
 from uuid import uuid4
 
-from ..models.data_model import JobAborted, IngestionJobStatus, IngestionStage, IngestionStageStatus
+from ..models.data_model import IngestionJobStatus, IngestionStage, IngestionStageStatus
 from ..db import get_mongo_client
-from ..utils import now_ts
 from ..llm_grok import GrokLLM
 from ..lsp_reference_resolver.run import CodeAnalyzer
 from .file_state import build_repo_file_changes
@@ -46,25 +45,6 @@ def _mark_stage_skipped(
     )
 
 
-def _abort_if_requested(job_id: str, repo_name: str, stage: IngestionStage):
-    if mongo.is_abort_requested(job_id):
-        mongo.upsert_ingestion_job(
-            IngestionJobStatus(
-                job_id=job_id,
-                repo_name=repo_name,
-                status="aborted",
-                current_stage=stage,
-                stage_status={stage: {"status": IngestionStageStatus.ABORTED.value}},
-            ),
-            extra_fields={
-                "abort_requested": True,
-                "aborted_at": now_ts(),
-                "aborted_after_stage": stage.value,
-            },
-        )
-        raise JobAborted()
-
-
 async def start_ingestion_pipeline(
     local_repo_path: Path,
     repo_name: str,
@@ -76,10 +56,6 @@ async def start_ingestion_pipeline(
 
     job_id = job_id or str(uuid4())
     initial_stage = _initial_current_stage(enable_precheck, enable_resolve_refs)
-    should_abort = lambda: mongo.is_abort_requested(job_id)
-
-    # If abort arrives while the job is still queued, stop before running any stage.
-    _abort_if_requested(job_id, repo_name, initial_stage)
 
     # Initialize canonical stages (no string stage names)
     mongo.upsert_ingestion_job(
@@ -108,7 +84,6 @@ async def start_ingestion_pipeline(
 
     # ---------- PRECHECK ----------
     if enable_precheck:
-        _abort_if_requested(job_id, repo_name, IngestionStage.PRECHECK)
         try:
             mongo.upsert_ingestion_job(
                 IngestionJobStatus(
@@ -123,7 +98,6 @@ async def start_ingestion_pipeline(
             pre_ingestion_stage = PreIngestionAnalysisStage(
                 llm_grok=llm,
                 repo_name=repo_name,
-                should_abort=should_abort,
             )
             analysis_summary = await pre_ingestion_stage.run(
                 repo_path=local_repo_path,
@@ -154,8 +128,6 @@ async def start_ingestion_pipeline(
                 )
             )
 
-        except JobAborted:
-            return
         except PreIngestionAnalysisError as pie:
             mongo.upsert_ingestion_job(
                 IngestionJobStatus(
@@ -200,7 +172,6 @@ async def start_ingestion_pipeline(
 
     # ---------- RESOLVE / ANALYZE ----------
     if enable_resolve_refs:
-        _abort_if_requested(job_id, repo_name, IngestionStage.RESOLVE_REFS)
         try:
             mongo.upsert_ingestion_job(
                 IngestionJobStatus(
@@ -216,7 +187,6 @@ async def start_ingestion_pipeline(
                 repo=local_repo_path,
                 repo_name=repo_name,
                 job_id=job_id,
-                should_abort=should_abort,
             ).analyze()
 
             mongo.upsert_ingestion_job(
@@ -238,8 +208,6 @@ async def start_ingestion_pipeline(
                     },
                 )
             )
-        except JobAborted:
-            return
         except Exception as e:
             mongo.upsert_ingestion_job(
                 IngestionJobStatus(
@@ -266,7 +234,6 @@ async def start_ingestion_pipeline(
         )
 
     # ---------- MENTAL MODEL ----------
-    _abort_if_requested(job_id, repo_name, IngestionStage.MENTAL_MODEL)
     try:
         mongo.upsert_ingestion_job(
             IngestionJobStatus(
@@ -281,7 +248,6 @@ async def start_ingestion_pipeline(
         critical_file_count, ignored_files_count, repo_context_token_count = await MentalModelStage(
             llm_grok=llm,
             config={"job_id": job_id},
-            should_abort=should_abort,
         ).run(
             repo_name=repo_name,
             local_repo_path=local_repo_path,
@@ -307,9 +273,6 @@ async def start_ingestion_pipeline(
                 },
             )
         )
-    except JobAborted:
-        return
-    
     except Exception as e:
         mongo.upsert_ingestion_job(
             IngestionJobStatus(

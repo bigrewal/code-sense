@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from ..core.lsp_client import LSPClient
 from ..core.base_analyser import BaseLSPAnalyzer
@@ -44,13 +44,11 @@ class RustAnalyzer(BaseLSPAnalyzer):
         repo_path: Path,
         base_repo_path: str,
         show_progress: bool = True,
-        should_abort: Optional[Callable[[], bool]] = None,
     ):
         super().__init__(
             repo_path,
             base_repo_path,
             show_progress=show_progress,
-            should_abort=should_abort,
         )
         if LANG_RUST is None or PARSER is None or QUERY_OBJ is None:
             logger.warning(

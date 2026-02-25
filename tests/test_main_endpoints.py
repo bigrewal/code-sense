@@ -14,14 +14,6 @@ async def _passthrough_with_timeout(coro, **_kwargs):
 class FakeMongo:
     def __init__(self):
         self.deleted_repo_name = None
-        self.abort_result = {
-            "reason": "requested",
-            "status": "aborting",
-            "abort_requested": True,
-            "already_terminal": False,
-            "already_requested": False,
-            "message": "Abort requested",
-        }
         self.job = None
         self.delete_job_ok = True
         self.health = {"status": "healthy", "response_time_ms": 1.0}
@@ -71,9 +63,6 @@ class FakeMongo:
 
     def list_jobs(self, **_kwargs):
         return ([{"job_id": "jid-1", "status": "completed"}], 1)
-
-    def request_abort(self, _job_id):
-        return self.abort_result
 
     def list_ingested_repos(self):
         return ["repo-a", "repo-b"]
@@ -236,21 +225,6 @@ async def test_get_status_list(fake_mongo):
     resp = await main.get_status(status="completed", repo_name="repo-a", limit=10, skip=0)
     assert resp["count"] == 1
     assert resp["total"] == 1
-
-
-@pytest.mark.asyncio
-async def test_abort_job_not_found(fake_mongo):
-    fake_mongo.abort_result = {"reason": "not_found"}
-    with pytest.raises(HTTPException) as exc:
-        await main.abort_job("00000000-0000-0000-0000-000000000000")
-    assert exc.value.status_code == 404
-
-
-@pytest.mark.asyncio
-async def test_abort_job_success(fake_mongo):
-    resp = await main.abort_job("00000000-0000-0000-0000-000000000001")
-    assert resp["abort_requested"] is True
-    assert resp["status"] == "aborting"
 
 
 @pytest.mark.asyncio

@@ -8,7 +8,6 @@ from tqdm import tqdm
 from ..config import Config
 from ..db import get_mongo_client
 from ..llm_grok import GrokLLM
-from ..models.data_model import JobAborted
 from .file_state import RepoFileChanges, build_repo_file_changes
 
 logger = logging.getLogger(__name__)
@@ -38,10 +37,9 @@ class PreIngestionAnalysisError(ValueError):
 
 
 class PreIngestionAnalysisStage:
-    def __init__(self, llm_grok: GrokLLM, repo_name: str, should_abort=None):
+    def __init__(self, llm_grok: GrokLLM, repo_name: str):
         self.llm_grok = llm_grok
         self.repo_name = repo_name
-        self.should_abort = should_abort
 
     async def run(
         self,
@@ -49,9 +47,6 @@ class PreIngestionAnalysisStage:
         file_changes: Optional[RepoFileChanges] = None,
         previous_state: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        if self.should_abort and self.should_abort():
-            raise JobAborted()
-
         mongo = get_mongo_client()
         previous_state = previous_state if previous_state is not None else mongo.get_repo_file_states(self.repo_name)
         file_changes = file_changes or build_repo_file_changes(repo_path=repo_path, previous_state=previous_state)
@@ -96,9 +91,6 @@ class PreIngestionAnalysisStage:
 
         async def process_one(rel: str) -> None:
             nonlocal tokenization_errors, total_files_tokenized
-
-            if self.should_abort and self.should_abort():
-                raise JobAborted()
 
             entry = file_changes.current_files[rel]
             supported = entry.supported

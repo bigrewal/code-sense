@@ -15,7 +15,6 @@ class IngestionStageStatus(str, Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
-    ABORTED = "aborted"
 
 
 @dataclass
@@ -25,7 +24,3 @@ class IngestionJobStatus:
     status: str
     current_stage: IngestionStage
     stage_status: dict[IngestionStage, Any]
-
-
-class JobAborted(Exception):
-    pass

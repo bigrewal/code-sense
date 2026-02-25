@@ -1,9 +1,8 @@
 import logging
 from pathlib import Path
-from typing import Callable, Optional, Sequence
+from typing import Optional, Sequence
 
 from .core.base_analyser import BaseLSPAnalyzer
-from ..models.data_model import JobAborted
 from .languages.java_analyser import JavaAnalyzer
 from .languages.python_analyser import PythonAnalyzer
 from .languages.rust_analyser import RustAnalyzer
@@ -27,11 +26,10 @@ class CodeAnalyzer:
         repo: Path,
         repo_name: str,
         job_id: str,
-        should_abort: Optional[Callable[[], bool]] = None,
     ):
         self.repo = repo.resolve()
         self.base_repo_path = repo_name
-        self.should_abort = should_abort
+        _ = job_id
 
     def detect(self) -> list[str]:
         return [
@@ -40,7 +38,6 @@ class CodeAnalyzer:
             if analyzer_cls(
                 self.repo,
                 self.base_repo_path,
-                should_abort=self.should_abort,
             ).get_files()
         ]
 
@@ -52,13 +49,9 @@ class CodeAnalyzer:
         deleted_files: set[str] = set()
 
         for lang in langs:
-            if self.should_abort and self.should_abort():
-                raise JobAborted()
-
             analyzer: BaseLSPAnalyzer = self.ANALYZERS[lang](
                 self.repo,
                 self.base_repo_path,
-                should_abort=self.should_abort,
             )
             logger.info("=== Analyzing %s ===", lang)
             await analyzer.analyze()

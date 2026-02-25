@@ -234,7 +234,6 @@ def test_ingestion_job_and_repo_helpers():
                         "metrics": {"supported_file_count": 1, "secret_metric": 99},
                     }
                 },
-                "abort_requested": True,
             }
         ]
     )
@@ -268,8 +267,6 @@ def test_ingestion_job_and_repo_helpers():
     listed, total = client.list_jobs(include_total=True)
     assert len(listed) == 1
     assert total == 1
-    assert client.is_abort_requested("j1") is True
-    assert client.is_abort_requested("missing") is False
 
     assert client.list_ingested_repos() == ["repo-a"]
     assert client.is_repo_ingested("repo-a") is True

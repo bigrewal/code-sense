@@ -2,19 +2,15 @@ from pathlib import Path
 
 import pytest
 
-from app.models.data_model import JobAborted, IngestionStage
+from app.models.data_model import IngestionStage
 from app.repo_ingestion_pipeline.file_state import FileEntry, RepoFileChanges
 import app.repo_ingestion_pipeline as rp
 
 
 class FakeMongo:
     def __init__(self):
-        self.abort_requested = False
         self.upserts = []
         self.ingested = []
-
-    def is_abort_requested(self, _job_id):
-        return self.abort_requested
 
     def upsert_ingestion_job(self, job, extra_fields=None, error=None):
         self.upserts.append({"job": job, "extra_fields": extra_fields, "error": error})
@@ -93,18 +89,6 @@ def test_initial_stage_and_cache_verification(tmp_path: Path):
     assert rp._initial_current_stage(True, True) == IngestionStage.PRECHECK
     assert rp._initial_current_stage(False, True) == IngestionStage.RESOLVE_REFS
     assert rp._initial_current_stage(False, False) == IngestionStage.MENTAL_MODEL
-
-
-def test_abort_if_requested_marks_job(monkeypatch):
-    fake_mongo = FakeMongo()
-    fake_mongo.abort_requested = True
-    monkeypatch.setattr(rp, "mongo", fake_mongo)
-
-    with pytest.raises(JobAborted):
-        rp._abort_if_requested("job-1", "repo-a", IngestionStage.PRECHECK)
-
-    assert fake_mongo.upserts
-    assert fake_mongo.upserts[-1]["extra_fields"]["aborted_after_stage"] == "precheck"
 
 
 @pytest.mark.asyncio
@@ -192,19 +176,3 @@ async def test_start_ingestion_pipeline_mental_model_failure(monkeypatch, tmp_pa
     assert result is None
     assert any(u["job"].current_stage == IngestionStage.MENTAL_MODEL for u in fake_mongo.upserts)
 
-
-@pytest.mark.asyncio
-async def test_start_ingestion_pipeline_aborted_before_start(monkeypatch, tmp_path: Path):
-    fake_mongo = FakeMongo()
-    fake_mongo.abort_requested = True
-    monkeypatch.setattr(rp, "mongo", fake_mongo)
-    monkeypatch.setattr(rp, "GrokLLM", lambda: object())
-
-    with pytest.raises(JobAborted):
-        await rp.start_ingestion_pipeline(
-            local_repo_path=tmp_path,
-            repo_name="repo-a",
-            job_id="job-5",
-            enable_precheck=True,
-            enable_resolve_refs=True,
-        )
