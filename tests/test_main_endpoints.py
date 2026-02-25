@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -17,6 +18,8 @@ class FakeMongo:
         self.job = None
         self.delete_job_ok = True
         self.health = {"status": "healthy", "response_time_ms": 1.0}
+        self.active_job = None
+        self.cancel_reason = None
 
     def create_conversation(self, repo_name: str):
         return {
@@ -75,6 +78,13 @@ class FakeMongo:
 
     def health_check(self):
         return self.health
+
+    def get_active_ingestion_job(self):
+        return self.active_job
+
+    def cancel_active_ingestion_jobs(self, reason):
+        self.cancel_reason = reason
+        return 1
 
     def close(self):
         return None
@@ -165,8 +175,40 @@ async def test_ingest_repo_success(fake_mongo, monkeypatch, tmp_path: Path):
 
     resp = await main.ingest_repo(background, main.IngestRequest(repo_name="repo-a"))
     assert resp["status"] == "queued"
-    assert scheduled["func"] is main.start_ingestion_pipeline
+    assert scheduled["func"] is main._run_ingestion_job
     assert scheduled["kwargs"]["repo_name"] == "repo-a"
+
+
+@pytest.mark.asyncio
+async def test_ingest_repo_conflict_when_active_job_exists(fake_mongo, monkeypatch, tmp_path: Path):
+    repo_dir = tmp_path / "repo-a"
+    repo_dir.mkdir()
+    monkeypatch.setattr(main, "get_repo_path", lambda _repo_name: repo_dir)
+    fake_mongo.active_job = {"job_id": "already-running"}
+
+    with pytest.raises(HTTPException) as exc:
+        await main.ingest_repo(BackgroundTasks(), main.IngestRequest(repo_name="repo-a"))
+
+    assert exc.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_run_ingestion_job_marks_cancelled_on_cancelled_error(fake_mongo, monkeypatch, tmp_path: Path):
+    async def _cancelled_pipeline(**_kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(main, "start_ingestion_pipeline", _cancelled_pipeline)
+
+    with pytest.raises(asyncio.CancelledError):
+        await main._run_ingestion_job(
+            local_repo_path=tmp_path,
+            repo_name="repo-a",
+            job_id="job-cancelled",
+            enable_precheck=True,
+            enable_resolve_refs=True,
+        )
+
+    assert "job-cancelled" in fake_mongo.cancel_reason
 
 
 @pytest.mark.asyncio

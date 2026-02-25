@@ -600,6 +600,29 @@ class MyMongoClient:
 
         return jobs
 
+    def get_active_ingestion_job(self) -> Optional[Dict[str, Any]]:
+        """Return the most recently updated queued/running ingestion job, if any."""
+        coll = self._db[INGESTION_JOBS_COLLECTION]
+        return coll.find_one(
+            {"status": {"$in": ["queued", "running"]}},
+            {"_id": 0},
+            sort=[("updated_at", -1), ("created_at", -1)],
+        )
+
+    def cancel_active_ingestion_jobs(self, reason: str) -> int:
+        """Mark any queued/running ingestion jobs as cancelled."""
+        result = self._db[INGESTION_JOBS_COLLECTION].update_many(
+            {"status": {"$in": ["queued", "running"]}},
+            {
+                "$set": {
+                    "status": "cancelled",
+                    "error": reason,
+                    "updated_at": now_ts(),
+                }
+            },
+        )
+        return int(result.modified_count)
+
     def list_ingested_repos(self) -> List[str]:
         collection = self._db[INGESTED_REPOS_COLLECTION]
         docs = collection.find({})
