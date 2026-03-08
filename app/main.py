@@ -36,6 +36,16 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Code Sense API", version="1.0.0")
 
+_ingest_admission_lock = asyncio.Lock()
+_ingest_execution_lock = asyncio.Lock()
+
+
+def _cancel_active_jobs_on_lifecycle_event(reason: str) -> None:
+    mongo = get_mongo_client()
+    cancelled_count = mongo.cancel_active_ingestion_jobs(reason)
+    if cancelled_count:
+        logger.info("Marked %s active ingestion job(s) as cancelled", cancelled_count)
+
 
 def _delete_repo_lsp_cache_files(local_repo_path: Path) -> None:
     """Delete per-repo LSP cache sqlite artifacts if present."""
@@ -72,6 +82,7 @@ async def on_startup():
     logger.info("Initializing clients")
     validate_required_settings()
     init_mongo_client()
+    _cancel_active_jobs_on_lifecycle_event("Ingestion cancelled: service restarted")
 
 
 @app.on_event("shutdown")
@@ -82,6 +93,7 @@ async def on_shutdown():
     logger.info("Shutting down application - closing database connections")
 
     try:
+        _cancel_active_jobs_on_lifecycle_event("Ingestion cancelled: service shutting down")
         mongo_client = get_mongo_client()
         if mongo_client:
             mongo_client.close()
@@ -135,6 +147,26 @@ class IngestRequest(BaseModel):
     repo_name: str
     enable_precheck: bool = True
     enable_resolve_refs: bool = True
+
+
+async def _run_ingestion_job(**kwargs):
+    """Ensure ingestion jobs execute one-at-a-time and cancellation is persisted."""
+    job_id = kwargs["job_id"]
+    mongo = get_mongo_client()
+
+    async with _ingest_execution_lock:
+        try:
+            await start_ingestion_pipeline(**kwargs)
+        except asyncio.CancelledError:
+            await with_timeout(
+                asyncio.to_thread(
+                    mongo.cancel_active_ingestion_jobs,
+                    f"Ingestion cancelled: job {job_id} interrupted",
+                ),
+                timeout_seconds=Config.DB_OPERATION_TIMEOUT,
+                operation_name="Cancel interrupted ingestion job",
+            )
+            raise
     
 
 @app.post("/conversations", response_model=ConversationCreateResponse)
@@ -287,42 +319,55 @@ async def ingest_repo(
     if not local_repo_path.exists():
         raise HTTPException(status_code=404, detail=f"Repository not found: {local_repo_path}")
 
-    job_id = str(uuid4())
+    async with _ingest_admission_lock:
+        active_job = await with_timeout(
+            asyncio.to_thread(mongo.get_active_ingestion_job),
+            timeout_seconds=Config.DB_OPERATION_TIMEOUT,
+            operation_name="Check active ingestion job",
+        )
+        if active_job:
+            active_job_id = active_job.get("job_id", "unknown")
+            raise HTTPException(
+                status_code=409,
+                detail=f"An ingestion job is already in progress ({active_job_id}).",
+            )
 
-    job = IngestionJobStatus(
-        job_id=job_id,
-        repo_name=repo_name,
-        status="queued",
-        current_stage=IngestionStage.PRECHECK,
-        stage_status={
-            IngestionStage.PRECHECK: IngestionStageStatus.PENDING,
-            IngestionStage.RESOLVE_REFS: IngestionStageStatus.PENDING,
-            IngestionStage.MENTAL_MODEL: IngestionStageStatus.PENDING,
-        },
-    )
+        job_id = str(uuid4())
 
-    await with_timeout(
-        asyncio.to_thread(
-            mongo.upsert_ingestion_job,
-            job,
-            extra_fields={
-                "operation": "full_ingest",
-                "enable_precheck": ingest_request.enable_precheck,
-                "enable_resolve_refs": ingest_request.enable_resolve_refs,
+        job = IngestionJobStatus(
+            job_id=job_id,
+            repo_name=repo_name,
+            status="queued",
+            current_stage=IngestionStage.PRECHECK,
+            stage_status={
+                IngestionStage.PRECHECK: IngestionStageStatus.PENDING,
+                IngestionStage.RESOLVE_REFS: IngestionStageStatus.PENDING,
+                IngestionStage.MENTAL_MODEL: IngestionStageStatus.PENDING,
             },
-        ),
-        timeout_seconds=Config.DB_OPERATION_TIMEOUT,
-        operation_name="Create ingestion job"
-    )
+        )
 
-    background_tasks.add_task(
-        start_ingestion_pipeline,
-        local_repo_path=local_repo_path,
-        repo_name=repo_name,
-        job_id=job_id,
-        enable_precheck=ingest_request.enable_precheck,
-        enable_resolve_refs=ingest_request.enable_resolve_refs,
-    )
+        await with_timeout(
+            asyncio.to_thread(
+                mongo.upsert_ingestion_job,
+                job,
+                extra_fields={
+                    "operation": "full_ingest",
+                    "enable_precheck": ingest_request.enable_precheck,
+                    "enable_resolve_refs": ingest_request.enable_resolve_refs,
+                },
+            ),
+            timeout_seconds=Config.DB_OPERATION_TIMEOUT,
+            operation_name="Create ingestion job"
+        )
+
+        background_tasks.add_task(
+            _run_ingestion_job,
+            local_repo_path=local_repo_path,
+            repo_name=repo_name,
+            job_id=job_id,
+            enable_precheck=ingest_request.enable_precheck,
+            enable_resolve_refs=ingest_request.enable_resolve_refs,
+        )
 
     return {
         "job_id": job_id,

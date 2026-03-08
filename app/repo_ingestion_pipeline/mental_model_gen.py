@@ -180,6 +180,7 @@ class MentalModelStage:
                     prompt=user_prompt,
                     system_prompt=PROMPT_SYSTEM,
                     temperature=0.0,
+                    max_tokens=150
                 )
             return file_path, response.strip(), code, sha1
 
