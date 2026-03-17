@@ -10,6 +10,7 @@ wheels/
 .venv
 .env.local
 data/
-eval/
+evals/
+tests/evals/
 # macOS cruft
 .DS_Store

@@ -18,7 +18,7 @@ class Cache:
     def __init__(self, repo_path: Path, namespace: str):
         self.repo_path = repo_path
         self.namespace = namespace
-        self.db_path = self.repo_path / ".lsp_ref_cache.sqlite"
+        self.db_path = self.repo_path / ".codesense_ref_index.sqlite"
         self.conn = sqlite3.connect(self.db_path)
         self.conn.execute("PRAGMA journal_mode=WAL;")
         self.conn.execute("PRAGMA synchronous=NORMAL;")
@@ -88,18 +88,19 @@ class Cache:
         self.conn.commit()
 
     def _ensure_namespace(self):
-        cur = self.conn.execute("SELECT value FROM meta WHERE key = 'namespace'")
-        row = cur.fetchone()
-        if not row or row[0] != self.namespace:
-            # Soft-reset this namespace only
-            self.conn.execute("DELETE FROM files WHERE namespace = ?", (self.namespace,))
-            self.conn.execute("DELETE FROM mappings WHERE namespace = ?", (self.namespace,))
-            self.conn.execute("DELETE FROM def_index WHERE namespace = ?", (self.namespace,))
-            self.conn.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES('namespace', ?)",
-                (self.namespace,),
-            )
-            self.conn.commit()
+        """
+        Ensure namespace marker exists.
+
+        Important: tables are already keyed by `namespace`, so data from different
+        analyzers can coexist safely. Using a single global `meta.namespace` key
+        causes analyzers to wipe each other's namespace on startup, which forces
+        near-full recomputation on subsequent ingests.
+        """
+        self.conn.execute(
+            "INSERT OR IGNORE INTO meta(key, value) VALUES(?, ?)",
+            (f"namespace::{self.namespace}", "1"),
+        )
+        self.conn.commit()
 
     # ---------- file SHA helpers ----------
 
@@ -120,6 +121,18 @@ class Cache:
             (self.namespace, rel_path, sha1, int(time.time())),
         )
 
+    def get_all_cached_file_paths(self) -> Set[str]:
+        """Returns all file paths stored in the cache for this namespace."""
+        cur = self.conn.execute("SELECT path FROM files WHERE namespace = ?", (self.namespace,))
+        return {row[0] for row in cur.fetchall()}
+
+    def delete_file_completely(self, rel_path: str):
+        """Remove all cache data for a deleted file from all tables."""
+        self.conn.execute("DELETE FROM files WHERE namespace = ? AND path = ?", (self.namespace, rel_path))
+        self.conn.execute("DELETE FROM mappings WHERE namespace = ? AND ref_path = ?", (self.namespace, rel_path))
+        self.conn.execute("DELETE FROM def_index WHERE namespace = ? AND (ref_path = ? OR def_path = ?)",
+                         (self.namespace, rel_path, rel_path))
+
     # ---------- mappings (per reference) ----------
 
     def delete_mappings_for_file(self, rel_path: str):
@@ -136,13 +149,6 @@ class Cache:
             "DELETE FROM def_index WHERE namespace = ? AND ref_path = ?",
             (self.namespace, rel_path),
         )
-
-    def load_mappings_for_file(self, rel_path: str) -> List[Dict]:
-        cur = self.conn.execute(
-            "SELECT data FROM mappings WHERE namespace = ? AND ref_path = ?",
-            (self.namespace, rel_path),
-        )
-        return [json.loads(row[0]) for row in cur.fetchall()]
 
     def store_mapping(self, mapping: Dict):
         """

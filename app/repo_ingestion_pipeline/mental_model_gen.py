@@ -1,15 +1,15 @@
 import asyncio
+import hashlib
 import logging
+import os
 from pathlib import Path
-import traceback
 from typing import Dict, List, Optional, Set, Tuple
 
 from tqdm import tqdm
 
-from ..db import Neo4jClient, get_mongo_client, get_neo4j_client
+from ..config import Config
+from ..db import LSPCacheReader, get_mongo_client
 from ..llm_grok import GrokLLM
-from ..repo_context_builder import build_repo_context
-from ..models.data_model import IngestionJobStatus, IngestionStage, IngestionStageStatus
 
 logger = logging.getLogger(__name__)
 
@@ -17,37 +17,44 @@ logger = logging.getLogger(__name__)
 MENTAL_MODEL_TYPES = {
     "BRIEF": "BRIEF_FILE_OVERVIEW",
     "IGNORED": "IGNORED_FILE",
-    "ENTRY": "POTENTIAL_ENTRY_POINTS",
 }
 
 PROMPT_SYSTEM = (
-    "Your task is to analyze the provided code file and determine if it is critical to the core "
-    "functionality of the repository. If the file is critical, write a 1–3 sentence plain-English "
-    "description covering components, purpose, and key interactions. Otherwise, output IGNORE. "
-    "Ignore tutorials, tests, and docs."
+   "You analyze one repository file at a time.\n\n"
+    "Step 1: classify file criticality.\n"
+    "A file is CRITICAL if it directly implements/coordinates core product behavior, API surface, core data model, orchestration, or essential integration flow.\n"
+    "A file is NOT critical if it is primarily tests, fixtures, docs, examples, demos, generated code, config-only, or thin wrappers with no meaningful domain behavior.\n\n"
+    "If NOT critical, output exactly: IGNORE\n\n"
+    "If the file is critical, output exactly a concise summary using the required sentence template.\n"
+    "Be factual and concise. Use only evidence from code and dependency context.\n"
+    "No bullets, no markdown, no extra commentary."
 )
 
 PROMPT_USER_TEMPLATE = """
-Repo name:
-{repo_id}
+    Repository: {repo_name}
+    File: {file_path}
 
-File path:
-`{file_path}`
+    Code:
+    {code}
 
-File code:
-{code}
+    Upstream dependencies (who calls/uses this file):
+    {upstream}
 
-Upstream interactions:
-{upstream}
+    Downstream dependencies (what this file calls/uses):
+    {downstream}
 
-Downstream interactions:
-{downstream}
+    Instructions:
+    - If NOT critical, output exactly: IGNORE
+    - If CRITICAL, output one concise paragraph in this exact 3-sentence format:
 
-If critical, write 1–3 sentences like:
-"`{file_path}` defines <key components> to <main responsibilities>, and interacts with <other files> to <reason>."
-Otherwise, output "IGNORE".
-Be concise but readable.
-""".strip()
+    "`{file_path}` <what this file does and why it exists>. It does this by <how it works end-to-end, explicitly naming every major component/function/class defined in this file and each component's role>. It interacts upstream with <key files/modules that call or depend on this file> and downstream with <key files/modules/services this file calls or depends on>."
+
+    Rules:
+    - Keep it very concise: 100-200 words total.
+    - Mention concrete identifiers when available.
+    - The second sentence must mention every major component in this file.
+    - No bullets, no markdown, no extra text.
+    """.strip()
 
 
 class MentalModelStage:
@@ -62,89 +69,88 @@ class MentalModelStage:
         self.batch_size = int(config.get("batch_size", 20))
         self.max_concurrency = int(config.get("max_concurrency", 10))
 
-    async def run(self, repo_id: str, local_repo_path: Path):
-        self.neo4j_client: Neo4jClient = get_neo4j_client()
-        logger.info("Job %s: starting mental model generation for %s", self.job_id, repo_id)
+    async def run(
+        self,
+        repo_name: str,
+        local_repo_path: Path,
+        file_changes: Optional[dict] = None,
+        resolver_changes: Optional[dict] = None,
+    ):
+        try:
+            self.lsp_cache = LSPCacheReader(str(local_repo_path))
+        except FileNotFoundError:
+            logger.warning(
+                "Job %s: LSP cache missing for %s, continuing mental-model generation without dependency interactions",
+                self.job_id,
+                repo_name,
+            )
+            self.lsp_cache = None
+        self.repo_name = repo_name
+        self.local_repo_path = local_repo_path
+        logger.info("Job %s: starting mental model generation for %s", self.job_id, repo_name)
 
         try:
-            dir_tree = self._build_dir_tree(repo_id)
-            insights, ignored_files = await self.identify_critical_files(dir_tree, repo_id)
+            dir_tree = self._build_dir_tree()
+            files_to_process = self._select_files_to_process(
+                repo_name=repo_name,
+                all_files=dir_tree,
+                file_changes=file_changes,
+                resolver_changes=resolver_changes,
+            )
+            deleted_files = sorted((file_changes or {}).get("deleted_files", []))
+            await self._delete_removed_artifacts(repo_name, deleted_files)
+
+            critical_files, ignored_files = await self.identify_critical_files(
+                files_to_process, repo_name
+            )
             logger.info(
-                "Job %s: generated overview with %s insights, ignored %s files",
+                "Job %s: generated overview from %s files with %s critical files, ignored %s files",
                 self.job_id,
-                len(insights),
+                len(files_to_process),
+                len(critical_files),
                 len(ignored_files),
             )
-            await self._set_potential_entry_points(insights, repo_id)
-            repo_context_token_count = await build_repo_context(repo_id, self.llm_client)
+            repo_context_token_count = await self.create_repo_context(repo_name)
+            critical_total, ignored_total = self._get_repo_file_classification_counts(repo_name)
 
-            return len(insights), len(ignored_files), repo_context_token_count
+            return critical_total, ignored_total, repo_context_token_count
 
-        except Exception as e:
+        except Exception:
             logger.exception("Job %s: mental model generation error", self.job_id)
-            traceback.print_exc()
-            raise e
+            raise
 
-    async def _set_potential_entry_points(self, insights: List[dict], repo_id: str) -> List[str]:
-        """Get potential entry points for the repo based on insights."""
-        potential_entry_points = set()
-        insights_files = {i.get("file_path") for i in insights if i.get("file_path")}
-
-        for i in insights:
-            fp = i.get("file_path")
-            if fp:
-                potential_entry_points.add(fp)
-
-        for i in insights:
-            fp = i.get("file_path")
-
-            if not fp:
-                continue
-            ups = i.get("upstream_dep_files") or []
-            for u in ups:
-                if u in insights_files:
-                    potential_entry_points.discard(fp)
-                    break
-
-        # Add potential entry points to the DB
-        for file_path in potential_entry_points:
-            document = {
-                "repo_id": repo_id,
-                "file_path": file_path,
-                "document_type": MENTAL_MODEL_TYPES["ENTRY"],
-            }
-            self._upsert_document(document)
-
-        return sorted(list(potential_entry_points))
-
-    async def identify_critical_files(self, dir_tree: List[str], repo_id: str) -> Tuple[List[Dict[str, str]], Set[str]]:
+    async def identify_critical_files(
+        self,
+        dir_tree: List[str],
+        repo_name: str,
+    ) -> Tuple[List[Dict[str, str]], Set[str]]:
         """Generate a comprehensive overview of the repo by summarizing critical files, ignoring non-critical ones."""
 
         semaphore = asyncio.Semaphore(self.max_concurrency)
 
-        async def summarize_file(file_path: str) -> tuple[str, str]:
+        async def summarize_file(file_path: str) -> tuple[str, str, str | None, str | None]:
+            try:
+                full_path = self.local_repo_path / file_path
+                code_bytes = full_path.read_bytes()
+                code = code_bytes.decode("utf-8")
+                sha1 = hashlib.sha1(code_bytes).hexdigest()
+            except Exception:
+                logger.warning("Job %s: unable to read %s; marking ignored", self.job_id, file_path)
+                return file_path, "IGNORE", None, None
+
             cached = self.mental_model_collection.find_one(
                 {
-                    "repo_id": repo_id,
+                    "repo_name": repo_name,
                     "file_path": file_path,
                     "document_type": {"$in": [MENTAL_MODEL_TYPES["BRIEF"], MENTAL_MODEL_TYPES["IGNORED"]]},
+                    "sha1": sha1,
                 },
                 {"_id": 0, "data": 1},
             )
             if cached:
-                return file_path, cached["data"]
+                return file_path, cached["data"], code, sha1
 
-            try:
-                code = Path(file_path).read_text(encoding="utf-8")
-            except Exception:
-                logger.warning("Job %s: unable to read %s; marking ignored", self.job_id, file_path)
-                return file_path, "IGNORE"
-
-            cfi = self.neo4j_client.cross_file_interactions_in_file(
-                file_path=file_path,
-                repo_id=repo_id,
-            )
-
+            cfi = self._cross_file_interactions(file_path)
             downstream_info = cfi.get("downstream", {}) or {}
             upstream_info = cfi.get("upstream", {}) or {}
 
@@ -162,7 +168,7 @@ class MentalModelStage:
             downstream_block = "\n".join(f"- {i}" for i in (downstream_interactions or [])) or "—"
 
             user_prompt = PROMPT_USER_TEMPLATE.format(
-                repo_id=repo_id,
+                repo_name=repo_name,
                 file_path=file_path,
                 code=code,
                 upstream=upstream_block,
@@ -174,8 +180,9 @@ class MentalModelStage:
                     prompt=user_prompt,
                     system_prompt=PROMPT_SYSTEM,
                     temperature=0.0,
+                    max_tokens=150
                 )
-            return file_path, response.strip()
+            return file_path, response.strip(), code, sha1
 
         all_files = dir_tree
 
@@ -189,27 +196,15 @@ class MentalModelStage:
             tasks = [summarize_file(fp) for fp in batch]
             results = await asyncio.gather(*tasks)
 
-            for fp, summary in results:
+            for fp, summary, _code, sha1 in results:
                 if summary == "IGNORE":
                     ignored.add(fp)
-                    self._upsert_document(
-                        {
-                            "repo_id": repo_id,
-                            "file_path": fp,
-                            "document_type": MENTAL_MODEL_TYPES["IGNORED"],
-                            "data": "IGNORE",
-                        }
-                    )
+                    if sha1:
+                        self._replace_file_document(repo_name, fp, MENTAL_MODEL_TYPES["IGNORED"], "IGNORE", sha1)
                 else:
                     insights.append({"file_path": fp, "summary": summary})
-                    self._upsert_document(
-                        {
-                            "repo_id": repo_id,
-                            "file_path": fp,
-                            "document_type": MENTAL_MODEL_TYPES["BRIEF"],
-                            "data": summary,
-                        }
-                    )
+                    if sha1:
+                        self._replace_file_document(repo_name, fp, MENTAL_MODEL_TYPES["BRIEF"], summary, sha1)
 
             pbar.update(len(batch))
 
@@ -217,7 +212,7 @@ class MentalModelStage:
 
         for insight in insights:
             file_path = insight["file_path"]
-            dependency_info = self._cross_file_interactions_in_file(file_path, repo_id)
+            dependency_info = self._cross_file_interactions(file_path)
             insight["downstream_dep_interactions"] = dependency_info["downstream"]["interactions"]
             insight["downstream_dep_files"] = list(dependency_info["downstream"]["files"])
             insight["upstream_dep_interactions"] = dependency_info["upstream"]["interactions"]
@@ -225,81 +220,147 @@ class MentalModelStage:
 
         return insights, ignored
 
-    def _build_dir_tree(self, repo_id: str) -> List[str]:
-        """Build a nested dict representing the directory tree from file paths in Neo4j or MongoDB."""
-        # Query Neo4j for all unique file_paths
-        query = """
-        MATCH (n:ASTNode {repo_id: $repo_id})
-        RETURN DISTINCT n.file_path AS file_path
-        """
-        with self.neo4j_client.driver.session() as session:
-            result = session.run(query, repo_id=repo_id)
-            file_paths = [record["file_path"] for record in result]
-        
-        return file_paths
+    async def create_repo_context(self, repo_name: str) -> int:
+        critical_files = set(self.mongo_client.get_critical_file_paths(repo_name))
+        context_parts: list[str] = []
 
-    def _cross_file_interactions_in_file(self, file_path: str, repo_id: str):
-        """Infer cross-file interactions for a given file by finding references to and from definitions in other files."""
+        for file_path in critical_files:
+            brief = self.mongo_client.get_brief_file_overview(repo_name, file_path)
+            if brief:
+                context_parts.append(brief)
 
-        # Downstream: file_path → other files
-        downstream_query = """
-        MATCH (ref:ASTNode {repo_id: $repo_id, file_path: $file_path, is_reference: true})
-        -[:REFERENCES]->(ident:ASTNode)
-        WHERE ident.file_path <> $file_path
-        MATCH (def:ASTNode)
-        WHERE def.node_id = ident.parent_id
-        RETURN DISTINCT ref.name AS ref_name, def.node_type AS node_type, def.file_path AS def_file_path
-        """
+        repo_context = "\n\n".join(context_parts)
+        repo_context_token_count = self.llm_client.count_tokens(repo_context)
 
-        # Upstream: other files → file_path
-        upstream_query = """
-        MATCH (ref:ASTNode {repo_id: $repo_id, is_reference: true})
-        -[:REFERENCES]->(ident:ASTNode {file_path: $file_path})
-        MATCH (def:ASTNode)
-        WHERE def.node_id = ident.parent_id
-        RETURN DISTINCT ref.file_path AS ref_file_path, ref.name AS ref_name, def.node_type AS node_type
-        """
+        doc = {
+            "repo_name": repo_name,
+            "document_type": "REPO_CONTEXT",
+            "context": repo_context,
+        }
+        self.mental_model_collection.update_one(
+            {
+                "repo_name": repo_name,
+                "document_type": "REPO_CONTEXT",
+            },
+            {"$set": doc},
+            upsert=True,
+        )
 
-        with self.neo4j_client.driver.session() as session:
-            # Downstream
-            downstream_result = list(session.run(downstream_query, repo_id=repo_id, file_path=file_path))
-            downstream_interactions = [
-                f"{record['ref_name']} REFERENCES {record['node_type']} IN {record['def_file_path']}"
-                for record in downstream_result
-            ]
-            downstream_files = {
-                record['def_file_path'] for record in downstream_result if record['def_file_path'] != file_path
-            }
+        return repo_context_token_count
 
-            # Upstream
-            upstream_result = list(session.run(upstream_query, repo_id=repo_id, file_path=file_path))
-            upstream_interactions = [
-                f"{record['ref_name']} IN {record['ref_file_path']} REFERENCES {record['node_type']} IN {file_path}"
-                for record in upstream_result
-            ]
-            upstream_files = {
-                record['ref_file_path'] for record in upstream_result if record['ref_file_path'] != file_path
-            }
+    def _get_repo_file_classification_counts(self, repo_name: str) -> tuple[int, int]:
+        critical_total = self.mental_model_collection.count_documents(
+            {"repo_name": repo_name, "document_type": MENTAL_MODEL_TYPES["BRIEF"]}
+        )
+        ignored_total = self.mental_model_collection.count_documents(
+            {"repo_name": repo_name, "document_type": MENTAL_MODEL_TYPES["IGNORED"]}
+        )
+        return critical_total, ignored_total
 
-            return {
-                "downstream": {
-                    "interactions": downstream_interactions,
-                    "files": downstream_files,
-                },
-                "upstream": {
-                    "interactions": upstream_interactions,
-                    "files": upstream_files,
-                },
-            }
+    def _build_dir_tree(self) -> List[str]:
+        """Build a list of code file paths by walking the repository."""
+        code_files = []
+        supported_extensions = set(Config.SUPPORTED_LANGUAGES.keys())
+        ignore_folders = Config.IGNORE_FOLDERS
+
+        for root, dirs, files in os.walk(self.local_repo_path):
+            root_path = Path(root)
+
+            # Filter out ignored directories in-place
+            dirs[:] = [d for d in dirs if d not in ignore_folders and not d.startswith('.')]
+
+            for file in files:
+                file_path = root_path / file
+                if file_path.suffix in supported_extensions:
+                    # Return path relative to repo root for consistency with LSP cache
+                    relative_path = file_path.relative_to(self.local_repo_path)
+                    code_files.append(str(relative_path))
+
+        return sorted(code_files)
 
     def _upsert_document(self, document: Dict):
         """Persist a mental model document via upsert."""
         self.mental_model_collection.update_one(
             {
-                "repo_id": document["repo_id"],
+                "repo_name": document["repo_name"],
                 "file_path": document["file_path"],
                 "document_type": document["document_type"],
             },
             {"$set": document},
             upsert=True,
         )
+
+    def _replace_file_document(self, repo_name: str, file_path: str, doc_type: str, data: str, sha1: str):
+        self.mental_model_collection.delete_many(
+            {
+                "repo_name": repo_name,
+                "file_path": file_path,
+                "document_type": {"$in": [MENTAL_MODEL_TYPES["BRIEF"], MENTAL_MODEL_TYPES["IGNORED"]]},
+            }
+        )
+        self._upsert_document(
+            {
+                "repo_name": repo_name,
+                "file_path": file_path,
+                "document_type": doc_type,
+                "data": data,
+                "sha1": sha1,
+            }
+        )
+
+    async def _delete_removed_artifacts(
+        self,
+        repo_name: str,
+        deleted_files: List[str],
+    ):
+        if not deleted_files:
+            return
+        self.mental_model_collection.delete_many(
+            {
+                "repo_name": repo_name,
+                "file_path": {"$in": deleted_files},
+                "document_type": {"$in": [MENTAL_MODEL_TYPES["BRIEF"], MENTAL_MODEL_TYPES["IGNORED"]]},
+            }
+        )
+
+    def _select_files_to_process(
+        self,
+        repo_name: str,
+        all_files: List[str],
+        file_changes: Optional[dict],
+        resolver_changes: Optional[dict],
+    ) -> List[str]:
+        if not file_changes and not resolver_changes:
+            return all_files
+
+        selected: Set[str] = set()
+        selected.update(file_changes.get("new_files", []) if file_changes else [])
+        selected.update(file_changes.get("changed_files", []) if file_changes else [])
+
+        prefix = f"{repo_name}/"
+        for path in (resolver_changes or {}).get("impacted_ref_files", []):
+            selected.add(path[len(prefix):] if path.startswith(prefix) else path)
+
+        # Backfill missing mental-model docs even when there are no file deltas.
+        existing = self.mental_model_collection.find(
+            {
+                "repo_name": repo_name,
+                "document_type": {"$in": [MENTAL_MODEL_TYPES["BRIEF"], MENTAL_MODEL_TYPES["IGNORED"]]},
+            },
+            {"_id": 0, "file_path": 1},
+        )
+        documented_files = {doc.get("file_path") for doc in existing if doc.get("file_path")}
+        for path in all_files:
+            if path not in documented_files:
+                selected.add(path)
+
+        allowed = set(all_files)
+        return sorted([p for p in selected if p in allowed])
+
+    def _cross_file_interactions(self, file_path: str) -> Dict[str, Dict]:
+        if not self.lsp_cache:
+            return {
+                "downstream": {"interactions": {}, "files": set()},
+                "upstream": {"interactions": {}, "files": set()},
+            }
+        return self.lsp_cache.cross_file_interactions(file_path)

@@ -1,11 +1,9 @@
-from pathlib import Path
-from typing import List, Tuple, Dict
-import logging
-import os
 import asyncio
+import logging
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
-from app.lsp_reference_resolver.core.lsp_client import LSPClient
-
+from ..core.lsp_client import LSPClient
 from ..core.base_analyser import BaseLSPAnalyzer
 
 logger = logging.getLogger(__name__)
@@ -41,8 +39,17 @@ except Exception as e:
 
 
 class RustAnalyzer(BaseLSPAnalyzer):
-    def __init__(self, repo_path: Path, show_progress: bool = True):
-        super().__init__(repo_path, show_progress)
+    def __init__(
+        self,
+        repo_path: Path,
+        base_repo_path: str,
+        show_progress: bool = True,
+    ):
+        super().__init__(
+            repo_path,
+            base_repo_path,
+            show_progress=show_progress,
+        )
         if LANG_RUST is None or PARSER is None or QUERY_OBJ is None:
             logger.warning(
                 "Rust tree-sitter setup missing. Install `tree_sitter_languages` "
@@ -77,13 +84,6 @@ class RustAnalyzer(BaseLSPAnalyzer):
 
     def get_max_concurrency(self) -> int:
         return 8
-    
-    def is_excluded_definition_path(self, path: Path) -> bool:
-        parts = set(path.parts)
-        exclude = {
-            "target", ".git",
-        }
-        return not parts.isdisjoint(exclude)
 
     # ---------- Adaptive project discovery ----------
     def _skip_dir(self, p: Path) -> bool:

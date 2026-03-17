@@ -7,7 +7,6 @@ requires-python = ">=3.11.0"
 dependencies = [
     "fastapi>=0.116.1",
     "loguru>=0.7.3",
-    "neo4j>=5.28.2",
     "pydantic>=2.11.7",
     "pylsp-rope>=0.1.17",
     "pymongo==4.13.0",
@@ -18,4 +17,16 @@ dependencies = [
     "tree-sitter-languages==1.10.2",
     "uvicorn>=0.35.0",
     "xai-sdk>=1.4.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.1.0",
+    "pytest-mock>=3.11.0",
+    "freezegun>=1.2.2",
+]
+eval = [
+    "datasets>=2.21.0",
 ]

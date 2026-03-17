@@ -3,19 +3,28 @@ services:
     image: mongo:7
     ports:
       - "27017:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ ping: 1 }).ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
     volumes:
       - mongo_data:/data/db
-
-  neo4j:
-    image: neo4j:5.22.0
-    ports:
-      - "7474:7474"   # browser
-      - "7687:7687"   # bolt
+  api:
+    build: .
+    env_file:
+      - .env.local
     environment:
-      - NEO4J_AUTH=${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-password}
+      MONGO_URI: mongodb://mongo:27017
+      BASE_REPO_DIR: /app/data
+    depends_on:
+      mongo:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
     volumes:
-      - neo4j_data:/data
+      - ./data:/app/data
 
 volumes:
   mongo_data:
-  neo4j_data:

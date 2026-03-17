@@ -10,8 +10,8 @@ CodeSense takes a different approach.
 
 Instead of retrieving isolated snippets, CodeSense:
 
-* builds a **semantic dependency graph directly from code** (AST + LSP),
-* compresses that graph into a **global repository context** that fits within an LLM’s context window. For example: [Astropy on GitHub](https://github.com/astropy/astropy) (~1M Python tokens) is compressed by CodeSense to ~48k tokens.
+* builds a **semantic reference index directly from code** (AST + LSP),
+* compresses cross-file signals into a **global repository context** that fits within an LLM’s context window. For example: [Astropy on GitHub](https://github.com/astropy/astropy) (~1M Python tokens) is compressed by CodeSense to ~48k tokens.
 * and uses this context to answer questions with a **repo-wide mental model**.
 
 > Note: The repo-wide mental model is constructed exclusively from source code (AST + semantic dependencies) and does not rely on repository documentation or Markdown files.
@@ -33,11 +33,10 @@ The goal is to give the LLM an **integrated understanding of the entire codebase
 ## How is the mental model created
 
 1. **Parse the repository** (tree-sitter) to capture structure.
-2. **Resolve cross-file symbol references** (LSP) to capture semantics.
-3. **Construct a repo graph** (Neo4j) from AST structure + LSP reference edges.
-4. **Generate a “mental model”**: classify files (CRITICAL vs IGNORE) and summarize critical files with upstream/downstream interactions.
-5. **Compress to global context**: traverse from entry points and assemble a repo-wide context that fits comfortably in the LLM context window.
-6. **Answer questions** using the global context (no doc reliance required).
+2. **Resolve cross-file symbol references** (LSP) to capture semantics in a local SQLite cache.
+3. **Generate a "mental model"**: classify files (CRITICAL vs IGNORE) and summarize critical files with upstream/downstream interactions using the LSP reference cache.
+4. **Compress to global context**: assemble a repo-wide context from critical-file summaries and cross-file interactions so it fits comfortably in the LLM context window.
+5. **Answer questions** using the global context (no doc reliance required).
 
 ---
 
@@ -48,7 +47,7 @@ The goal is to give the LLM an **integrated understanding of the entire codebase
 * **Compression-first**: gives the model a **stable global view**, enabling more reliable cross-file reasoning.
 
 ## TL;DR
-Search-based approaches inevitably expose the model to only a small subset of the repository (e.g., top-k files out of thousands). In large codebases like Twitter’s recommendation system (~6k files), this means answers are constructed from a partial view and can miss critical cross-file interactions. CodeSense instead compresses the entire repository into a global, dependency-aware context, allowing questions to be answered with awareness of all files, not just a retrieved fraction.
+Search-based approaches inevitably expose the model to only a small subset of the repository (e.g., top-k files out of thousands). In large codebases like Twitter’s recommendation system (~6k files), this means answers are constructed from a partial view and can miss critical cross-file interactions. CodeSense instead compresses repository-wide signals into a global context, allowing questions to be answered with awareness of the broader codebase, not just a retrieved fraction.
 
 ---
 
@@ -58,15 +57,13 @@ Search-based approaches inevitably expose the model to only a small subset of th
 
 * **Pre-ingestion analysis**: scans files, filters directories, estimates size/budget.
 * **LSP reference extraction**: builds a persistent SQLite cache of symbol reference edges.
-* **Repo graph construction**: stores nodes/edges in Neo4j.
-* **Mental model generation**: uses graph queries + an LLM to produce short file-level “briefs” and criticality.
-* **Repo context builder**: performs BFS from entry points to assemble a **global repo context** stored in MongoDB.
+* **Mental model generation**: queries the SQLite cache + an LLM to produce short file-level "briefs" and criticality.
+* **Repo context builder**: assembles a **global repo context** from critical-file briefs and dependencies, then stores it in MongoDB.
 
 **Storage**
 
-* **Neo4j**: repo dependency graph (AST + semantic reference edges)
+* **SQLite**: LSP reference cache (per-repository, stores cross-file dependencies)
 * **MongoDB**: brief summaries + global repo context (document store)
-* **SQLite**: LSP reference cache
 
 
 ## Evaluation
@@ -97,10 +94,10 @@ I compared our tool against **DeepWiki** (Cognition Labs / Devin-powered reposit
 ### Key Takeaways
 - **DeepWiki** relies heavily on human-written markdown documentation for accurate high-level reasoning and architectural synthesis. When documentation is removed, its answers become shallow, incomplete, and miss critical system components.
 - Our system **excels in the code-only setting** — deriving deeper, more accurate architectural understanding directly from:
-  - LSP-resolved cross-file references
-  - Tree-sitter AST + pruned Neo4j graph
+  - LSP-resolved cross-file references (stored in SQLite)
+  - Tree-sitter AST + semantic dependency analysis
   - Dependency-aware critical file selection & summarization
-  - BFS-ordered repo context from inferred entry points
+  - Repository context synthesis from summarized critical files and cross-file interactions
 
 This demonstrates a significant advantage in real-world scenarios where documentation is sparse, outdated, or absent — a common situation in large production codebases.
 
@@ -110,82 +107,95 @@ I believe this is a meaningful step toward more robust, doc-independent reposito
 
 ## Limitations (current)
 
-* **Language support**: CodeSense currently supports Scala, Java, Python, and Rust. Support for additional languages is planned as the ingestion and analysis pipeline is extended.
+* **Language support**: CodeSense currently supports Scala, Java, Python, Rust, and TypeScript. Support for additional languages is planned as the ingestion and analysis pipeline is extended.
 
 * **Context window constraints**: CodeSense relies on fitting the compressed repo-wide mental model within the LLM’s context window. If the compressed representation exceeds the available context, this approach will not scale further without additional hierarchical compression. In practice, this design works well for most real-world repositories; for example, a ~1.2M LoC codebase (~5M raw tokens) was compressed to ~600k tokens, comfortably fitting within Grok’s 2M-token context window.
 --- 
 
 ## Run Locally
 
-### Prerequisites
+### Option A: Docker-first (recommended)
 
-Make sure you have the following installed:
+Make sure you have **Docker** and **Docker Compose** installed.
 
-* **Docker** and **Docker Compose**
-* **`uv`** (Python package manager)
-
----
-
-### Setup Environment
-
-1. Clone the repo and create `data/` dir and clone a repo to ingest. For example: https://github.com/cyberlis/dictquery.git
-
-   ```bash
-   mkdir data
-   git clone https://github.com/cyberlis/dictquery.git
-   ```
-
-
-2. Install dependencies and create the virtual environment:
-
-   ```bash
-   uv sync
-   ```
-
-2. Activate the virtual environment:
-
-   ```bash
-   source .venv/bin/activate
-   ```
-
-3. Create your local environment file:
+1. Create your local environment file:
 
    ```bash
    cp .env.local.example .env.local
    ```
 
-   Then update the following values in `.env.local`:
+   Then set:
 
    * `XAI_API_KEY`
-   * `NEO4J_PASSWORD`
 
-4. Make scripts executable:
+2. Create `data/` and clone a repo to ingest. For example:
+
+   ```bash
+   mkdir -p data
+   git clone https://github.com/cyberlis/dictquery.git data/dictquery
+   ```
+
+3. Start the full stack (API + MongoDB):
+
+   ```bash
+   docker compose up --build
+   ```
+
+4. Verify:
+
+   * API docs: http://localhost:8000/docs#/
+   * MongoDB: `mongodb://localhost:27017`
+
+5. Optional UI:
+
+   ```bash
+   git clone https://github.com/bigrewal/code-sense-ui
+   cd code-sense-ui
+   npm install
+   # Create .env.local and set VITE_API_BASE=http://localhost:8000
+   npm run dev
+   ```
+
+### Option B: Host development workflow
+
+Make sure you have **Docker**, **Docker Compose**, and **`uv`** installed.
+
+1. Install dependencies and create the virtual environment:
+
+   ```bash
+   uv sync
+   source .venv/bin/activate
+   ```
+
+2. Create your local environment file:
+
+   ```bash
+   cp .env.local.example .env.local
+   ```
+
+   Then set:
+
+   * `XAI_API_KEY`
+
+3. Make scripts executable:
 
    ```bash
    chmod +x scripts/bootstrap_local.sh scripts/install_language_servers.sh
    ```
 
-5. Bootstrap the local environment:
+4. Bootstrap local tools and start MongoDB:
 
    ```bash
    ./scripts/bootstrap_local.sh
    ```
 
-6. Run:
-   ```
+5. Run the API:
+
+   ```bash
    uv run uvicorn app.main:app --reload
    ```
 
-
-7. Go to http://localhost:8000/docs#/ to check if the CodeSense API is up.
-
-8. Run `git clone https://github.com/bigrewal/code-sense-ui` and point it to the API:
-
-   ```bash
-   npm install
-   Create .env.local and set VITE_API_BASE=http://localhost:8000
-   npm run dev
-   ```
+6. Verify API docs at http://localhost:8000/docs#/
 
 
 ---
@@ -201,7 +211,13 @@ Make sure you have the following installed:
 
 ### Shutdown Services
 
-To stop and remove Neo4j and MongoDB containers (including volumes):
+To stop the Docker stack (API + MongoDB):
+
+```bash
+docker compose down
+```
+
+To stop and remove volumes as well:
 
 ```bash
 docker compose down -v
@@ -211,18 +227,17 @@ docker compose down -v
 
 **Hard requirements**
 
-* The following language servers **must** be installed or bootstrap will fail:
+* Docker image path: language servers are preinstalled in the API image.
+* Host development path: the following language servers **must** be installed or bootstrap will fail:
 
   * `jdtls` (Java)
   * `pylsp` (Python)
   * `rust-analyzer` (Rust)
   * `metals` (Scala)
+  * `typescript-language-server` (TypeScript)
 
 **Endpoints**
 
 * API: [http://localhost:8000](http://localhost:8000)
-* Neo4j UI: [http://localhost:7474](http://localhost:7474)
 * MongoDB: mongodb://localhost:27017
 * CodeSense UI: http://localhost:5173/
-
----

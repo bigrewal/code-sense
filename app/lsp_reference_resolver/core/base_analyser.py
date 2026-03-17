@@ -1,12 +1,15 @@
-import asyncio, logging, os, hashlib
+import asyncio
+import hashlib
+import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple, Set
-from urllib.parse import urlparse, unquote
+from typing import Dict, List, Optional, Set, Tuple
+from urllib.parse import unquote, urlparse
 
 from .lsp_client import LSPClient
 from .cache import Cache
 from app.config import Config
+from app.db import get_mongo_client
 
 try:
     from tqdm import tqdm
@@ -45,7 +48,12 @@ class BaseLSPAnalyzer:
       4) unchanged files served from SQLite cache
     """
 
-    def __init__(self, repo_path: Path, base_repo_path: str, show_progress: bool = True):
+    def __init__(
+        self,
+        repo_path: Path,
+        base_repo_path: str,
+        show_progress: bool = True,
+    ):
         self.repo_path = repo_path
         self.base_repo_path = base_repo_path
         # self.client: Optional[LSPClient] = None
@@ -53,6 +61,9 @@ class BaseLSPAnalyzer:
         self.cache: Optional[Cache] = None
         self.cache_lock: Optional[asyncio.Lock] = None
         self.changed_files: Set[str] = set()
+        self.content_changed_files: Set[str] = set()
+        self.impacted_ref_files: Set[str] = set()
+        self.deleted_files: Set[str] = set()
         self._doc_versions = {}
         self.server_list: List[LSPClient] = []
 
@@ -74,13 +85,13 @@ class BaseLSPAnalyzer:
         raise NotImplementedError
 
     def get_max_concurrency(self) -> int:
-        NotImplementedError
+        raise NotImplementedError
 
     def get_timeout_seconds(self) -> float:
-        NotImplementedError
+        raise NotImplementedError
 
     def get_total_server_instances(self) -> int:
-        NotImplementedError
+        raise NotImplementedError
     
     def get_initialize_options(self) -> Dict:
         return {}
@@ -162,10 +173,6 @@ class BaseLSPAnalyzer:
 
     # --- file discovery ---
     def get_files(self) -> List[Path]:
-        skip = {
-            "node_modules", "__pycache__", "venv", ".venv", "build", "dist",
-            "target", ".tox", ".eggs", "site-packages", "tests", "test", ".*"
-        }
         files: List[Path] = []
         for ext in self.get_file_extensions():
             for f in self.repo_path.rglob(f"*{ext}"):
@@ -174,14 +181,14 @@ class BaseLSPAnalyzer:
         return files
 
     # --- main ---
-    async def analyze(self) -> List[Dict]:
+    async def analyze(self) -> None:
         self.cache_lock = asyncio.Lock()
         if self.cache is None:
             self.cache = Cache(self.repo_path, self.get_cache_namespace())
+        mongo_client = get_mongo_client()
 
         files = self.get_files()
         logger.info("Found %d source files", len(files))
-        await self.start_server()
 
         timeout_primary = self.get_timeout_seconds()
         timeout_backoff = 0.2
@@ -191,6 +198,22 @@ class BaseLSPAnalyzer:
 
         file_infos: Dict[str, Dict] = {}
         content_changed_files: Set[str] = set()
+
+        # ---------- Phase 0.5: detect and clean deleted files ----------
+        if self.cache:
+            current_files = {f"{self.base_repo_path}/{str(f.relative_to(self.repo_path))}" for f in files}
+            cached_files = self.cache.get_all_cached_file_paths()
+            deleted_files = cached_files - current_files
+            self.deleted_files = set(deleted_files)
+            if deleted_files:
+                logger.info(f"Found {len(deleted_files)} deleted files, cleaning cache...")
+                for del_path in deleted_files:
+                    impacted = self.cache.invalidate_by_definition_file(del_path)
+                    if impacted:
+                        content_changed_files.update(impacted)
+                    self.cache.delete_file_completely(del_path)
+                    mongo_client.delete_brief_file_overview(self.base_repo_path, del_path)
+                self.cache.commit()
 
         for fpath in files:
             rel_path = f"{self.base_repo_path}/{str(fpath.relative_to(self.repo_path))}"
@@ -230,6 +253,8 @@ class BaseLSPAnalyzer:
                     impacted_ref_files.update(impacted)
 
         files_to_recompute: Set[str] = set(content_changed_files) | set(impacted_ref_files)
+        self.content_changed_files = set(content_changed_files)
+        self.impacted_ref_files = set(impacted_ref_files)
         self.changed_files = set(files_to_recompute)
 
         logger.info(f"{len(files_to_recompute)}/{len(files)} need to be recomputed")
@@ -241,6 +266,14 @@ class BaseLSPAnalyzer:
             if rp in files_to_recompute:
                 await file_queue.put(rp)
                 recompute_list.append(rp)
+
+        if not recompute_list:
+            logger.info("No changed files detected; skipping LSP server startup")
+            if self.cache:
+                self.cache.commit()
+            return
+
+        await self.start_server()
 
         batch_bar = tqdm(total=len(recompute_list), desc="Resolving references", leave=True) if self.show_progress else None
 
@@ -269,7 +302,7 @@ class BaseLSPAnalyzer:
             
             return resolved_queries
 
-        async def worker(client: LSPClient, worker_id: int):
+        async def worker(client: LSPClient):
             worker_sem = asyncio.Semaphore(self.get_max_concurrency())
             total_resolved_queries = 0
             while True:
@@ -277,6 +310,7 @@ class BaseLSPAnalyzer:
                     rel_path = file_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
+
                 info = file_infos[rel_path]
                 fpath: Path = info["path"]
                 uri: str = info["uri"]
@@ -313,6 +347,7 @@ class BaseLSPAnalyzer:
                 if self.cache:
                     self.cache.delete_mappings_for_file(rel_path)
                     self.cache.commit()
+                    mongo_client.delete_brief_file_overview(self.base_repo_path, rel_path)
 
                 resolved_queries = await resolve_queries(client, queries, worker_sem=worker_sem)
                 total_resolved_queries += len(resolved_queries)
@@ -345,8 +380,8 @@ class BaseLSPAnalyzer:
             return total_resolved_queries
         # Launch workers
         worker_tasks = [
-            asyncio.create_task(worker(client, i)) 
-            for i, client in enumerate(self.server_list)
+            asyncio.create_task(worker(client))
+            for client in self.server_list
         ]
 
         try:
@@ -384,7 +419,6 @@ class BaseLSPAnalyzer:
 
             params = {"textDocument": {"uri": file_uri}, "position": position}
 
-            import time
             res = await client.send_request(
                 "textDocument/definition",
                 params,

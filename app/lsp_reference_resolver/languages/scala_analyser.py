@@ -1,6 +1,8 @@
 from pathlib import Path
 from typing import List, Tuple
-from tree_sitter_languages import get_parser, get_language
+
+from tree_sitter_languages import get_language, get_parser
+
 from ..core.base_analyser import BaseLSPAnalyzer
 
 SCALA_QUERY = r"""
@@ -36,13 +38,6 @@ class ScalaAnalyzer(BaseLSPAnalyzer):
     
     def get_total_server_instances(self) -> int:
         return 1
-    
-    def is_excluded_definition_path(self, path: Path) -> bool:
-        parts = set(path.parts)
-        exclude = {
-            ".metals", ".bloop", "project", "target",
-        }
-        return not parts.isdisjoint(exclude)
 
     def ref_pos_extractor(self, text: str, path: Path) -> List[Tuple[int, int]]:
         lang = get_language("scala")

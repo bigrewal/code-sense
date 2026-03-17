@@ -1,28 +1,35 @@
-import asyncio
+import json
 import logging
+import sqlite3
+import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from bson import ObjectId
-from neo4j import GraphDatabase
 from pymongo import MongoClient
 
 from .config import Config
+from .db_exceptions import (
+    ConnectionError as DBConnectionError,
+    QueryError,
+    InvalidParameterError,
+    InvalidConnectionStringError,
+)
 from .utils import now_ts
-from .models.data_model import ASTNode, IngestionJobStatus, IngestionStage
+from .models.data_model import IngestionJobStatus, IngestionStage
+
 logger = logging.getLogger(__name__)
 
-## Silence WARNING:neo4j.notifications: 
-logging.getLogger("neo4j.notifications").setLevel(logging.WARNING)
+# Module-level metrics collector (singleton)
 
 INGESTION_JOBS_COLLECTION = "ingestion_jobs"
 INGESTED_REPOS_COLLECTION = "ingested_repos"
 CONVERSATIONS_COLLECTION = "conversations"
 MESSAGES_COLLECTION = "messages"
 MENTAL_MODEL_COLLECTION = "mental_model"
-
-
+INGESTION_FILE_STATE_COLLECTION = "ingestion_file_state"
 def _serialize_job(job_doc: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "job_id": job_doc.get("job_id"),
@@ -31,12 +38,16 @@ def _serialize_job(job_doc: Dict[str, Any]) -> Dict[str, Any]:
         "current_stage": job_doc.get("current_stage"),
         "stages": job_doc.get("stages", {}),
         "error": job_doc.get("error"),
+        "operation": job_doc.get("operation"),
+        "enable_precheck": job_doc.get("enable_precheck"),
+        "enable_resolve_refs": job_doc.get("enable_resolve_refs"),
         "created_at": job_doc.get("created_at"),
         "updated_at": job_doc.get("updated_at"),
     }
 
 def _filter_stage_metrics(job: Dict[str, Any]) -> Dict[str, Any]:
     ALLOWED_PRECHECK_METRICS = {
+        "skipped",
         "supported_file_count",
         "unsupported_file_count",
         "language_distribution_pct",
@@ -53,256 +64,126 @@ def _filter_stage_metrics(job: Dict[str, Any]) -> Dict[str, Any]:
 
     return job
 
-class Neo4jClient:
-    """Neo4j database client wrapper."""
-    _instance = None  # Singleton instance
 
-    def __new__(cls, *args, **kwargs):
-        # Enforce singleton
-        if cls._instance is None:
-            cls._instance = super(Neo4jClient, cls).__new__(cls)
-        return cls._instance
+def _validate_repo_name(repo_name: str) -> None:
+    if not repo_name or not isinstance(repo_name, str):
+        raise InvalidParameterError("repo_name must be a non-empty string")
+    if any(char in repo_name for char in ["$", "{", "}"]):
+        raise InvalidParameterError("repo_name contains invalid characters")
 
-    def __init__(self):
-        # Prevent re-initialisation on subsequent instantiations
-        if getattr(self, "_initialized", False):
-            return
 
-        self.driver = None
-        self.batch_size = 1000
-        logger.info(f"Initializing Neo4jClient with config: {Config.NEO4J_URI}")
-        try:
-            self.driver = GraphDatabase.driver(
-                Config.NEO4J_URI,
-                auth=(Config.NEO4J_USER, Config.NEO4J_PASSWORD)
-            )
-            # Test connection
-            with self.driver.session() as session:
-                self._create_indexes(session)
-                session.run("CALL db.awaitIndexes()")
-                session.run("RETURN 1")
-            logger.info("Neo4j connection established successfully")
-        except Exception as e:
-            logger.warning(f"Neo4j connection failed: {e}")
-            raise
+class LSPCacheReader:
+    """Minimal SQLite reader for querying LSP reference cache."""
 
-        self._initialized = True
+    def __init__(self, repo_path: str):
+        """Initialize reader for a specific repository.
 
-    async def init_graph_for_repo(self, repo_id: str):
-        if not self.driver:
-            logger.error("Neo4j driver not initialized")
-            raise Exception("Neo4j driver not initialized")
-
-        def _initialise():
-            try:
-                logger.info("Initialising graph for repo: %s", repo_id)
-                with self.driver.session() as session:
-                    self.clear_repo_data(session, repo_id)
-            except Exception as exc:
-                logger.error("Neo4j initialisation failed: %s", exc)
-                raise
-
-        await asyncio.to_thread(_initialise)
-
-    def _create_indexes(self, session):
-        """Create necessary indexes for performance."""
-        indexes = [
-            "CREATE INDEX IF NOT EXISTS FOR (n:ASTNode) ON (n.node_id)",
-            "CREATE INDEX IF NOT EXISTS FOR (n:ASTNode) ON (n.repo_id)",
-            "CREATE INDEX IF NOT EXISTS FOR (n:ASTNode) ON (n.repo_id, n.node_id)",
-            "CREATE INDEX IF NOT EXISTS FOR (n:ASTNode) ON (n.file_path)",
-            "CREATE INDEX IF NOT EXISTS FOR (n:ASTNode) ON (n.node_type)",
-        ]
-
-        for index_query in indexes:
-            session.run(index_query).consume()
-
-    def clear_repo_data(self, session, repo_id: str):
-        """Clear existing data for a repository."""
-        try:
-            query = """
-            MATCH (n:ASTNode {repo_id: $repo_id})
-            DETACH DELETE n
-            """
-            session.run(query, repo_id=repo_id)
-            logger.info(f"Cleared existing data for repo: {repo_id}")
-        except Exception as e:
-            logger.warning(f"Failed to clear repo data: {e}")
-
-    async def batch_create_nodes(self, nodes: List["ASTNode"], repo_id: str):
-        """Create AST nodes in batches."""
-        if not self.driver:
-            logger.error("Neo4j driver not initialized")
-            raise Exception("Neo4j driver not initialized")
-
-        total_batches = (len(nodes) + self.batch_size - 1) // self.batch_size
-
-        for i in range(0, len(nodes), self.batch_size):
-            batch_num = (i // self.batch_size) + 1
-            batch = nodes[i:i + self.batch_size]
-
-            # Convert nodes to dictionaries
-            node_dicts = []
-            for node in batch:
-                node_dict = {
-                    'node_id': node.node_id,
-                    'node_type': node.node_type,
-                    'start_line': node.start_line,
-                    'start_column': node.start_column,
-                    'end_line': node.end_line,
-                    'end_column': node.end_column,
-                    'parent_id': node.parent_id,
-                    'file_path': node.file_path,
-                    'is_definition': node.is_definition,
-                    'is_reference': node.is_reference,
-                    'repo_id': repo_id,
-                    'name': node.name,
-                }
-                node_dicts.append(node_dict)
-
-            query = """
-            UNWIND $nodes AS node
-            CREATE (n:ASTNode)
-            SET n = node
-            """
-
-            # Add Definition label if is_definition is True
-            query += """
-            WITH n, node
-            WHERE node.is_definition = true
-            SET n:Definition
-            """
-
-            # Add Reference label if is_reference is True
-            query += """
-            WITH n, node
-            WHERE node.is_reference = true
-            SET n:Reference
-            """
-
-            def _write_nodes():
-                with self.driver.session() as session:
-                    session.run(query, nodes=node_dicts)
-
-            try:
-                await asyncio.to_thread(_write_nodes)
-                logger.debug("Created node batch %s/%s (%s nodes)", batch_num, total_batches, len(batch))
-            except Exception as e:
-                logger.error("Failed to create node batch %s: %s", batch_num, e)
-                raise
-
-    async def batch_create_edges(self, edges: List[Dict[str, Any]], repo_id: str):
-        """Create edges in batches."""
-        if not self.driver:
-            logger.error("Neo4j driver not initialized")
-            raise Exception("Neo4j driver not initialized")
-
-        if not edges:
-            logger.info("No edges to create")
-            return
-
-        total_batches = (len(edges) + self.batch_size - 1) // self.batch_size
-
-        for i in range(0, len(edges), self.batch_size):
-            batch_num = (i // self.batch_size) + 1
-            batch = edges[i:i + self.batch_size]
-
-            edges_payload = [
-                {
-                    "source": e["source"],
-                    "target": e["target"],
-                    "sequence": e.get("sequence", 1),
-                    "type": e["type"],
-                }
-                for e in batch
-            ]
-
-            query = """
-            UNWIND $edges AS edge
-            MATCH (s:ASTNode {repo_id: $repo_id, node_id: edge.source})
-            MATCH (t:ASTNode {repo_id: $repo_id, node_id: edge.target})
-            CALL {
-                WITH s, t, edge
-                WITH s, t, edge WHERE edge.type = 'CONTAINS'
-                CREATE (s)-[:CONTAINS {sequence: edge.sequence}]->(t)
-            }
-            CALL {
-                WITH s, t, edge
-                WITH s, t, edge WHERE edge.type = 'REFERENCES'
-                CREATE (s)-[:REFERENCES {sequence: edge.sequence}]->(t)
-            }
-            """
-
-            def _write_edges():
-                with self.driver.session() as session:
-                    session.execute_write(
-                        lambda tx: tx.run(query, edges=edges_payload, repo_id=repo_id)
-                    )
-
-            try:
-                await asyncio.to_thread(_write_edges)
-                logger.debug(
-                    "Created edges in batch %s/%s (%s edges)",
-                    batch_num,
-                    total_batches,
-                    len(edges_payload),
-                )
-
-            except Exception as e:
-                logger.error("Failed to create edges in batch %s: %s", batch_num, e)
-                raise
-
-    def cross_file_interactions_in_file(self, file_path: str, repo_id: str):
-        """Infer cross-file interactions for a given file by finding references to and from definitions in other files."""
-
-        if not self.driver:
-            logger.error("Neo4j driver not initialized")
-            raise Exception("Neo4j driver not initialized")
-
-        # Downstream: file_path → other files
-        downstream_query = """
-        MATCH (ref:ASTNode {repo_id: $repo_id, file_path: $file_path, is_reference: true})
-        -[:REFERENCES]->(ident:ASTNode)
-        WHERE ident.file_path <> $file_path
-        MATCH (def:ASTNode)
-        WHERE def.node_id = ident.parent_id
-        RETURN DISTINCT ref.name AS ref_name, def.node_type AS node_type, def.file_path AS def_file_path
+        Args:
+            repo_path: Path to repository root (where .codesense_ref_index.sqlite is located)
         """
+        self.repo_path = Path(repo_path)
+        self.db_path = self.repo_path / ".codesense_ref_index.sqlite"
+        if not self.db_path.exists():
+            raise FileNotFoundError(f"LSP cache not found: {self.db_path}")
+        # LSP cache stores paths with repo folder name prefix (e.g., "dictquery/dictquery/__init__.py")
+        self.repo_folder_name = self.repo_path.name
 
-        # Upstream: other files → file_path
-        upstream_query = """
-        MATCH (ref:ASTNode {repo_id: $repo_id, is_reference: true})
-        -[:REFERENCES]->(ident:ASTNode {file_path: $file_path})
-        MATCH (def:ASTNode)
-        WHERE def.node_id = ident.parent_id
-        RETURN DISTINCT ref.file_path AS ref_file_path, ref.name AS ref_name, def.node_type AS node_type
+    def _get_connection(self) -> sqlite3.Connection:
+        """Get a read-only connection to the cache database."""
+        conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _to_cache_path(self, file_path: str) -> str:
+        """Convert relative file path to LSP cache path format (with repo folder prefix)."""
+        return f"{self.repo_folder_name}/{file_path}"
+
+    def _from_cache_path(self, cache_path: str) -> str:
+        """Convert LSP cache path to relative file path (strip repo folder prefix)."""
+        prefix = f"{self.repo_folder_name}/"
+        if cache_path.startswith(prefix):
+            return cache_path[len(prefix):]
+        return cache_path
+
+    def cross_file_interactions(self, file_path: str) -> Dict[str, Any]:
+        """Get cross-file interactions for a given file.
+
+        Args:
+            file_path: Relative path to file within repository
+
+        Returns:
+            Dict with 'downstream' and 'upstream' keys containing interactions
         """
+        conn = self._get_connection()
+        # Convert to LSP cache format (with repo folder prefix)
+        cache_file_path = self._to_cache_path(file_path)
 
-        with self.driver.session() as session:
-            # Downstream
-            downstream_result = list(session.run(downstream_query, repo_id=repo_id, file_path=file_path))
+        try:
+            # Downstream: file_path → other files
             downstream_interactions: Dict[str, List[str]] = {}
-            for record in downstream_result:
-                def_file = record["def_file_path"]
-                interaction = f"{record['ref_name']} REFERENCES {record['node_type']} IN {def_file}"
-                downstream_interactions.setdefault(def_file, []).append(interaction)
+            downstream_files = set()
 
-            downstream_files = {
-                record["def_file_path"] for record in downstream_result if record["def_file_path"] != file_path
-            }
+            # Note: LSP cache uses language-specific namespaces (e.g., "PythonAnalyzer:pylsp")
+            # not repo names, so we don't filter by namespace
+            cursor = conn.execute(
+                "SELECT ref_path, data FROM mappings WHERE ref_path = ?",
+                (cache_file_path,)
+            )
 
-            # Upstream
-            upstream_result = list(session.run(upstream_query, repo_id=repo_id, file_path=file_path))
+            for row in cursor.fetchall():
+                data = json.loads(row["data"])
+                definitions = data.get("definitions", [])
+                if not definitions:
+                    continue
+
+                ref = data.get("reference", {})
+                ref_loc = f"{file_path}:{ref.get('line', '?')}:{ref.get('column', '?')}"
+
+                for defn in definitions:
+                    def_file_cache = defn.get("file_path")
+                    if def_file_cache and def_file_cache != cache_file_path:
+                        # Convert from cache path to relative path
+                        def_file = self._from_cache_path(def_file_cache)
+                        def_loc = f"{def_file}:{defn.get('line', '?')}:{defn.get('column', '?')}"
+                        interaction = f"{ref_loc} -> {def_loc}"
+                        downstream_interactions.setdefault(def_file, []).append(interaction)
+                        downstream_files.add(def_file)
+
+            # Upstream: other files → file_path
             upstream_interactions: Dict[str, List[str]] = {}
-            for record in upstream_result:
-                ref_file = record["ref_file_path"]
-                interaction = f"{record['ref_name']} IN {ref_file} REFERENCES {record['node_type']} IN {file_path}"
-                upstream_interactions.setdefault(ref_file, []).append(interaction)
+            upstream_files = set()
 
-            upstream_files = {
-                record["ref_file_path"] for record in upstream_result if record["ref_file_path"] != file_path
-            }
+            # Query for references that point to definitions in this file
+            cursor = conn.execute("""
+                SELECT m.ref_path, m.data
+                FROM mappings m
+                JOIN def_index d ON d.namespace = m.namespace
+                    AND d.ref_path = m.ref_path
+                    AND d.ref_line = m.ref_line
+                    AND d.ref_column = m.ref_column
+                WHERE d.def_path = ?
+            """, (cache_file_path,))
 
+            for row in cursor.fetchall():
+                data = json.loads(row["data"])
+                ref = data.get("reference", {})
+                ref_file_cache = ref.get("file_path")
+                if not ref_file_cache or ref_file_cache == cache_file_path:
+                    continue
+
+                # Convert from cache path to relative path
+                ref_file = self._from_cache_path(ref_file_cache)
+                ref_loc = f"{ref_file}:{ref.get('line', '?')}:{ref.get('column', '?')}"
+                definitions = data.get("definitions", [])
+
+                for defn in definitions:
+                    def_file_cache = defn.get("file_path")
+                    if def_file_cache == cache_file_path:
+                        def_loc = f"{file_path}:{defn.get('line', '?')}:{defn.get('column', '?')}"
+                        interaction = f"{ref_loc} -> {def_loc}"
+                        upstream_interactions.setdefault(ref_file, []).append(interaction)
+                        upstream_files.add(ref_file)
+                        
             return {
                 "downstream": {
                     "interactions": downstream_interactions,
@@ -314,80 +195,107 @@ class Neo4jClient:
                 },
             }
 
-    def close(self):
-        """Close the Neo4j connection."""
-        if self.driver:
-            self.driver.close()
-            logger.info("Neo4j connection closed")
+        finally:
+            conn.close()
 
 
 class MyMongoClient:
+    """
+    MongoDB database client wrapper with connection pooling, retry logic, and health monitoring.
+
+    Features:
+    - Singleton pattern for application-wide connection reuse
+    - Automatic retry on transient failures
+    - Connection pool configuration
+    - Query performance tracking
+    - Input validation and sanitization
+
+    Example:
+        client = get_mongo_client()
+        result = client.create_conversation(repo_name="my-repo")
+    """
+
     _instance = None   # Singleton instance
+    _lock = threading.Lock()  # Thread-safe singleton initialization
 
     def __new__(cls, *args, **kwargs):
+        """Enforce thread-safe singleton pattern."""
         if cls._instance is None:
-            cls._instance = super(MyMongoClient, cls).__new__(cls)
+            with cls._lock:
+                # Double-check locking pattern
+                if cls._instance is None:
+                    cls._instance = super(MyMongoClient, cls).__new__(cls)
         return cls._instance
 
     def __init__(self, *args, **kwargs):
+        """Initialize MongoDB client with connection pooling and retry logic."""
         # Init runs every time __new__ returns the instance,
         # so guard actual initialization.
         if hasattr(self, "_initialized") and self._initialized:
             return
 
-        self._client = MongoClient(*args, **kwargs)
-        self._db = None
-        self._initialized = True
+        logger.info("Initializing MyMongoClient connection")
+
+        try:
+            # VALIDATION: Check connection string
+            if not Config.MONGO_URI:
+                raise InvalidConnectionStringError("MONGO_URI not configured")
+
+            # PERFORMANCE: Configure connection pool
+            self._client = MongoClient(
+                Config.MONGO_URI,
+                maxPoolSize=Config.MONGO_MAX_POOL_SIZE,
+                minPoolSize=Config.MONGO_MIN_POOL_SIZE,
+                maxIdleTimeMS=Config.MONGO_MAX_IDLE_TIME_MS,
+                serverSelectionTimeoutMS=Config.MONGO_SERVER_SELECTION_TIMEOUT_MS,
+                connectTimeoutMS=Config.MONGO_CONNECT_TIMEOUT_MS,
+                socketTimeoutMS=Config.MONGO_SOCKET_TIMEOUT_MS,
+                retryWrites=True,
+                retryReads=True,
+                *args,
+                **kwargs
+            )
+
+            self._db = None
+            self._initialized = True
+
+            logger.info("MongoDB client initialized successfully")
+
+        except Exception as e:
+            logger.exception("Failed to initialize MongoDB client")
+            raise DBConnectionError(f"Failed to initialize MongoDB client: {str(e)}") from e
 
     def connect(self, db_name: str):
-        """Select the DB to operate on."""
-        self._db = self._client[db_name]
+        """
+        Select the database to operate on with validation.
+
+        Args:
+            db_name: Database name
+
+        Raises:
+            InvalidParameterError: If db_name is invalid
+            DBConnectionError: If connection fails
+        """
+        if not db_name or not isinstance(db_name, str):
+            raise InvalidParameterError("db_name must be a non-empty string")
+
+        try:
+            self._db = self._client[db_name]
+            # Test connection
+            self._db.command("ping")
+            logger.info("Connected to MongoDB database: %s", db_name)
+        except Exception as e:
+            logger.error("Failed to connect to database %s: %s", db_name, str(e))
+            raise DBConnectionError(f"Failed to connect to database: {str(e)}") from e
     
     def __getitem__(self, collection_name: str):
         return self._db[collection_name]
 
-    # ========== Former helper functions converted to methods ==========
-
-    def get_potential_entry_points(self, repo_id: str) -> List[str]:
-        collection = self._db[MENTAL_MODEL_COLLECTION]
-        docs = collection.find({
-            "repo_id": repo_id,
-            "document_type": "POTENTIAL_ENTRY_POINTS"
-        })
-        return [doc.get("file_path") for doc in docs if doc.get("file_path")]
-
-    def get_repo_summary(self, repo_id: str) -> str:
-        collection = self._db[MENTAL_MODEL_COLLECTION]
-        doc = collection.find_one({
-            "repo_id": repo_id,
-            "document_type": "REPO_SUMMARY"
-        })
-        return doc.get("data", "") if doc else ""
-
-    def get_brief_file_overviews(self, repo_id: str, file_paths: List[str]) -> List[Dict[str, str]]:
-        collection = self._db[MENTAL_MODEL_COLLECTION]
-        result = []
-
-        for file_path in file_paths:
-            doc = collection.find_one(
-                {
-                    "repo_id": repo_id,
-                    "document_type": "BRIEF_FILE_OVERVIEW",
-                    "file_path": file_path
-                },
-                {"_id": 0, "data": 1},
-            )
-            brief = (doc or {}).get("data", "")
-            if brief:
-                result.append({"file_path": file_path, "brief": brief})
-
-        return result
-
-    def get_brief_file_overview(self, repo_id: str, file_path: str) -> str:
+    def get_brief_file_overview(self, repo_name: str, file_path: str) -> str:
         collection = self._db[MENTAL_MODEL_COLLECTION]
         doc = collection.find_one(
             {
-                "repo_id": repo_id,
+                "repo_name": repo_name,
                 "document_type": "BRIEF_FILE_OVERVIEW",
                 "file_path": file_path
             },
@@ -395,45 +303,191 @@ class MyMongoClient:
         )
         return (doc or {}).get("data", "")
 
-    def get_critical_file_paths(self, repo_id: str) -> List[str]:
+    def delete_brief_file_overview(self, repo_name: str, file_path: str) -> bool:
+        collection = self._db[MENTAL_MODEL_COLLECTION]
+        result = collection.delete_one({
+            "repo_name": repo_name,
+            "document_type": "BRIEF_FILE_OVERVIEW",
+            "file_path": file_path
+        })
+        return result.deleted_count > 0
+
+    def get_critical_file_paths(self, repo_name: str) -> List[str]:
         collection = self._db[MENTAL_MODEL_COLLECTION]
         docs = collection.find({
-            "repo_id": repo_id,
+            "repo_name": repo_name,
             "document_type": "BRIEF_FILE_OVERVIEW"
         })
         return [doc.get("file_path") for doc in docs if doc.get("file_path")]
 
-    def delete_repo_data(self, repo_id: str):
-        print(f"ABout to delete repo: {repo_id}")
-        collections = [CONVERSATIONS_COLLECTION, MESSAGES_COLLECTION, MENTAL_MODEL_COLLECTION, INGESTED_REPOS_COLLECTION]
-        for coll_name in collections:
-            collection = self._db[coll_name]
-            result = collection.delete_many({"repo_id": repo_id})
-            logger.info(f"Deleted {result.deleted_count} documents from '{coll_name}' for repo_id '{repo_id}'")
-        
-        ingest_job_coll = self._db[INGESTION_JOBS_COLLECTION]
-        result = ingest_job_coll.delete_many({"repo_name": repo_id})
-        logger.info(f"Deleted {result.deleted_count} documents from '{INGESTION_JOBS_COLLECTION}' for repo_id '{repo_id}'")
-    
-    def create_conversation(self, repo_id: str) -> dict:
-        collection = self._db[CONVERSATIONS_COLLECTION]
-        new_conversation_doc = {
-            "repo_id": repo_id,
-            "created_at": now_ts(),
-            "updated_at": now_ts(),
-            "type": "REPO_CHAT",
-        }
-        result = collection.insert_one(new_conversation_doc)
-        return {
-            "conversation_id": str(result.inserted_id),
-            "repo_id": repo_id,
-            "created_at": new_conversation_doc["created_at"],
-        }
+    def get_repo_file_states(self, repo_name: str) -> Dict[str, Dict[str, Any]]:
+        docs = self._db[INGESTION_FILE_STATE_COLLECTION].find(
+            {"repo_name": repo_name},
+            {"_id": 0, "file_path": 1, "sha1": 1, "language": 1, "supported": 1, "token_count": 1},
+        )
+        return {d["file_path"]: d for d in docs if d.get("file_path")}
+
+    def upsert_repo_file_states(self, repo_name: str, rows: List[Dict[str, Any]]) -> None:
+        collection = self._db[INGESTION_FILE_STATE_COLLECTION]
+        now = now_ts()
+        for row in rows:
+            file_path = row["file_path"]
+            update = {
+                "repo_name": repo_name,
+                "file_path": file_path,
+                "sha1": row["sha1"],
+                "language": row.get("language"),
+                "supported": bool(row.get("supported")),
+                "token_count": int(row.get("token_count", 0)),
+                "updated_at": now,
+                "last_seen_at": now,
+            }
+            collection.update_one(
+                {"repo_name": repo_name, "file_path": file_path},
+                {"$set": update, "$setOnInsert": {"created_at": now}},
+                upsert=True,
+            )
+
+    def delete_repo_file_states(self, repo_name: str, file_paths: List[str]) -> int:
+        if not file_paths:
+            return 0
+        result = self._db[INGESTION_FILE_STATE_COLLECTION].delete_many(
+            {"repo_name": repo_name, "file_path": {"$in": file_paths}}
+        )
+        return int(result.deleted_count)
+
+    def delete_repo_data(self, repo_name: str) -> Dict[str, Any]:
+        """
+        Delete all data for a repository across collections.
+
+        Args:
+            repo_name: Repository identifier
+
+        Returns:
+            Dict with deletion summary: {
+                "repo_name": str,
+                "collections_processed": int,
+                "total_deleted": int,
+                "duration_ms": float,
+            }
+
+        Raises:
+            InvalidParameterError: If repo_name is invalid
+            QueryError: If deletion fails
+
+        Example:
+            result = client.delete_repo_data("my-repo")
+            logger.info("Deleted %d documents", result["total_deleted"])
+        """
+        start_time = time.time()
+        _validate_repo_name(repo_name)
+
+        try:
+            logger.info("Deleting all data for repo_name: %s", repo_name)
+
+            collections = [
+                CONVERSATIONS_COLLECTION,
+                MESSAGES_COLLECTION,
+                MENTAL_MODEL_COLLECTION,
+                INGESTED_REPOS_COLLECTION,
+                INGESTION_FILE_STATE_COLLECTION,
+            ]
+            total_deleted = 0
+
+            for coll_name in collections:
+                collection = self._db[coll_name]
+                result = collection.delete_many({"repo_name": repo_name})
+                total_deleted += result.deleted_count
+                logger.info(
+                    "Deleted documents: collection=%s, repo_name=%s, count=%d",
+                    coll_name, repo_name, result.deleted_count
+                )
+
+            # Delete ingestion jobs (uses repo_name field)
+            ingest_job_coll = self._db[INGESTION_JOBS_COLLECTION]
+            result = ingest_job_coll.delete_many({"repo_name": repo_name})
+            total_deleted += result.deleted_count
+            logger.info(
+                "Deleted documents: collection=%s, repo_name=%s, count=%d",
+                INGESTION_JOBS_COLLECTION, repo_name, result.deleted_count
+            )
+
+            duration_ms = (time.time() - start_time) * 1000
+
+            logger.info(
+                "Completed repo data deletion: repo_name=%s, total_deleted=%d, duration_ms=%.2f",
+                repo_name, total_deleted, duration_ms
+            )
+
+            return {
+                "repo_name": repo_name,
+                "collections_processed": len(collections) + 1,
+                "total_deleted": total_deleted,
+                "duration_ms": duration_ms,
+            }
+
+        except Exception as e:
+            logger.error("Failed to delete repo data: repo_name=%s, error=%s", repo_name, str(e))
+            raise QueryError(f"Failed to delete repo data: {str(e)}") from e
+
+    def create_conversation(self, repo_name: str) -> dict:
+        """
+        Create a new conversation for a repository.
+
+        Args:
+            repo_name: Repository identifier
+
+        Returns:
+            Dict with conversation details: {
+                "conversation_id": str,
+                "repo_name": str,
+                "created_at": datetime,
+            }
+
+        Raises:
+            InvalidParameterError: If repo_name is invalid
+            QueryError: If conversation creation fails
+
+        Example:
+            result = client.create_conversation(repo_name="my-repo")
+            conv_id = result["conversation_id"]
+        """
+        start_time = time.time()
+        _validate_repo_name(repo_name)
+
+        try:
+            collection = self._db[CONVERSATIONS_COLLECTION]
+
+            new_conversation_doc = {
+                "repo_name": repo_name,
+                "created_at": now_ts(),
+                "updated_at": now_ts(),
+                "type": "REPO_CHAT",
+            }
+
+            result = collection.insert_one(new_conversation_doc)
+
+            duration_ms = (time.time() - start_time) * 1000
+
+            logger.info(
+                "Created conversation: conversation_id=%s, repo_name=%s, duration_ms=%.2f",
+                str(result.inserted_id), repo_name, duration_ms
+            )
+
+            return {
+                "conversation_id": str(result.inserted_id),
+                "repo_name": repo_name,
+                "created_at": new_conversation_doc["created_at"],
+            }
+
+        except Exception as e:
+            logger.error("Failed to create conversation: repo_name=%s, error=%s", repo_name, str(e))
+            raise QueryError(f"Failed to create conversation: {str(e)}") from e
     
     def list_conversations(
         self,
         *,
-        repo_id: Optional[str] = None,
+        repo_name: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
@@ -441,10 +495,10 @@ class MyMongoClient:
         offset = max(0, offset)
 
         query: dict[str, Any] = {}
-        if repo_id:
-            query["repo_id"] = repo_id
+        if repo_name:
+            query["repo_name"] = repo_name
 
-        projection = {"title": 1, "repo_id": 1, "created_at": 1, "updated_at": 1}
+        projection = {"title": 1, "repo_name": 1, "created_at": 1, "updated_at": 1}
 
         cursor = (
             self._db[CONVERSATIONS_COLLECTION]
@@ -458,11 +512,11 @@ class MyMongoClient:
     
     def add_ingested_repo(self, repo_name: str, job_id: str):
         collection = self._db[INGESTED_REPOS_COLLECTION]
-        existing = collection.find_one({"repo_id": repo_name})
+        existing = collection.find_one({"repo_name": repo_name})
         if existing:
             logger.info(f"Repo '{repo_name}' already marked as ingested.")
             return
-        collection.insert_one({"repo_id": repo_name, "job_id": job_id, "ingested_at": datetime.now(timezone.utc).isoformat()})
+        collection.insert_one({"repo_name": repo_name, "job_id": job_id, "ingested_at": datetime.now(timezone.utc).isoformat()})
         logger.info(f"Marked repo '{repo_name}' as ingested.")
 
     def upsert_ingestion_job(
@@ -501,16 +555,13 @@ class MyMongoClient:
         collection = self._db[INGESTION_JOBS_COLLECTION]
         projection = {"_id": 0}
         job_doc = collection.find_one({"job_id": job_id}, projection)
-        job_unfiltered = _serialize_job(job_doc) if job_doc else None
-        if job_unfiltered:
-            job_filtered = _filter_stage_metrics(job_unfiltered)
-            return job_filtered
-        return None
+        if not job_doc:
+            return None
+        return _filter_stage_metrics(_serialize_job(job_doc))
     
     def list_jobs(
         self,
         *,
-        batch_id: Optional[str] = None,
         status: Optional[str] = None,
         repo_name: Optional[str] = None,
         limit: int = 50,
@@ -518,8 +569,6 @@ class MyMongoClient:
         include_total: bool = False,
     ) -> Union[List[Dict[str, Any]], Tuple[List[Dict[str, Any]], int]]:
         q: Dict[str, Any] = {}
-        if batch_id:
-            q["batch_id"] = batch_id
         if status:
             q["status"] = status
         if repo_name:
@@ -529,7 +578,8 @@ class MyMongoClient:
             "_id": 0,
             "job_id": 1, "repo_name": 1, "status": 1,
             "current_stage": 1, "error": 1,
-            "batch_id": 1, "batch_index": 1,
+            "operation": 1,
+            "enable_precheck": 1, "enable_resolve_refs": 1,
             "created_at": 1, "updated_at": 1,
         }
 
@@ -550,23 +600,33 @@ class MyMongoClient:
 
         return jobs
 
-    def request_abort(self, job_id: str) -> bool:
-        res = self._db[INGESTION_JOBS_COLLECTION].update_one(
-            {"job_id": job_id},
+    def get_active_ingestion_job(self) -> Optional[Dict[str, Any]]:
+        """Return the most recently updated queued/running ingestion job, if any."""
+        coll = self._db[INGESTION_JOBS_COLLECTION]
+        return coll.find_one(
+            {"status": {"$in": ["queued", "running"]}},
+            {"_id": 0},
+            sort=[("updated_at", -1), ("created_at", -1)],
+        )
+
+    def cancel_active_ingestion_jobs(self, reason: str) -> int:
+        """Mark any queued/running ingestion jobs as cancelled."""
+        result = self._db[INGESTION_JOBS_COLLECTION].update_many(
+            {"status": {"$in": ["queued", "running"]}},
             {
-                "$set": {"abort_requested": True, "abort_requested_at": now_ts(), "updated_at": now_ts()}
+                "$set": {
+                    "status": "cancelled",
+                    "error": reason,
+                    "updated_at": now_ts(),
+                }
             },
         )
-        return res.matched_count > 0
-
-    def is_abort_requested(self, job_id: str) -> bool:
-        doc = self._db[INGESTION_JOBS_COLLECTION].find_one({"job_id": job_id}, {"_id": 0, "abort_requested": 1})
-        return bool(doc and doc.get("abort_requested"))
+        return int(result.modified_count)
 
     def list_ingested_repos(self) -> List[str]:
         collection = self._db[INGESTED_REPOS_COLLECTION]
         docs = collection.find({})
-        return [doc.get("repo_id") for doc in docs if doc.get("repo_id")]
+        return [doc.get("repo_name") for doc in docs if doc.get("repo_name")]
 
     def conversation_exists(self, conversation_id: str) -> bool:
         try:
@@ -606,14 +666,6 @@ class MyMongoClient:
         self._db[MESSAGES_COLLECTION].delete_many({"conversation_id": conversation_id})
         self._db[CONVERSATIONS_COLLECTION].delete_one({"_id": oid})
     
-    def get_batch_jobs(self, batch_id: str) -> List[Dict[str, Any]]:
-        cursor = (
-            self._db[INGESTION_JOBS_COLLECTION]
-            .find({"batch_id": batch_id}, {"_id": 0})
-            .sort("batch_index", 1)
-        )
-        return list(cursor)
-    
     def get_job(self, job_id: str) -> dict | None:
         return self._db[INGESTION_JOBS_COLLECTION].find_one({"job_id": job_id}, {"_id": 0})
 
@@ -623,30 +675,90 @@ class MyMongoClient:
     
     def is_repo_ingested(self, repo_name: str) -> bool:
         collection = self._db[INGESTED_REPOS_COLLECTION]
-        doc = collection.find_one({"repo_id": repo_name}, {"_id": 1})
+        doc = collection.find_one({"repo_name": repo_name}, {"_id": 1})
         return doc is not None
     
-    def is_repo_being_ingested(self, repo_name: str) -> bool:
-        collection = self._db[INGESTION_JOBS_COLLECTION]
-        doc = collection.find_one(
-            {
-                "repo_name": repo_name,
-                "status": {"$in": ["running", "pending"]}
-            },
-            {"_id": 1}
-        )
-        return doc is not None
+    def health_check(self) -> Dict[str, Any]:
+        """
+        Perform health check on MongoDB connection.
 
-def init_neo4j_client() -> Neo4jClient:
-    """Initialise the global Neo4jClient singleton (if not already)."""
-    client = Neo4jClient()
-    return client
+        Returns:
+            Dict with health status: {
+                "status": "healthy" | "unhealthy",
+                "response_time_ms": float,
+                "database": str,
+                "collections": List[str],
+                "error": Optional[str],
+            }
 
-def get_neo4j_client() -> Neo4jClient:
-    """Get the Neo4jClient singleton instance."""
-    if Neo4jClient._instance is None:
-        init_neo4j_client()
-    return Neo4jClient._instance
+        Example:
+            health = client.health_check()
+            if health["status"] == "unhealthy":
+                logger.error("MongoDB is down: %s", health.get("error"))
+        """
+        start_time = time.time()
+
+        # Fix: MongoDB database objects don't support truth value testing
+        # Must compare with None explicitly
+        if self._client is None or self._db is None:
+            return {
+                "status": "unhealthy",
+                "error": "Client not initialized or database not selected",
+                "response_time_ms": 0.0,
+            }
+
+        try:
+            # Ping database
+            self._db.command("ping")
+
+            # Get collection names
+            collections = self._db.list_collection_names()
+
+            response_time_ms = (time.time() - start_time) * 1000
+
+            return {
+                "status": "healthy",
+                "response_time_ms": response_time_ms,
+                "database": self._db.name,
+                "collections": collections,
+                "collection_count": len(collections),
+            }
+
+        except Exception as e:
+            logger.error("MongoDB health check failed: %s", str(e))
+            return {
+                "status": "unhealthy",
+                "error": str(e),
+                "response_time_ms": (time.time() - start_time) * 1000,
+            }
+
+    def close(self):
+        """
+        Close the MongoDB connection gracefully.
+
+        Ensures all in-flight operations complete before closing.
+        Should be called during application shutdown.
+        """
+        if not self._client:
+            logger.warning("close() called but client was not initialized")
+            return
+
+        try:
+            logger.info("Closing MongoDB connection")
+
+            # Give in-flight operations time to complete
+            time.sleep(0.5)
+
+            self._client.close()
+            logger.info("MongoDB connection closed successfully")
+
+        except Exception as e:
+            logger.error("Error closing MongoDB connection: %s", str(e))
+            raise
+        finally:
+            self._client = None
+            self._db = None
+
 
 def init_mongo_client():
     client = MyMongoClient()
