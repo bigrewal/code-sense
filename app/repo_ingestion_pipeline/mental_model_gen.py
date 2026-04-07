@@ -26,7 +26,8 @@ PROMPT_SYSTEM = (
     "A file is NOT critical if it is primarily tests, fixtures, docs, examples, demos, generated code, config-only, or thin wrappers with no meaningful domain behavior.\n\n"
     "If NOT critical, output exactly: IGNORE\n\n"
     "If the file is critical, output exactly a concise summary using the required sentence template.\n"
-    "Be factual and concise. Use only evidence from code and dependency context.\n"
+    "Be factual and concise. Use evidence from code and dependency context.\n"
+    "If dependency context is missing or empty, infer the most likely upstream/downstream relationships from the code itself rather than assuming there are none.\n"
     "No bullets, no markdown, no extra commentary."
 )
 
@@ -53,6 +54,8 @@ PROMPT_USER_TEMPLATE = """
     - Keep it very concise: 100-200 words total.
     - Mention concrete identifiers when available.
     - The second sentence must mention every major component in this file.
+    - If an upstream/downstream section says no dependency interactions were found in the cache, infer the likely relationship from imports, exports, call sites, framework conventions, and surrounding code structure.
+    - Do not claim there are no upstream/downstream interactions unless the code itself clearly supports that conclusion.
     - No bullets, no markdown, no extra text.
     """.strip()
 
@@ -164,8 +167,16 @@ class MentalModelStage:
                 for inter in interactions or []:
                     upstream_interactions.append(f"{src_file} → {file_path}: {inter}")
 
-            upstream_block = "\n".join(f"- {i}" for i in (upstream_interactions or [])) or "—"
-            downstream_block = "\n".join(f"- {i}" for i in (downstream_interactions or [])) or "—"
+            upstream_block = (
+                "\n".join(f"- {i}" for i in upstream_interactions)
+                if upstream_interactions
+                else "No dependency interactions were found in the cache for this direction."
+            )
+            downstream_block = (
+                "\n".join(f"- {i}" for i in downstream_interactions)
+                if downstream_interactions
+                else "No dependency interactions were found in the cache for this direction."
+            )
 
             user_prompt = PROMPT_USER_TEMPLATE.format(
                 repo_name=repo_name,
