@@ -43,3 +43,22 @@ def test_build_repo_file_changes_excludes_ignored_hidden_and_sqlite(tmp_path: Pa
     assert "tests/ignored.py" not in changes.current_files
     assert ".hidden/ignored.py" not in changes.current_files
     assert "db.sqlite" not in changes.current_files
+
+
+def test_build_repo_file_changes_omits_unsupported_files_from_cached_deltas(tmp_path: Path):
+    _write(tmp_path / "src/kept.py", "print('ok')\n")
+    _write(tmp_path / "notes.unsupported", "ignore me\n")
+
+    previous_state = {
+        "src/kept.py": {"sha1": "stale-sha"},
+        "notes.unsupported": {"sha1": "old-sha", "supported": False, "token_count": 0},
+    }
+
+    changes = build_repo_file_changes(tmp_path, previous_state)
+
+    assert "notes.unsupported" in changes.current_files
+    assert changes.current_files["notes.unsupported"].supported is False
+    assert "notes.unsupported" not in changes.new_files
+    assert "notes.unsupported" not in changes.changed_files
+    assert "notes.unsupported" not in changes.unchanged_files
+    assert "notes.unsupported" in changes.deleted_files

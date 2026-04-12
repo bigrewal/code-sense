@@ -47,31 +47,33 @@ class Config:
         ".java": "java",
         ".scala": "scala",
         ".rs": "rust",
+        ".js": "javascript",
+        ".jsx": "javascript",
+        ".mjs": "javascript",
+        ".cjs": "javascript",
         ".ts": "typescript",
         ".tsx": "typescript",
-    }
-
-    LANGUAGE_DEFINITION_MAP: dict[str, set[str]] = {
-        "python": {"function_definition", "class_definition", "assignment"},
-        "rust": {
-            "struct_item", "enum_item", "union_item", "type_item",
-            "function_item", "trait_item", "mod_item", "macro_definition"
-        },
-        "scala": {
-            "package_clause", "trait_definition", "enum_definition",
-            "simple_enum_case", "full_enum_case", "class_definition",
-            "object_definition", "function_definition", "val_definition",
-            "given_definition", "var_definition", "val_declaration",
-            "var_declaration", "type_definition", "class_parameter"
-        },
-        "java": {
-            "class_declaration", "method_declaration", "interface_declaration"
-        },
-        "typescript": {
-            "function_declaration", "class_declaration", "interface_declaration",
-            "type_alias_declaration", "lexical_declaration", "method_definition",
-            "enum_declaration"
-        }
+        ".html": "html",
+        ".htm": "html",
+        ".go": "go",
+        ".cpp": "cpp",
+        ".cc": "cpp",
+        ".cxx": "cpp",
+        ".hpp": "cpp",
+        ".hh": "cpp",
+        ".hxx": "cpp",
+        ".c": "c",
+        ".h": "c",
+        ".f": "fortran",
+        ".for": "fortran",
+        ".f77": "fortran",
+        ".f90": "fortran",
+        ".f95": "fortran",
+        ".f03": "fortran",
+        ".jl": "julia",
+        ".m": "matlab",
+        ".css": "css",
+        ".agc": "assembly",
     }
 
     min_supported_cov_ratio: float = 0.5
