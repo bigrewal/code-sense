@@ -204,7 +204,6 @@ async def test_run_ingestion_job_marks_cancelled_on_cancelled_error(fake_mongo, 
             local_repo_path=tmp_path,
             repo_name="repo-a",
             job_id="job-cancelled",
-            enable_precheck=True,
         )
 
     assert "job-cancelled" in fake_mongo.cancel_reason

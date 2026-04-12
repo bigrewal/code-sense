@@ -137,7 +137,6 @@ class ConversationMessagesResponse(BaseModel):
 
 class IngestRequest(BaseModel):
     repo_name: str
-    enable_precheck: bool = True
 
 
 async def _run_ingestion_job(**kwargs):
@@ -333,7 +332,7 @@ async def ingest_repo(
             job_id=job_id,
             repo_name=repo_name,
             status="queued",
-            current_stage=IngestionStage.PRECHECK if ingest_request.enable_precheck else IngestionStage.MENTAL_MODEL,
+            current_stage=IngestionStage.PRECHECK,
             stage_status={
                 IngestionStage.PRECHECK: IngestionStageStatus.PENDING,
                 IngestionStage.MENTAL_MODEL: IngestionStageStatus.PENDING,
@@ -346,7 +345,6 @@ async def ingest_repo(
                 job,
                 extra_fields={
                     "operation": "full_ingest",
-                    "enable_precheck": ingest_request.enable_precheck,
                 },
             ),
             timeout_seconds=Config.DB_OPERATION_TIMEOUT,
@@ -358,14 +356,12 @@ async def ingest_repo(
             local_repo_path=local_repo_path,
             repo_name=repo_name,
             job_id=job_id,
-            enable_precheck=ingest_request.enable_precheck,
         )
 
     return {
         "job_id": job_id,
         "repo_name": repo_name,
         "status": "queued",
-        "enable_precheck": ingest_request.enable_precheck,
     }
 
 @app.delete("/repos", responses={404: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})

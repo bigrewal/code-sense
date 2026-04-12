@@ -36,7 +36,6 @@ def _serialize_job(job_doc: Dict[str, Any]) -> Dict[str, Any]:
         "stages": job_doc.get("stages", {}),
         "error": job_doc.get("error"),
         "operation": job_doc.get("operation"),
-        "enable_precheck": job_doc.get("enable_precheck"),
         "created_at": job_doc.get("created_at"),
         "updated_at": job_doc.get("updated_at"),
     }
@@ -448,7 +447,6 @@ class MyMongoClient:
             "job_id": 1, "repo_name": 1, "status": 1,
             "current_stage": 1, "error": 1,
             "operation": 1,
-            "enable_precheck": 1,
             "created_at": 1, "updated_at": 1,
         }
 

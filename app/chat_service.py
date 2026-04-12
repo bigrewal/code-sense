@@ -25,10 +25,14 @@ logger = logging.getLogger(__name__)
 
 llm = GrokLLM()
 
-mongo = get_mongo_client()
-mental_model_col = mongo[MENTAL_MODEL_COL]
-conversations_col = mongo[CONVERSATIONS_COL]
-messages_col = mongo[MESSAGES_COL]
+
+def _collections():
+    mongo = get_mongo_client()
+    return (
+        mongo[MENTAL_MODEL_COL],
+        mongo[CONVERSATIONS_COL],
+        mongo[MESSAGES_COL],
+    )
 
 class FileSelection(BaseModel):
     file_path: str
@@ -64,6 +68,7 @@ class ChatEventRecorder:
         if not self.conversation_id:
             return
 
+        _mental_model_col, conversations_col, messages_col = _collections()
         timestamp = created_at or _utc_now()
         doc = {
             "conversation_id": self.conversation_id,
@@ -152,6 +157,7 @@ class ChatEventRecorder:
 # ---------------------------
 
 async def stream_chat(conversation_id: str, user_message: str):
+    _mental_model_col, conversations_col, messages_col = _collections()
     recorder = ChatEventRecorder(conversation_id=conversation_id)
     conv = await asyncio.to_thread(conversations_col.find_one, {"_id": ObjectId(conversation_id)})
     if not conv:
@@ -288,6 +294,7 @@ async def get_rephrased_question(messages: List[Dict[str, str]], repo_name: str)
 
 
 async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[Dict[str, Any], None]:
+    mental_model_col, _conversations_col, _messages_col = _collections()
 
     async def _select_files_for_query(
         repo_context: str,
