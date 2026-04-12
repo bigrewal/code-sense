@@ -39,7 +39,7 @@ def _sha1_bytes(path: Path) -> str:
 def build_repo_file_changes(repo_path: Path, previous_state: Dict[str, dict]) -> RepoFileChanges:
     repo_path = Path(repo_path)
     current: Dict[str, FileEntry] = {}
-    current_paths: Set[str] = set()
+    supported_current_paths: Set[str] = set()
 
     for path in repo_path.rglob("*"):
         if not path.is_file() or _is_excluded(path, repo_path):
@@ -51,13 +51,14 @@ def build_repo_file_changes(repo_path: Path, previous_state: Dict[str, dict]) ->
             language=language,
             supported=bool(language),
         )
-        current_paths.add(rel)
+        if language:
+            supported_current_paths.add(rel)
 
     previous_paths = set(previous_state.keys())
-    deleted = previous_paths - current_paths
-    new = current_paths - previous_paths
+    deleted = previous_paths - supported_current_paths
+    new = supported_current_paths - previous_paths
 
-    existing_paths = current_paths - new
+    existing_paths = supported_current_paths - new
     changed = {rel for rel in existing_paths if (previous_state.get(rel) or {}).get("sha1") != current[rel].sha1}
     unchanged = existing_paths - changed
 

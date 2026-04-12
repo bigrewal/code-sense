@@ -8,7 +8,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from tqdm import tqdm
 
 from ..config import Config
-from ..db import LSPCacheReader, get_mongo_client
+from ..db import get_mongo_client
 from ..llm_grok import GrokLLM
 
 logger = logging.getLogger(__name__)
@@ -27,7 +27,7 @@ PROMPT_SYSTEM = (
     "If NOT critical, output exactly: IGNORE\n\n"
     "If the file is critical, output exactly a concise summary using the required sentence template.\n"
     "Be factual and concise. Use evidence from code and dependency context.\n"
-    "If dependency context is missing or empty, infer the most likely upstream/downstream relationships from the code itself rather than assuming there are none.\n"
+    "If dependency context is unavailable or empty, infer the most likely upstream/downstream relationships from the code itself rather than assuming there are none.\n"
     "No bullets, no markdown, no extra commentary."
 )
 
@@ -54,7 +54,7 @@ PROMPT_USER_TEMPLATE = """
     - Keep it very concise: 100-200 words total.
     - Mention concrete identifiers when available.
     - The second sentence must mention every major component in this file.
-    - If an upstream/downstream section says no dependency interactions were found in the cache, infer the likely relationship from imports, exports, call sites, framework conventions, and surrounding code structure.
+    - If an upstream/downstream section says dependency interaction data is unavailable, infer the likely relationship from imports, exports, call sites, framework conventions, and surrounding code structure.
     - Do not claim there are no upstream/downstream interactions unless the code itself clearly supports that conclusion.
     - No bullets, no markdown, no extra text.
     """.strip()
@@ -77,17 +77,7 @@ class MentalModelStage:
         repo_name: str,
         local_repo_path: Path,
         file_changes: Optional[dict] = None,
-        resolver_changes: Optional[dict] = None,
     ):
-        try:
-            self.lsp_cache = LSPCacheReader(str(local_repo_path))
-        except FileNotFoundError:
-            logger.warning(
-                "Job %s: LSP cache missing for %s, continuing mental-model generation without dependency interactions",
-                self.job_id,
-                repo_name,
-            )
-            self.lsp_cache = None
         self.repo_name = repo_name
         self.local_repo_path = local_repo_path
         logger.info("Job %s: starting mental model generation for %s", self.job_id, repo_name)
@@ -98,10 +88,9 @@ class MentalModelStage:
                 repo_name=repo_name,
                 all_files=dir_tree,
                 file_changes=file_changes,
-                resolver_changes=resolver_changes,
             )
             deleted_files = sorted((file_changes or {}).get("deleted_files", []))
-            await self._delete_removed_artifacts(repo_name, deleted_files)
+            self._delete_removed_artifacts(repo_name, deleted_files)
 
             critical_files, ignored_files = await self.identify_critical_files(
                 files_to_process, repo_name
@@ -153,29 +142,11 @@ class MentalModelStage:
             if cached:
                 return file_path, cached["data"], code, sha1
 
-            cfi = self._cross_file_interactions(file_path)
-            downstream_info = cfi.get("downstream", {}) or {}
-            upstream_info = cfi.get("upstream", {}) or {}
-
-            downstream_interactions: list[str] = []
-            for dep_file, interactions in (downstream_info.get("interactions", {}) or {}).items():
-                for inter in interactions or []:
-                    downstream_interactions.append(f"{file_path} → {dep_file}: {inter}")
-
-            upstream_interactions: list[str] = []
-            for src_file, interactions in (upstream_info.get("interactions", {}) or {}).items():
-                for inter in interactions or []:
-                    upstream_interactions.append(f"{src_file} → {file_path}: {inter}")
-
             upstream_block = (
-                "\n".join(f"- {i}" for i in upstream_interactions)
-                if upstream_interactions
-                else "No dependency interactions were found in the cache for this direction."
+                "Dependency interaction data is unavailable for this direction."
             )
             downstream_block = (
-                "\n".join(f"- {i}" for i in downstream_interactions)
-                if downstream_interactions
-                else "No dependency interactions were found in the cache for this direction."
+                "Dependency interaction data is unavailable for this direction."
             )
 
             user_prompt = PROMPT_USER_TEMPLATE.format(
@@ -191,7 +162,7 @@ class MentalModelStage:
                     prompt=user_prompt,
                     system_prompt=PROMPT_SYSTEM,
                     temperature=0.0,
-                    max_tokens=150
+                    max_tokens=150,
                 )
             return file_path, response.strip(), code, sha1
 
@@ -220,14 +191,6 @@ class MentalModelStage:
             pbar.update(len(batch))
 
         pbar.close()
-
-        for insight in insights:
-            file_path = insight["file_path"]
-            dependency_info = self._cross_file_interactions(file_path)
-            insight["downstream_dep_interactions"] = dependency_info["downstream"]["interactions"]
-            insight["downstream_dep_files"] = list(dependency_info["downstream"]["files"])
-            insight["upstream_dep_interactions"] = dependency_info["upstream"]["interactions"]
-            insight["upstream_dep_files"] = list(dependency_info["upstream"]["files"])
 
         return insights, ignored
 
@@ -278,12 +241,12 @@ class MentalModelStage:
             root_path = Path(root)
 
             # Filter out ignored directories in-place
-            dirs[:] = [d for d in dirs if d not in ignore_folders and not d.startswith('.')]
+            dirs[:] = [d for d in dirs if d not in ignore_folders and not d.startswith(".")]
 
             for file in files:
                 file_path = root_path / file
                 if file_path.suffix in supported_extensions:
-                    # Return path relative to repo root for consistency with LSP cache
+                    # Persist paths relative to repo root so they match stored mental-model docs.
                     relative_path = file_path.relative_to(self.local_repo_path)
                     code_files.append(str(relative_path))
 
@@ -319,7 +282,7 @@ class MentalModelStage:
             }
         )
 
-    async def _delete_removed_artifacts(
+    def _delete_removed_artifacts(
         self,
         repo_name: str,
         deleted_files: List[str],
@@ -339,18 +302,13 @@ class MentalModelStage:
         repo_name: str,
         all_files: List[str],
         file_changes: Optional[dict],
-        resolver_changes: Optional[dict],
     ) -> List[str]:
-        if not file_changes and not resolver_changes:
+        if not file_changes:
             return all_files
 
         selected: Set[str] = set()
         selected.update(file_changes.get("new_files", []) if file_changes else [])
         selected.update(file_changes.get("changed_files", []) if file_changes else [])
-
-        prefix = f"{repo_name}/"
-        for path in (resolver_changes or {}).get("impacted_ref_files", []):
-            selected.add(path[len(prefix):] if path.startswith(prefix) else path)
 
         # Backfill missing mental-model docs even when there are no file deltas.
         existing = self.mental_model_collection.find(
@@ -367,11 +325,3 @@ class MentalModelStage:
 
         allowed = set(all_files)
         return sorted([p for p in selected if p in allowed])
-
-    def _cross_file_interactions(self, file_path: str) -> Dict[str, Dict]:
-        if not self.lsp_cache:
-            return {
-                "downstream": {"interactions": {}, "files": set()},
-                "upstream": {"interactions": {}, "files": set()},
-            }
-        return self.lsp_cache.cross_file_interactions(file_path)

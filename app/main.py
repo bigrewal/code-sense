@@ -2,7 +2,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .models.data_model import IngestionStage, IngestionStageStatus, IngestionJobStatus
 from .utils import get_repo_path
@@ -45,18 +45,6 @@ def _cancel_active_jobs_on_lifecycle_event(reason: str) -> None:
     cancelled_count = mongo.cancel_active_ingestion_jobs(reason)
     if cancelled_count:
         logger.info("Marked %s active ingestion job(s) as cancelled", cancelled_count)
-
-
-def _delete_repo_lsp_cache_files(local_repo_path: Path) -> None:
-    """Delete per-repo LSP cache sqlite artifacts if present."""
-    cache_paths = [
-        local_repo_path / ".codesense_ref_index.sqlite",
-        local_repo_path / ".codesense_ref_index.sqlite-wal",
-        local_repo_path / ".codesense_ref_index.sqlite-shm",
-    ]
-    for cache_path in cache_paths:
-        if cache_path.exists():
-            cache_path.unlink()
 
 # Register exception handlers
 app.add_exception_handler(StarletteHTTPException, http_exception_handler)
@@ -136,6 +124,10 @@ class ConversationSummary(BaseModel):
 class MessageModel(BaseModel):
     role: str
     content: str
+    message_type: str = "chat_message"
+    stage: Optional[str] = None
+    status: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
 
 
@@ -146,7 +138,6 @@ class ConversationMessagesResponse(BaseModel):
 class IngestRequest(BaseModel):
     repo_name: str
     enable_precheck: bool = True
-    enable_resolve_refs: bool = True
 
 
 async def _run_ingestion_job(**kwargs):
@@ -253,6 +244,10 @@ async def list_conversation_messages(conversation_id: str, limit: int = Query(20
         MessageModel(
             role=m["role"],
             content=m["content"],
+            message_type=m.get("message_type", "chat_message"),
+            stage=m.get("stage"),
+            status=m.get("status"),
+            metadata=m.get("metadata", {}),
             created_at=m.get("created_at"),
         )
         for m in docs
@@ -287,7 +282,7 @@ async def chat(req: ChatRequest):
 
     return StreamingResponse(
         stream_chat(conversation_id=req.conversation_id, user_message=req.message),
-        media_type="text/markdown",
+        media_type="application/x-ndjson",
     )
 
 
@@ -300,7 +295,7 @@ async def stateless_chat(req: StatelessChatRequest):
 
     return StreamingResponse(
         stateless_stream_chat(repo_name=req.repo_name, user_message=req.message),
-        media_type="text/markdown",
+        media_type="application/x-ndjson",
     )
 
 
@@ -338,10 +333,9 @@ async def ingest_repo(
             job_id=job_id,
             repo_name=repo_name,
             status="queued",
-            current_stage=IngestionStage.PRECHECK,
+            current_stage=IngestionStage.PRECHECK if ingest_request.enable_precheck else IngestionStage.MENTAL_MODEL,
             stage_status={
                 IngestionStage.PRECHECK: IngestionStageStatus.PENDING,
-                IngestionStage.RESOLVE_REFS: IngestionStageStatus.PENDING,
                 IngestionStage.MENTAL_MODEL: IngestionStageStatus.PENDING,
             },
         )
@@ -353,7 +347,6 @@ async def ingest_repo(
                 extra_fields={
                     "operation": "full_ingest",
                     "enable_precheck": ingest_request.enable_precheck,
-                    "enable_resolve_refs": ingest_request.enable_resolve_refs,
                 },
             ),
             timeout_seconds=Config.DB_OPERATION_TIMEOUT,
@@ -366,7 +359,6 @@ async def ingest_repo(
             repo_name=repo_name,
             job_id=job_id,
             enable_precheck=ingest_request.enable_precheck,
-            enable_resolve_refs=ingest_request.enable_resolve_refs,
         )
 
     return {
@@ -374,7 +366,6 @@ async def ingest_repo(
         "repo_name": repo_name,
         "status": "queued",
         "enable_precheck": ingest_request.enable_precheck,
-        "enable_resolve_refs": ingest_request.enable_resolve_refs,
     }
 
 @app.delete("/repos", responses={404: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
@@ -400,13 +391,6 @@ async def delete_repo(repo_name: str, delete_files: bool = False):
                 raise HTTPException(status_code=500, detail="Failed to delete repo files")
         else:
             logger.info("Repo files not found for %s, continuing with DB cleanup", repo_name)
-    else:
-        try:
-            _delete_repo_lsp_cache_files(local_repo_path)
-        except Exception as exc:
-            logger.exception("Failed to delete repo LSP cache files", exc_info=exc)
-            raise HTTPException(status_code=500, detail="Failed to delete repo LSP cache files")
-
     mongo = get_mongo_client()
 
     try:

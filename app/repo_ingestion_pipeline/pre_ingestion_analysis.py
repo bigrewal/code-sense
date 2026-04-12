@@ -93,19 +93,28 @@ class PreIngestionAnalysisStage:
             nonlocal tokenization_errors, total_files_tokenized
 
             entry = file_changes.current_files[rel]
+            previous_entry = previous_state.get(rel) or {}
             supported = entry.supported
             language_label = entry.language if supported else "unsupported/unknown"
 
             try:
                 if supported:
-                    if rel in changed_or_new or (previous_state.get(rel) or {}).get("token_count") is None:
+                    previous_token_count = previous_entry.get("token_count")
+                    needs_retokenization = (
+                        rel in changed_or_new
+                        or previous_token_count is None
+                        or int(previous_token_count) <= 0
+                        or previous_entry.get("supported") is not True
+                        or previous_entry.get("language") != entry.language
+                    )
+                    if needs_retokenization:
                         content = await asyncio.to_thread((repo_path / rel).read_text, encoding="utf-8", errors="ignore")
                         async with sem:
                             tok = await asyncio.to_thread(self.llm_grok.count_tokens, content)
                         async with lock:
                             total_files_tokenized += 1
                     else:
-                        tok = int((previous_state.get(rel) or {}).get("token_count", 0))
+                        tok = int(previous_token_count)
                 else:
                     tok = 0
 
@@ -118,15 +127,16 @@ class PreIngestionAnalysisStage:
 
                 async with lock:
                     metrics.append(metric)
-                    state_rows.append(
-                        {
-                            "file_path": rel,
-                            "sha1": entry.sha1,
-                            "language": entry.language,
-                            "supported": supported,
-                            "token_count": tok,
-                        }
-                    )
+                    if supported:
+                        state_rows.append(
+                            {
+                                "file_path": rel,
+                                "sha1": entry.sha1,
+                                "language": entry.language,
+                                "supported": supported,
+                                "token_count": tok,
+                            }
+                        )
 
             except Exception as e:
                 logger.warning("Tokenization error for file %s: %s", rel, e)

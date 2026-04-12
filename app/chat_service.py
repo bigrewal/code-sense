@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+import json
 import logging
+import re
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from bson import ObjectId
 from pydantic import BaseModel, Field
@@ -17,6 +19,8 @@ from .tools.fetch_code_file import fetch_code_file
 MENTAL_MODEL_COL = "mental_model"
 CONVERSATIONS_COL = "conversations"
 MESSAGES_COL = "messages"
+MESSAGE_TYPE_CHAT = "chat_message"
+MESSAGE_TYPE_PROGRESS = "progress_event"
 logger = logging.getLogger(__name__)
 
 llm = GrokLLM()
@@ -34,69 +38,217 @@ class FileSelection(BaseModel):
 class FileSelectionResponse(BaseModel):
     files_to_fetch: List[FileSelection] = Field(default_factory=list)
 
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class ChatEventRecorder:
+    def __init__(self, conversation_id: Optional[str] = None):
+        self.conversation_id = conversation_id
+
+    def _serialize(self, payload: Dict[str, Any]) -> str:
+        return json.dumps(payload, default=str) + "\n"
+
+    async def _persist_message(
+        self,
+        *,
+        role: str,
+        content: str,
+        message_type: str,
+        stage: Optional[str] = None,
+        status: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        created_at: Optional[datetime] = None,
+    ) -> None:
+        if not self.conversation_id:
+            return
+
+        timestamp = created_at or _utc_now()
+        doc = {
+            "conversation_id": self.conversation_id,
+            "role": role,
+            "content": content,
+            "message_type": message_type,
+            "created_at": timestamp,
+        }
+        if stage:
+            doc["stage"] = stage
+        if status:
+            doc["status"] = status
+        if metadata:
+            doc["metadata"] = metadata
+
+        await asyncio.to_thread(messages_col.insert_one, doc)
+        await asyncio.to_thread(
+            conversations_col.update_one,
+            {"_id": ObjectId(self.conversation_id)},
+            {"$set": {"updated_at": timestamp}},
+        )
+
+    async def persist_chat_message(self, *, role: str, content: str) -> None:
+        await self._persist_message(
+            role=role,
+            content=content,
+            message_type=MESSAGE_TYPE_CHAT,
+        )
+
+    async def emit_progress(
+        self,
+        *,
+        stage: str,
+        status: str,
+        message: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        timestamp = _utc_now()
+        payload = {
+            "type": "progress",
+            "stage": stage,
+            "status": status,
+            "message": message,
+            "metadata": metadata or {},
+            "created_at": timestamp.isoformat(),
+        }
+        await self._persist_message(
+            role="assistant",
+            content=message,
+            message_type=MESSAGE_TYPE_PROGRESS,
+            stage=stage,
+            status=status,
+            metadata=metadata or {},
+            created_at=timestamp,
+        )
+        return self._serialize(payload)
+
+    def emit_content(self, delta: str) -> str:
+        return self._serialize(
+            {
+                "type": "content",
+                "delta": delta,
+                "created_at": _utc_now().isoformat(),
+            }
+        )
+
+    def emit_error(self, message: str) -> str:
+        return self._serialize(
+            {
+                "type": "error",
+                "message": message,
+                "created_at": _utc_now().isoformat(),
+            }
+        )
+
+    def emit_done(self) -> str:
+        return self._serialize(
+            {
+                "type": "done",
+                "created_at": _utc_now().isoformat(),
+            }
+        )
+
 # ---------------------------
 # Public API
 # ---------------------------
 
 async def stream_chat(conversation_id: str, user_message: str):
+    recorder = ChatEventRecorder(conversation_id=conversation_id)
     conv = await asyncio.to_thread(conversations_col.find_one, {"_id": ObjectId(conversation_id)})
     if not conv:
-        yield "Conversation not found.\n"
+        yield recorder.emit_error("Conversation not found.")
         return
 
     repo_name = conv["repo_name"]
 
     history_cursor = messages_col.find(
-        {"conversation_id": conversation_id}
+        {
+            "conversation_id": conversation_id,
+            "message_type": {"$ne": MESSAGE_TYPE_PROGRESS},
+        }
     ).sort("created_at", 1)
 
     history_docs = await asyncio.to_thread(list, history_cursor)
     messages_for_llm: List[Dict[str, str]] = [
         {"role": m["role"], "content": m["content"]}
         for m in history_docs
+        if m.get("role") in {"user", "assistant"}
     ]
     messages_for_llm.append({"role": "user", "content": user_message})
 
+    await recorder.persist_chat_message(role="user", content=user_message)
+
+    yield await recorder.emit_progress(
+        stage="rephrasing_question",
+        status="started",
+        message="Rephrasing question",
+    )
     rephrased_user_question = await get_rephrased_question(messages=messages_for_llm, repo_name=repo_name)
     logger.debug("Rephrased question for repo=%s", repo_name)
-
-    now = datetime.now(timezone.utc)
-    await asyncio.to_thread(
-        messages_col.insert_one,
-        {
-            "conversation_id": conversation_id,
-            "role": "user",
-            "content": user_message,
-            "created_at": now,
-        },
+    yield await recorder.emit_progress(
+        stage="rephrasing_question",
+        status="completed",
+        message="Question rephrased",
+        metadata={"rephrased_question": rephrased_user_question},
     )
 
     captured: List[str] = []
-    async for chunk in stream_answer(user_question=rephrased_user_question, repo_name=repo_name):
-        captured.append(chunk)
-        yield chunk
+    async for event in stream_answer(
+        user_question=rephrased_user_question,
+        repo_name=repo_name,
+    ):
+        if event["type"] == "content":
+            delta = event["delta"]
+            captured.append(delta)
+            yield recorder.emit_content(delta)
+            continue
+
+        if event["type"] == "progress":
+            yield await recorder.emit_progress(
+                stage=event["stage"],
+                status=event["status"],
+                message=event["message"],
+                metadata=event.get("metadata"),
+            )
+            continue
+
+        yield recorder._serialize(event)
 
     assistant_content = "".join(captured)
-    await asyncio.to_thread(
-        messages_col.insert_one,
-        {
-            "conversation_id": conversation_id,
-            "role": "assistant",
-            "content": assistant_content,
-            "created_at": datetime.now(timezone.utc),
-        },
-    )
+    await recorder.persist_chat_message(role="assistant", content=assistant_content)
+    yield recorder.emit_done()
 
 
 async def stateless_stream_chat(repo_name: str, user_message: str):
     """
     Stream a reply for a given repo_name and user message, ChatGPT-style.
     """
-    async for chunk in stream_answer(
-        user_question=user_message,
+    recorder = ChatEventRecorder()
+    yield await recorder.emit_progress(
+        stage="rephrasing_question",
+        status="started",
+        message="Rephrasing question",
+    )
+    rephrased_user_question = await get_rephrased_question(
+        messages=[{"role": "user", "content": user_message}],
+        repo_name=repo_name,
+    )
+    yield await recorder.emit_progress(
+        stage="rephrasing_question",
+        status="completed",
+        message="Question rephrased",
+        metadata={"rephrased_question": rephrased_user_question},
+    )
+
+    async for event in stream_answer(
+        user_question=rephrased_user_question,
         repo_name=repo_name
     ):
-        yield chunk
+        if event["type"] == "content":
+            yield recorder.emit_content(event["delta"])
+        else:
+            yield recorder._serialize(event)
+
+    yield recorder.emit_done()
 
 # ---------------------------
 # Internal helpers
@@ -135,11 +287,11 @@ async def get_rephrased_question(messages: List[Dict[str, str]], repo_name: str)
     )
 
 
-async def stream_answer(user_question: str, repo_name: str):
+async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[Dict[str, Any], None]:
 
     async def _select_files_for_query(
         repo_context: str,
-    ) -> List[Dict[str, str]]:
+    ) -> List[FileSelection]:
         system_prompt = f"""
         You are a senior codebase analysis agent.
 
@@ -154,6 +306,11 @@ async def stream_answer(user_question: str, repo_name: str):
         {repo_context.strip()}
         ────────────────────────────────────────────
 
+        Each file summary uses this exact structure:
+        "`{{file_path}}` <what this file does and why it exists>. It does this by <how it works end-to-end, explicitly naming every major component/function/class defined in this file and each component's role>. It interacts upstream with <key files/modules that call or depend on this file> and downstream with <key files/modules/services this file calls or depends on>."
+
+        The canonical file path for a summary is the exact backticked `file_path` at the start of that summary.
+
         TASK
         ────────────────────────────────────────────
         Given the user's question, determine:
@@ -166,12 +323,15 @@ async def stream_answer(user_question: str, repo_name: str):
         ────────────────────────────────────────────
         - ONLY select files that are strictly necessary to answer the question.
         - Return ONLY valid JSON in this exact shape:
-          {{"files_to_fetch":[{{"file_path":"...","info_needed":"..."}}],"summaries_sufficient":true|false,"reasoning":"..."}}
-        - If the summaries already provide enough information, return "files_to_fetch": [] and "summaries_sufficient": true.
+          {{"files_to_fetch":[{{"file_path":"...","info_needed":"..."}}]}}
+        - If the summaries already provide enough information, return "files_to_fetch": [].
         - Do NOT guess or hallucinate code behavior.
         - Do NOT select files merely to “be safe” unless uncertainty would materially affect correctness.
         - Be explicit: name functions, classes, variables, or code paths when possible.
         - Prefer minimal file sets over broad coverage.
+        - When selecting a file, copy the `file_path` exactly from the leading backticked path in the matching summary.
+        - NEVER invent, rename, shorten, normalize, or infer a file path.
+        - NEVER return a file path unless that exact path appears in the provided file summaries.
 
         GUIDANCE
         ────────────────────────────────────────────
@@ -198,6 +358,7 @@ async def stream_answer(user_question: str, repo_name: str):
         """
 
         
+        response = ""
         try:
             response = await llm.generate_async(
                 prompt=user_question,
@@ -206,15 +367,10 @@ async def stream_answer(user_question: str, repo_name: str):
                 response_format=FileSelectionResponse,
             )
             
-            parsed = FileSelectionResponse.model_validate_json(response)
-            
-            return [
-                {"file_path": f.file_path, "info_needed": f.info_needed}
-                for f in parsed.files_to_fetch
-            ]
+            return FileSelectionResponse.model_validate_json(response).files_to_fetch
             
         except Exception:
-            logger.exception("Error selecting files for query")
+            logger.exception(f"Error selecting files for query: {response}")
             return []
         
     async def _read_file_and_fetch_info(repo_name: str, file_path: str, info_needed: str):
@@ -238,6 +394,28 @@ async def stream_answer(user_question: str, repo_name: str):
             temperature=0.0,
         )
         return {"file_path": file_path, "insight": insight}
+
+    async def _read_file_task(file_info: Dict[str, str]) -> Dict[str, Any]:
+        try:
+            insight = await _read_file_and_fetch_info(
+                repo_name=repo_name,
+                file_path=file_info["file_path"],
+                info_needed=file_info["info_needed"],
+            )
+            return {
+                "file_path": file_info["file_path"],
+                "info_needed": file_info["info_needed"],
+                "result": insight,
+                "error": None,
+            }
+        except Exception as exc:
+            logger.exception("Error reading file %s", file_info["file_path"])
+            return {
+                "file_path": file_info["file_path"],
+                "info_needed": file_info["info_needed"],
+                "result": None,
+                "error": str(exc),
+            }
 
     async def _answer_query_using_repo_context(repo_context: str) -> str:
         system_prompt = f"""
@@ -352,10 +530,23 @@ async def stream_answer(user_question: str, repo_name: str):
         for _, chunk in stream:
             content = getattr(chunk, "content", None)
             if content:
-                yield content
-        
-        yield "\n"
+                yield {
+                    "type": "content",
+                    "delta": content,
+                }
 
+        yield {
+            "type": "content",
+            "delta": "\n",
+        }
+
+    yield {
+        "type": "progress",
+        "stage": "selecting_files",
+        "status": "started",
+        "message": "Selecting relevant files",
+        "metadata": {},
+    }
     arch_doc = await asyncio.to_thread(
         mental_model_col.find_one,
         {"repo_name": repo_name, "document_type": "REPO_CONTEXT"},
@@ -363,29 +554,101 @@ async def stream_answer(user_question: str, repo_name: str):
     )
     repo_context = (arch_doc or {}).get("context", "")
 
-    additional_info_required: List[Dict[str, str]] = await _select_files_for_query(repo_context=repo_context)
-    
-    tasks = []
-    for file_info in additional_info_required:
-        logger.debug("Fetching info from file: %s", file_info["file_path"])
-        tasks.append(_read_file_and_fetch_info(
-            repo_name=repo_name,
-            file_path=file_info["file_path"],
-            info_needed=file_info["info_needed"],
-        ))
+    additional_info_required_task = asyncio.create_task(
+        _select_files_for_query(repo_context=repo_context)
+    )
 
-    tasks.append(_answer_query_using_repo_context(
-        repo_context=repo_context,
-    ))
+    summary_task = asyncio.create_task(
+        _answer_query_using_repo_context(
+            repo_context=repo_context,
+        )
+    )
 
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    additional_info_required: List[FileSelection] = await additional_info_required_task
 
-    file_insights = results[:-1]
-    summary_insight = results[-1]
-    
+    yield {
+        "type": "progress",
+        "stage": "selecting_files",
+        "status": "completed",
+        "message": "Completed file selection",
+        "metadata": {
+            "file_count": len(additional_info_required),
+            "files": [item.file_path for item in additional_info_required],
+        },
+    }
+
+    file_insights: List[Any] = []
+    if additional_info_required:
+        for file_info in additional_info_required:
+            logger.debug("Fetching info from file: %s", file_info["file_path"])
+            yield {
+                "type": "progress",
+                "stage": "reading_file",
+                "status": "started",
+                "message": f"Reading {file_info['file_path']}",
+                "metadata": {
+                    "file_path": file_info["file_path"],
+                    "info_needed": file_info["info_needed"],
+                },
+            }
+
+        read_tasks = [
+            asyncio.create_task(_read_file_task(file_info))
+            for file_info in additional_info_required
+        ]
+
+        for task in asyncio.as_completed(read_tasks):
+            outcome = await task
+            if outcome["error"]:
+                yield {
+                    "type": "progress",
+                    "stage": "reading_file",
+                    "status": "failed",
+                    "message": f"Failed reading {outcome['file_path']}",
+                    "metadata": {
+                        "file_path": outcome["file_path"],
+                        "info_needed": outcome["info_needed"],
+                        "error": outcome["error"],
+                    },
+                }
+                continue
+
+            file_insights.append(outcome["result"])
+            yield {
+                "type": "progress",
+                "stage": "reading_file",
+                "status": "completed",
+                "message": f"Finished reading {outcome['file_path']}",
+                "metadata": {
+                    "file_path": outcome["file_path"],
+                    "info_needed": outcome["info_needed"],
+                },
+            }
+
+    yield {
+        "type": "progress",
+        "stage": "synthesizing_response",
+        "status": "started",
+        "message": "Synthesizing response",
+        "metadata": {
+            "file_count": len(file_insights),
+        },
+    }
+
+    summary_insight = await summary_task
+
     async for chunk in _synth_final_answer(
         user_question=user_question,
         file_insights=file_insights,
         summary_insight=summary_insight
     ):
         yield chunk
+    yield {
+        "type": "progress",
+        "stage": "synthesizing_response",
+        "status": "completed",
+        "message": "Response synthesis complete",
+        "metadata": {
+            "file_count": len(file_insights),
+        },
+    }

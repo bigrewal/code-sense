@@ -7,7 +7,6 @@ from typing import Any
 class IngestionStage(str, Enum):
     QUEUED = "queued"
     PRECHECK = "precheck"
-    RESOLVE_REFS = "resolve_refs"
     MENTAL_MODEL = "mental_model"
 
 class IngestionStageStatus(str, Enum):

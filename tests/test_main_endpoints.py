@@ -205,7 +205,6 @@ async def test_run_ingestion_job_marks_cancelled_on_cancelled_error(fake_mongo, 
             repo_name="repo-a",
             job_id="job-cancelled",
             enable_precheck=True,
-            enable_resolve_refs=True,
         )
 
     assert "job-cancelled" in fake_mongo.cancel_reason
@@ -224,21 +223,6 @@ async def test_delete_repo_invalid_path(fake_mongo, monkeypatch, tmp_path: Path)
     with pytest.raises(HTTPException) as exc:
         await main.delete_repo("repo-a", delete_files=False)
     assert exc.value.status_code == 400
-
-
-@pytest.mark.asyncio
-async def test_delete_repo_cache_error(fake_mongo, monkeypatch, tmp_path: Path):
-    safe_base = tmp_path / "safe"
-    repo_dir = safe_base / "repo-a"
-    repo_dir.mkdir(parents=True)
-
-    monkeypatch.setattr(main.Config, "BASE_REPO_DIR", str(safe_base))
-    monkeypatch.setattr(main, "get_repo_path", lambda _repo_name: repo_dir)
-    monkeypatch.setattr(main, "_delete_repo_lsp_cache_files", lambda _path: (_ for _ in ()).throw(RuntimeError("x")))
-
-    with pytest.raises(HTTPException) as exc:
-        await main.delete_repo("repo-a", delete_files=False)
-    assert exc.value.status_code == 500
 
 
 @pytest.mark.asyncio

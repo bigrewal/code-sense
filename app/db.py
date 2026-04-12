@@ -1,10 +1,7 @@
-import json
 import logging
-import sqlite3
 import threading
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from bson import ObjectId
@@ -40,7 +37,6 @@ def _serialize_job(job_doc: Dict[str, Any]) -> Dict[str, Any]:
         "error": job_doc.get("error"),
         "operation": job_doc.get("operation"),
         "enable_precheck": job_doc.get("enable_precheck"),
-        "enable_resolve_refs": job_doc.get("enable_resolve_refs"),
         "created_at": job_doc.get("created_at"),
         "updated_at": job_doc.get("updated_at"),
     }
@@ -70,133 +66,6 @@ def _validate_repo_name(repo_name: str) -> None:
         raise InvalidParameterError("repo_name must be a non-empty string")
     if any(char in repo_name for char in ["$", "{", "}"]):
         raise InvalidParameterError("repo_name contains invalid characters")
-
-
-class LSPCacheReader:
-    """Minimal SQLite reader for querying LSP reference cache."""
-
-    def __init__(self, repo_path: str):
-        """Initialize reader for a specific repository.
-
-        Args:
-            repo_path: Path to repository root (where .codesense_ref_index.sqlite is located)
-        """
-        self.repo_path = Path(repo_path)
-        self.db_path = self.repo_path / ".codesense_ref_index.sqlite"
-        if not self.db_path.exists():
-            raise FileNotFoundError(f"LSP cache not found: {self.db_path}")
-        # LSP cache stores paths with repo folder name prefix (e.g., "dictquery/dictquery/__init__.py")
-        self.repo_folder_name = self.repo_path.name
-
-    def _get_connection(self) -> sqlite3.Connection:
-        """Get a read-only connection to the cache database."""
-        conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        return conn
-
-    def _to_cache_path(self, file_path: str) -> str:
-        """Convert relative file path to LSP cache path format (with repo folder prefix)."""
-        return f"{self.repo_folder_name}/{file_path}"
-
-    def _from_cache_path(self, cache_path: str) -> str:
-        """Convert LSP cache path to relative file path (strip repo folder prefix)."""
-        prefix = f"{self.repo_folder_name}/"
-        if cache_path.startswith(prefix):
-            return cache_path[len(prefix):]
-        return cache_path
-
-    def cross_file_interactions(self, file_path: str) -> Dict[str, Any]:
-        """Get cross-file interactions for a given file.
-
-        Args:
-            file_path: Relative path to file within repository
-
-        Returns:
-            Dict with 'downstream' and 'upstream' keys containing interactions
-        """
-        conn = self._get_connection()
-        # Convert to LSP cache format (with repo folder prefix)
-        cache_file_path = self._to_cache_path(file_path)
-
-        try:
-            # Downstream: file_path → other files
-            downstream_interactions: Dict[str, List[str]] = {}
-            downstream_files = set()
-
-            # Note: LSP cache uses language-specific namespaces (e.g., "PythonAnalyzer:pylsp")
-            # not repo names, so we don't filter by namespace
-            cursor = conn.execute(
-                "SELECT ref_path, data FROM mappings WHERE ref_path = ?",
-                (cache_file_path,)
-            )
-
-            for row in cursor.fetchall():
-                data = json.loads(row["data"])
-                definitions = data.get("definitions", [])
-                if not definitions:
-                    continue
-
-                ref = data.get("reference", {})
-                ref_loc = f"{file_path}:{ref.get('line', '?')}:{ref.get('column', '?')}"
-
-                for defn in definitions:
-                    def_file_cache = defn.get("file_path")
-                    if def_file_cache and def_file_cache != cache_file_path:
-                        # Convert from cache path to relative path
-                        def_file = self._from_cache_path(def_file_cache)
-                        def_loc = f"{def_file}:{defn.get('line', '?')}:{defn.get('column', '?')}"
-                        interaction = f"{ref_loc} -> {def_loc}"
-                        downstream_interactions.setdefault(def_file, []).append(interaction)
-                        downstream_files.add(def_file)
-
-            # Upstream: other files → file_path
-            upstream_interactions: Dict[str, List[str]] = {}
-            upstream_files = set()
-
-            # Query for references that point to definitions in this file
-            cursor = conn.execute("""
-                SELECT m.ref_path, m.data
-                FROM mappings m
-                JOIN def_index d ON d.namespace = m.namespace
-                    AND d.ref_path = m.ref_path
-                    AND d.ref_line = m.ref_line
-                    AND d.ref_column = m.ref_column
-                WHERE d.def_path = ?
-            """, (cache_file_path,))
-
-            for row in cursor.fetchall():
-                data = json.loads(row["data"])
-                ref = data.get("reference", {})
-                ref_file_cache = ref.get("file_path")
-                if not ref_file_cache or ref_file_cache == cache_file_path:
-                    continue
-
-                # Convert from cache path to relative path
-                ref_file = self._from_cache_path(ref_file_cache)
-                ref_loc = f"{ref_file}:{ref.get('line', '?')}:{ref.get('column', '?')}"
-                definitions = data.get("definitions", [])
-
-                for defn in definitions:
-                    def_file_cache = defn.get("file_path")
-                    if def_file_cache == cache_file_path:
-                        def_loc = f"{file_path}:{defn.get('line', '?')}:{defn.get('column', '?')}"
-                        interaction = f"{ref_loc} -> {def_loc}"
-                        upstream_interactions.setdefault(ref_file, []).append(interaction)
-                        upstream_files.add(ref_file)
-                        
-            return {
-                "downstream": {
-                    "interactions": downstream_interactions,
-                    "files": downstream_files,
-                },
-                "upstream": {
-                    "interactions": upstream_interactions,
-                    "files": upstream_files,
-                },
-            }
-
-        finally:
-            conn.close()
 
 
 class MyMongoClient:
@@ -579,7 +448,7 @@ class MyMongoClient:
             "job_id": 1, "repo_name": 1, "status": 1,
             "current_stage": 1, "error": 1,
             "operation": 1,
-            "enable_precheck": 1, "enable_resolve_refs": 1,
+            "enable_precheck": 1,
             "created_at": 1, "updated_at": 1,
         }
 

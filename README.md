@@ -10,13 +10,13 @@ CodeSense takes a different approach.
 
 Instead of retrieving isolated snippets, CodeSense:
 
-* builds a **semantic reference index directly from code** (AST + LSP),
-* compresses cross-file signals into a **global repository context** that fits within an LLM’s context window. For example: [Astropy on GitHub](https://github.com/astropy/astropy) (~1M Python tokens) is compressed by CodeSense to ~48k tokens.
+* scans and classifies source files directly from the repository,
+* compresses file-level signals into a **global repository context** that fits within an LLM’s context window. For example: [Astropy on GitHub](https://github.com/astropy/astropy) (~1M Python tokens) is compressed by CodeSense to ~48k tokens.
 * and uses this context to answer questions with a **repo-wide mental model**.
 
-> Note: The repo-wide mental model is constructed exclusively from source code (AST + semantic dependencies) and does not rely on repository documentation or Markdown files.
+> Note: The repo-wide mental model is constructed exclusively from source code and does not rely on repository documentation or Markdown files.
 
-The resulting mental model captures **upstream and downstream relationships across files**, enabling reliable reasoning about cross-component behavior.
+The resulting mental model captures the repository’s important files, responsibilities, and likely relationships across components, enabling reliable reasoning about the broader codebase.
 
 Importantly, this mental model serves two roles:
 
@@ -26,16 +26,16 @@ Importantly, this mental model serves two roles:
 The goal is to give the LLM an **integrated understanding of the entire codebase**, rather than a handful of retrieved chunks or an agent’s transient working memory.
 
 
-> **Outcome:** In a controlled comparison against DeepWiki (Cognition), I tested repo-level understanding with and without Markdown documentation. I found that DeepWiki’s explanations rely heavily on existing docs and degrade significantly when documentation is removed. In contrast, CodeSense continues to produce coherent, end-to-end explanations because its repo-wide mental model is derived entirely from code structure and semantic dependencies, not from written documentation. This makes the system more robust to undocumented, outdated, or poorly documented repositories and better suited for reliable, code-grounded answers.
+> **Outcome:** In a controlled comparison against DeepWiki (Cognition), I tested repo-level understanding with and without Markdown documentation. I found that DeepWiki’s explanations rely heavily on existing docs and degrade significantly when documentation is removed. In contrast, CodeSense continues to produce coherent, end-to-end explanations because its repo-wide mental model is derived entirely from source code and repository structure, not from written documentation. This makes the system more robust to undocumented, outdated, or poorly documented repositories and better suited for reliable, code-grounded answers.
 
 ---
 
 ## How is the mental model created
 
-1. **Parse the repository** (tree-sitter) to capture structure.
-2. **Resolve cross-file symbol references** (LSP) to capture semantics in a local SQLite cache.
-3. **Generate a "mental model"**: classify files (CRITICAL vs IGNORE) and summarize critical files with upstream/downstream interactions using the LSP reference cache.
-4. **Compress to global context**: assemble a repo-wide context from critical-file summaries and cross-file interactions so it fits comfortably in the LLM context window.
+1. **Scan the repository** and filter out ignored paths.
+2. **Run pre-ingestion analysis** to identify supported source files, estimate token footprint, and persist supported-file state for incremental ingestion.
+3. **Generate a "mental model"**: classify files (CRITICAL vs IGNORE) and summarize critical files from source code, inferring likely upstream/downstream relationships from code structure when needed.
+4. **Compress to global context**: assemble a repo-wide context from critical-file summaries so it fits comfortably in the LLM context window.
 5. **Answer questions** using the global context (no doc reliance required).
 
 ---
@@ -55,15 +55,13 @@ Search-based approaches inevitably expose the model to only a small subset of th
 
 **Stages**
 
-* **Pre-ingestion analysis**: scans files, filters directories, estimates size/budget.
-* **LSP reference extraction**: builds a persistent SQLite cache of symbol reference edges.
-* **Mental model generation**: queries the SQLite cache + an LLM to produce short file-level "briefs" and criticality.
-* **Repo context builder**: assembles a **global repo context** from critical-file briefs and dependencies, then stores it in MongoDB.
+* **Pre-ingestion analysis**: scans files, filters directories, estimates size/budget, and persists supported-file state for incremental re-ingestion.
+* **Mental model generation**: uses source code plus an LLM to produce short file-level briefs and criticality labels.
+* **Repo context builder**: assembles a **global repo context** from critical-file briefs, then stores it in MongoDB.
 
 **Storage**
 
-* **SQLite**: LSP reference cache (per-repository, stores cross-file dependencies)
-* **MongoDB**: brief summaries + global repo context (document store)
+* **MongoDB**: ingestion jobs, supported-file state, file briefs, and global repo context
 
 
 ## Evaluation
@@ -94,10 +92,10 @@ I compared our tool against **DeepWiki** (Cognition Labs / Devin-powered reposit
 ### Key Takeaways
 - **DeepWiki** relies heavily on human-written markdown documentation for accurate high-level reasoning and architectural synthesis. When documentation is removed, its answers become shallow, incomplete, and miss critical system components.
 - Our system **excels in the code-only setting** — deriving deeper, more accurate architectural understanding directly from:
-  - LSP-resolved cross-file references (stored in SQLite)
-  - Tree-sitter AST + semantic dependency analysis
-  - Dependency-aware critical file selection & summarization
-  - Repository context synthesis from summarized critical files and cross-file interactions
+  - Repository-wide source-code scanning and summarization
+  - File-state-aware incremental ingestion
+  - Critical file selection and source-grounded summarization
+  - Repository context synthesis from summarized critical files
 
 This demonstrates a significant advantage in real-world scenarios where documentation is sparse, outdated, or absent — a common situation in large production codebases.
 
@@ -107,7 +105,7 @@ I believe this is a meaningful step toward more robust, doc-independent reposito
 
 ## Limitations (current)
 
-* **Language support**: CodeSense currently supports Scala, Java, Python, Rust, and TypeScript. Support for additional languages is planned as the ingestion and analysis pipeline is extended.
+* **Language support**: CodeSense currently supports Python, Java, Scala, Rust, JavaScript, TypeScript, HTML, Go, C, C++, Fortran, Julia, MATLAB, CSS, and AGC assembly by file extension. Summary quality still depends on how well the model can interpret the source language and repository conventions.
 
 * **Context window constraints**: CodeSense relies on fitting the compressed repo-wide mental model within the LLM’s context window. If the compressed representation exceeds the available context, this approach will not scale further without additional hierarchical compression. In practice, this design works well for most real-world repositories; for example, a ~1.2M LoC codebase (~5M raw tokens) was compressed to ~600k tokens, comfortably fitting within Grok’s 2M-token context window.
 --- 
@@ -177,25 +175,19 @@ Make sure you have **Docker**, **Docker Compose**, and **`uv`** installed.
 
    * `XAI_API_KEY`
 
-3. Make scripts executable:
+3. Start MongoDB:
 
    ```bash
-   chmod +x scripts/bootstrap_local.sh scripts/install_language_servers.sh
+   docker compose up -d mongo
    ```
 
-4. Bootstrap local tools and start MongoDB:
-
-   ```bash
-   ./scripts/bootstrap_local.sh
-   ```
-
-5. Run the API:
+4. Run the API:
 
    ```bash
    uv run uvicorn app.main:app --reload
    ```
 
-6. Verify API docs at http://localhost:8000/docs#/
+5. Verify API docs at http://localhost:8000/docs#/
 
 
 ---
@@ -227,14 +219,9 @@ docker compose down -v
 
 **Hard requirements**
 
-* Docker image path: language servers are preinstalled in the API image.
-* Host development path: the following language servers **must** be installed or bootstrap will fail:
-
-  * `jdtls` (Java)
-  * `pylsp` (Python)
-  * `rust-analyzer` (Rust)
-  * `metals` (Scala)
-  * `typescript-language-server` (TypeScript)
+* `XAI_API_KEY`
+* A reachable MongoDB instance
+* A repository checked out under `data/`
 
 **Endpoints**
 
