@@ -105,8 +105,6 @@ I believe this is a meaningful step toward more robust, doc-independent reposito
 
 ## Limitations (current)
 
-* **Language support**: CodeSense currently supports Python, Java, Scala, Rust, JavaScript, TypeScript, HTML, Go, C, C++, Fortran, Julia, MATLAB, CSS, and AGC assembly by file extension. Summary quality still depends on how well the model can interpret the source language and repository conventions.
-
 * **Context window constraints**: CodeSense relies on fitting the compressed repo-wide mental model within the LLM’s context window. If the compressed representation exceeds the available context, this approach will not scale further without additional hierarchical compression. In practice, this design works well for most real-world repositories; for example, a ~1.2M LoC codebase (~5M raw tokens) was compressed to ~600k tokens, comfortably fitting within Grok’s 2M-token context window.
 --- 
 
