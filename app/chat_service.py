@@ -373,6 +373,7 @@ async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[Di
                 temperature=0.0,
                 response_format=FileSelectionResponse,
             )
+            logger.info("Raw file-selection LLM response: %r", response)
             
             return FileSelectionResponse.model_validate_json(response).files_to_fetch
             
@@ -380,46 +381,36 @@ async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[Di
             logger.exception(f"Error selecting files for query: {response}")
             return []
         
-    async def _read_file_and_fetch_info(repo_name: str, file_path: str, info_needed: str):
-        code = fetch_code_file(repo_name=repo_name, file_path=file_path)
-
-        system_prompt = "Your task is to only fetch the information requested from the provided code"
-
-        user_prompt = f"""
-            File path: {file_path}
-
-            Code:
-            {code}
-            
-            Information requested: {info_needed}
-
-            """
-        
-        insight = await llm.generate_async(
-            prompt=user_prompt,
-            system_prompt=system_prompt,
-            temperature=0.0,
-        )
-        return {"file_path": file_path, "insight": insight}
-
-    async def _read_file_task(file_info: Dict[str, str]) -> Dict[str, Any]:
+    async def _read_file_task(file_info: FileSelection) -> Dict[str, Any]:
         try:
-            insight = await _read_file_and_fetch_info(
-                repo_name=repo_name,
-                file_path=file_info["file_path"],
-                info_needed=file_info["info_needed"],
+            code = fetch_code_file(repo_name=repo_name, file_path=file_info.file_path)
+
+            user_prompt = f"""
+                File path: {file_info.file_path}
+
+                Code:
+                {code}
+                
+                Information requested: {file_info.info_needed}
+
+                """
+
+            insight = await llm.generate_async(
+                prompt=user_prompt,
+                system_prompt="Your task is to only fetch the information requested from the provided code",
+                temperature=0.0,
             )
             return {
-                "file_path": file_info["file_path"],
-                "info_needed": file_info["info_needed"],
-                "result": insight,
+                "file_path": file_info.file_path,
+                "info_needed": file_info.info_needed,
+                "result": {"file_path": file_info.file_path, "insight": insight},
                 "error": None,
             }
         except Exception as exc:
-            logger.exception("Error reading file %s", file_info["file_path"])
+            logger.exception("Error reading file %s", file_info.file_path)
             return {
-                "file_path": file_info["file_path"],
-                "info_needed": file_info["info_needed"],
+                "file_path": file_info.file_path,
+                "info_needed": file_info.info_needed,
                 "result": None,
                 "error": str(exc),
             }
@@ -587,15 +578,14 @@ async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[Di
     file_insights: List[Any] = []
     if additional_info_required:
         for file_info in additional_info_required:
-            logger.debug("Fetching info from file: %s", file_info["file_path"])
             yield {
                 "type": "progress",
                 "stage": "reading_file",
                 "status": "started",
-                "message": f"Reading {file_info['file_path']}",
+                "message": f"Reading {file_info.file_path}",
                 "metadata": {
-                    "file_path": file_info["file_path"],
-                    "info_needed": file_info["info_needed"],
+                    "file_path": file_info.file_path,
+                    "info_needed": file_info.info_needed,
                 },
             }
 
