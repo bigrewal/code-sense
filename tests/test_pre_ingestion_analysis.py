@@ -11,7 +11,7 @@ class DummyLLM:
         return len(text.split())
 
 
-class FakeMongo:
+class FakeDB:
     def get_repo_file_states(self, _repo_name):
         return {}
 
@@ -41,8 +41,8 @@ async def test_scan_retokenizes_when_file_becomes_supported(monkeypatch, tmp_pat
     }
 
     monkeypatch.setattr(
-        "app.repo_ingestion_pipeline.pre_ingestion_analysis.get_mongo_client",
-        lambda: FakeMongo(),
+        "app.repo_ingestion_pipeline.pre_ingestion_analysis.get_db_client",
+        lambda: FakeDB(),
     )
 
     stage = PreIngestionAnalysisStage(llm_grok=DummyLLM(), repo_name="Apollo-11")
@@ -77,8 +77,8 @@ async def test_scan_retokenizes_when_supported_file_has_zero_cached_tokens(monke
     }
 
     monkeypatch.setattr(
-        "app.repo_ingestion_pipeline.pre_ingestion_analysis.get_mongo_client",
-        lambda: FakeMongo(),
+        "app.repo_ingestion_pipeline.pre_ingestion_analysis.get_db_client",
+        lambda: FakeDB(),
     )
 
     stage = PreIngestionAnalysisStage(llm_grok=DummyLLM(), repo_name="Apollo-11")
@@ -102,8 +102,8 @@ async def test_scan_does_not_persist_unsupported_files(monkeypatch, tmp_path: Pa
     _write(tmp_path / "README.xyz", "not supported\n")
 
     monkeypatch.setattr(
-        "app.repo_ingestion_pipeline.pre_ingestion_analysis.get_mongo_client",
-        lambda: FakeMongo(),
+        "app.repo_ingestion_pipeline.pre_ingestion_analysis.get_db_client",
+        lambda: FakeDB(),
     )
 
     stage = PreIngestionAnalysisStage(llm_grok=DummyLLM(), repo_name="Apollo-11")

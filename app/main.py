@@ -17,8 +17,8 @@ from .utils import get_repo_path
 from .chat_service import stream_chat, stateless_stream_chat
 from .config import Config, validate_required_settings
 from .db import (
-    get_mongo_client,
-    init_mongo_client,
+    get_db_client,
+    init_db_client,
 )
 from .repo_ingestion_pipeline import start_ingestion_pipeline
 from .validators import validate_repo_name, validate_conversation_id, validate_job_id
@@ -41,8 +41,8 @@ _ingest_execution_lock = asyncio.Lock()
 
 
 def _cancel_active_jobs_on_lifecycle_event(reason: str) -> None:
-    mongo = get_mongo_client()
-    cancelled_count = mongo.cancel_active_ingestion_jobs(reason)
+    db_client = get_db_client()
+    cancelled_count = db_client.cancel_active_ingestion_jobs(reason)
     if cancelled_count:
         logger.info("Marked %s active ingestion job(s) as cancelled", cancelled_count)
 
@@ -69,7 +69,7 @@ app.add_middleware(
 async def on_startup():
     logger.info("Initializing clients")
     validate_required_settings()
-    init_mongo_client()
+    init_db_client()
     _cancel_active_jobs_on_lifecycle_event("Ingestion cancelled: service restarted")
 
 
@@ -82,12 +82,12 @@ async def on_shutdown():
 
     try:
         _cancel_active_jobs_on_lifecycle_event("Ingestion cancelled: service shutting down")
-        mongo_client = get_mongo_client()
-        if mongo_client:
-            mongo_client.close()
-            logger.info("MongoDB connection closed")
+        db_client = get_db_client()
+        if db_client:
+            db_client.close()
+            logger.info("SQLite connection closed")
     except Exception as e:
-        logger.error("Error closing MongoDB connection: %s", str(e))
+        logger.error("Error closing SQLite connection: %s", str(e))
 
     logger.info("Shutdown complete")
 
@@ -142,7 +142,7 @@ class IngestRequest(BaseModel):
 async def _run_ingestion_job(**kwargs):
     """Ensure ingestion jobs execute one-at-a-time and cancellation is persisted."""
     job_id = kwargs["job_id"]
-    mongo = get_mongo_client()
+    db_client = get_db_client()
 
     async with _ingest_execution_lock:
         try:
@@ -150,7 +150,7 @@ async def _run_ingestion_job(**kwargs):
         except asyncio.CancelledError:
             await with_timeout(
                 asyncio.to_thread(
-                    mongo.cancel_active_ingestion_jobs,
+                    db_client.cancel_active_ingestion_jobs,
                     f"Ingestion cancelled: job {job_id} interrupted",
                 ),
                 timeout_seconds=Config.DB_OPERATION_TIMEOUT,
@@ -166,10 +166,10 @@ async def create_conversation(req: ConversationCreateRequest):
     Frontend calls this once when the user clicks 'New Chat'.
     """
     repo_name = validate_repo_name(req.repo_name)
-    mongo = get_mongo_client()
+    db_client = get_db_client()
 
     result = await with_timeout(
-        asyncio.to_thread(mongo.create_conversation, repo_name=repo_name),
+        asyncio.to_thread(db_client.create_conversation, repo_name=repo_name),
         timeout_seconds=Config.DB_OPERATION_TIMEOUT,
         operation_name="Create conversation"
     )
@@ -190,11 +190,11 @@ async def list_conversations(
     if repo_name:
         repo_name = validate_repo_name(repo_name)
 
-    mongo = get_mongo_client()
+    db_client = get_db_client()
 
     docs = await with_timeout(
         asyncio.to_thread(
-            mongo.list_conversations,
+            db_client.list_conversations,
             repo_name=repo_name,
             limit=limit,
             offset=offset,
@@ -218,10 +218,10 @@ async def list_conversations(
 @app.get("/conversations/{conversation_id}/messages", response_model=ConversationMessagesResponse)
 async def list_conversation_messages(conversation_id: str, limit: int = Query(200, ge=1, le=500)):
     conversation_id = validate_conversation_id(conversation_id)
-    mongo = get_mongo_client()
+    db_client = get_db_client()
 
     exists = await with_timeout(
-        asyncio.to_thread(mongo.conversation_exists, conversation_id),
+        asyncio.to_thread(db_client.conversation_exists, conversation_id),
         timeout_seconds=Config.DB_OPERATION_TIMEOUT,
         operation_name="Check conversation exists"
     )
@@ -231,7 +231,7 @@ async def list_conversation_messages(conversation_id: str, limit: int = Query(20
 
     docs = await with_timeout(
         asyncio.to_thread(
-            mongo.list_conversation_messages,
+            db_client.list_conversation_messages,
             conversation_id=conversation_id,
             limit=limit,
         ),
@@ -258,11 +258,11 @@ async def list_conversation_messages(conversation_id: str, limit: int = Query(20
 @app.delete("/conversations/{conversation_id}")
 async def delete_conversation(conversation_id: str):
     conversation_id = validate_conversation_id(conversation_id)
-    mongo = get_mongo_client()
+    db_client = get_db_client()
 
     try:
         await with_timeout(
-            asyncio.to_thread(mongo.delete_conversation, conversation_id),
+            asyncio.to_thread(db_client.delete_conversation, conversation_id),
             timeout_seconds=Config.DB_OPERATION_TIMEOUT,
             operation_name="Delete conversation"
         )
@@ -307,7 +307,7 @@ async def ingest_repo(
         raise HTTPException(status_code=400, detail="Provide repo_name")
 
     repo_name = validate_repo_name(ingest_request.repo_name)
-    mongo = get_mongo_client()
+    db_client = get_db_client()
     logger.info(f"Processing repo for ingestion: {repo_name}")
     local_repo_path = get_repo_path(repo_name)
     if not local_repo_path.exists():
@@ -315,7 +315,7 @@ async def ingest_repo(
 
     async with _ingest_admission_lock:
         active_job = await with_timeout(
-            asyncio.to_thread(mongo.get_active_ingestion_job),
+            asyncio.to_thread(db_client.get_active_ingestion_job),
             timeout_seconds=Config.DB_OPERATION_TIMEOUT,
             operation_name="Check active ingestion job",
         )
@@ -341,7 +341,7 @@ async def ingest_repo(
 
         await with_timeout(
             asyncio.to_thread(
-                mongo.upsert_ingestion_job,
+                db_client.upsert_ingestion_job,
                 job,
                 extra_fields={
                     "operation": "full_ingest",
@@ -387,11 +387,11 @@ async def delete_repo(repo_name: str, delete_files: bool = False):
                 raise HTTPException(status_code=500, detail="Failed to delete repo files")
         else:
             logger.info("Repo files not found for %s, continuing with DB cleanup", repo_name)
-    mongo = get_mongo_client()
+    db_client = get_db_client()
 
     try:
         deletion_result = await with_timeout(
-            asyncio.to_thread(mongo.delete_repo_data, repo_name),
+            asyncio.to_thread(db_client.delete_repo_data, repo_name),
             timeout_seconds=Config.DB_OPERATION_TIMEOUT,
             operation_name="Delete repo data"
         )
@@ -417,11 +417,11 @@ async def get_status(
     if repo_name:
         repo_name = validate_repo_name(repo_name)
 
-    mongo = get_mongo_client()
+    db_client = get_db_client()
 
     if job_id:
         job = await with_timeout(
-            asyncio.to_thread(mongo.get_job_status, job_id),
+            asyncio.to_thread(db_client.get_job_status, job_id),
             timeout_seconds=Config.DB_OPERATION_TIMEOUT,
             operation_name="Get job status"
         )
@@ -431,7 +431,7 @@ async def get_status(
 
     jobs, total = await with_timeout(
         asyncio.to_thread(
-            mongo.list_jobs,
+            db_client.list_jobs,
             status=status,
             repo_name=repo_name,
             limit=limit,
@@ -453,9 +453,9 @@ async def get_status(
 @app.get("/repos")
 async def list_repos():
     """List all ingested code repositories."""
-    mongo = get_mongo_client()
+    db_client = get_db_client()
     ingested_repos = await with_timeout(
-        asyncio.to_thread(mongo.list_ingested_repos),
+        asyncio.to_thread(db_client.list_ingested_repos),
         timeout_seconds=Config.DB_OPERATION_TIMEOUT,
         operation_name="List repos"
     )
@@ -465,10 +465,10 @@ async def list_repos():
 @app.delete("/jobs/{job_id}")
 async def delete_job(job_id: str):
     job_id = validate_job_id(job_id)
-    mongo = get_mongo_client()
+    db_client = get_db_client()
 
     job = await with_timeout(
-        asyncio.to_thread(mongo.get_job, job_id),
+        asyncio.to_thread(db_client.get_job, job_id),
         timeout_seconds=Config.DB_OPERATION_TIMEOUT,
         operation_name="Get job"
     )
@@ -482,7 +482,7 @@ async def delete_job(job_id: str):
         )
 
     ok = await with_timeout(
-        asyncio.to_thread(mongo.delete_job, job_id),
+        asyncio.to_thread(db_client.delete_job, job_id),
         timeout_seconds=Config.DB_OPERATION_TIMEOUT,
         operation_name="Delete job"
     )
@@ -503,7 +503,7 @@ async def health():
 
     Response includes:
         - Overall status
-        - Component health (MongoDB)
+        - Component health (SQLite)
         - Response times
         - Connection pool status
         - Metrics (if enabled)
@@ -513,15 +513,15 @@ async def health():
     overall_status = "healthy"
     components = {}
 
-    # Check MongoDB
+    # Check SQLite
     try:
-        mongo_client = get_mongo_client()
-        mongo_health = mongo_client.health_check()
-        components["mongodb"] = mongo_health
-        if mongo_health["status"] != "healthy":
+        db_client = get_db_client()
+        db_health = db_client.health_check()
+        components["sqlite"] = db_health
+        if db_health["status"] != "healthy":
             overall_status = "unhealthy"
     except Exception as e:
-        components["mongodb"] = {"status": "unhealthy", "error": str(e)}
+        components["sqlite"] = {"status": "unhealthy", "error": str(e)}
         overall_status = "unhealthy"
 
     response = {

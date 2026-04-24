@@ -18,9 +18,8 @@ class Config:
     # Base directory to store cloned repositories
     BASE_REPO_DIR: str = "data"
 
-    # MongoDB Configuration
-    MONGO_URI: str = os.getenv("MONGO_URI")
-    MONGO_DB_NAME: str = "code_comprehension"
+    # SQLite Configuration
+    SQLITE_DB_PATH: str = os.getenv("SQLITE_DB_PATH", "data/code_sense.sqlite3")
 
     IGNORE_FOLDERS: set[str] = {
         "test",
@@ -78,24 +77,6 @@ class Config:
 
     min_supported_cov_ratio: float = 0.5
 
-    # ========== Database Connection Pool Configuration ==========
-
-    # MongoDB Connection Pool Settings
-    MONGO_MAX_POOL_SIZE: int = int(os.getenv("MONGO_MAX_POOL_SIZE", "50"))
-    MONGO_MIN_POOL_SIZE: int = int(os.getenv("MONGO_MIN_POOL_SIZE", "10"))
-    MONGO_MAX_IDLE_TIME_MS: int = int(
-        os.getenv("MONGO_MAX_IDLE_TIME_MS", "300000")
-    ) 
-    MONGO_SERVER_SELECTION_TIMEOUT_MS: int = int(
-        os.getenv("MONGO_SERVER_SELECTION_TIMEOUT_MS", "30000")
-    )
-    MONGO_CONNECT_TIMEOUT_MS: int = int(
-        os.getenv("MONGO_CONNECT_TIMEOUT_MS", "20000")
-    )
-    MONGO_SOCKET_TIMEOUT_MS: int = int(
-        os.getenv("MONGO_SOCKET_TIMEOUT_MS", "300000")
-    )
-
     # ========== Security ==========
 
     # Disable query logging in production for security
@@ -115,17 +96,10 @@ def validate_required_settings() -> None:
     # Check required environment variables
     required = {
         "XAI_API_KEY": Config.XAI_API_KEY,
-        "MONGO_URI": Config.MONGO_URI,
+        "SQLITE_DB_PATH": Config.SQLITE_DB_PATH,
     }
     missing = [name for name, value in required.items() if not value]
     if missing:
         raise RuntimeError(
             f"Missing required environment variables: {', '.join(missing)}"
-        )
-
-    # Validate numeric ranges for database configuration
-    if Config.MONGO_MAX_POOL_SIZE < Config.MONGO_MIN_POOL_SIZE:
-        raise ValueError(
-            f"MONGO_MAX_POOL_SIZE ({Config.MONGO_MAX_POOL_SIZE}) must be >= "
-            f"MONGO_MIN_POOL_SIZE ({Config.MONGO_MIN_POOL_SIZE})"
         )

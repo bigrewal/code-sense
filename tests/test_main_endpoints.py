@@ -12,7 +12,7 @@ async def _passthrough_with_timeout(coro, **_kwargs):
     return await coro
 
 
-class FakeMongo:
+class FakeDB:
     def __init__(self):
         self.deleted_repo_name = None
         self.job = None
@@ -91,43 +91,43 @@ class FakeMongo:
 
 
 @pytest.fixture
-def fake_mongo(monkeypatch):
-    mongo = FakeMongo()
+def fake_db(monkeypatch):
+    db_client = FakeDB()
     monkeypatch.setattr(main, "with_timeout", _passthrough_with_timeout)
-    monkeypatch.setattr(main, "get_mongo_client", lambda: mongo)
-    return mongo
+    monkeypatch.setattr(main, "get_db_client", lambda: db_client)
+    return db_client
 
 
 @pytest.mark.asyncio
-async def test_create_conversation(fake_mongo):
+async def test_create_conversation(fake_db):
     resp = await main.create_conversation(main.ConversationCreateRequest(repo_name="repo-a"))
     assert resp.repo_name == "repo-a"
     assert resp.conversation_id == "507f1f77bcf86cd799439011"
 
 
 @pytest.mark.asyncio
-async def test_list_conversations(fake_mongo):
+async def test_list_conversations(fake_db):
     rows = await main.list_conversations(repo_name="repo-a", limit=5, offset=0)
     assert len(rows) == 1
     assert rows[0].title == "First"
 
 
 @pytest.mark.asyncio
-async def test_list_conversation_messages_not_found(fake_mongo):
+async def test_list_conversation_messages_not_found(fake_db):
     with pytest.raises(HTTPException) as exc:
         await main.list_conversation_messages("507f1f77bcf86cd799439012")
     assert exc.value.status_code == 404
 
 
 @pytest.mark.asyncio
-async def test_list_conversation_messages_found(fake_mongo):
+async def test_list_conversation_messages_found(fake_db):
     resp = await main.list_conversation_messages("507f1f77bcf86cd799439011")
     assert resp.conversation_id == "507f1f77bcf86cd799439011"
     assert resp.messages[0].content == "hi"
 
 
 @pytest.mark.asyncio
-async def test_delete_conversation_404(fake_mongo):
+async def test_delete_conversation_404(fake_db):
     with pytest.raises(HTTPException) as exc:
         await main.delete_conversation("507f1f77bcf86cd799439012")
     assert exc.value.status_code == 404
@@ -150,7 +150,7 @@ async def test_stateless_chat_validation_errors():
 
 
 @pytest.mark.asyncio
-async def test_ingest_repo_not_found(fake_mongo, monkeypatch, tmp_path: Path):
+async def test_ingest_repo_not_found(fake_db, monkeypatch, tmp_path: Path):
     missing = tmp_path / "repo-a"
     monkeypatch.setattr(main, "get_repo_path", lambda _repo_name: missing)
     with pytest.raises(HTTPException) as exc:
@@ -159,7 +159,7 @@ async def test_ingest_repo_not_found(fake_mongo, monkeypatch, tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_ingest_repo_success(fake_mongo, monkeypatch, tmp_path: Path):
+async def test_ingest_repo_success(fake_db, monkeypatch, tmp_path: Path):
     repo_dir = tmp_path / "repo-a"
     repo_dir.mkdir()
     monkeypatch.setattr(main, "get_repo_path", lambda _repo_name: repo_dir)
@@ -180,11 +180,11 @@ async def test_ingest_repo_success(fake_mongo, monkeypatch, tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_ingest_repo_conflict_when_active_job_exists(fake_mongo, monkeypatch, tmp_path: Path):
+async def test_ingest_repo_conflict_when_active_job_exists(fake_db, monkeypatch, tmp_path: Path):
     repo_dir = tmp_path / "repo-a"
     repo_dir.mkdir()
     monkeypatch.setattr(main, "get_repo_path", lambda _repo_name: repo_dir)
-    fake_mongo.active_job = {"job_id": "already-running"}
+    fake_db.active_job = {"job_id": "already-running"}
 
     with pytest.raises(HTTPException) as exc:
         await main.ingest_repo(BackgroundTasks(), main.IngestRequest(repo_name="repo-a"))
@@ -193,7 +193,7 @@ async def test_ingest_repo_conflict_when_active_job_exists(fake_mongo, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_run_ingestion_job_marks_cancelled_on_cancelled_error(fake_mongo, monkeypatch, tmp_path: Path):
+async def test_run_ingestion_job_marks_cancelled_on_cancelled_error(fake_db, monkeypatch, tmp_path: Path):
     async def _cancelled_pipeline(**_kwargs):
         raise asyncio.CancelledError
 
@@ -206,11 +206,11 @@ async def test_run_ingestion_job_marks_cancelled_on_cancelled_error(fake_mongo, 
             job_id="job-cancelled",
         )
 
-    assert "job-cancelled" in fake_mongo.cancel_reason
+    assert "job-cancelled" in fake_db.cancel_reason
 
 
 @pytest.mark.asyncio
-async def test_delete_repo_invalid_path(fake_mongo, monkeypatch, tmp_path: Path):
+async def test_delete_repo_invalid_path(fake_db, monkeypatch, tmp_path: Path):
     safe_base = tmp_path / "safe"
     safe_base.mkdir()
     outside = tmp_path / "outside"
@@ -225,7 +225,7 @@ async def test_delete_repo_invalid_path(fake_mongo, monkeypatch, tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_delete_repo_success(fake_mongo, monkeypatch, tmp_path: Path):
+async def test_delete_repo_success(fake_db, monkeypatch, tmp_path: Path):
     safe_base = tmp_path / "safe"
     repo_dir = safe_base / "repo-a"
     repo_dir.mkdir(parents=True)
@@ -235,65 +235,65 @@ async def test_delete_repo_success(fake_mongo, monkeypatch, tmp_path: Path):
 
     resp = await main.delete_repo("repo-a", delete_files=False)
     assert resp["total_deleted"] == 7
-    assert fake_mongo.deleted_repo_name == "repo-a"
+    assert fake_db.deleted_repo_name == "repo-a"
 
 
 @pytest.mark.asyncio
-async def test_get_status_by_job_not_found(fake_mongo):
+async def test_get_status_by_job_not_found(fake_db):
     with pytest.raises(HTTPException) as exc:
         await main.get_status(job_id="00000000-0000-0000-0000-000000000000")
     assert exc.value.status_code == 404
 
 
 @pytest.mark.asyncio
-async def test_get_status_list(fake_mongo):
+async def test_get_status_list(fake_db):
     resp = await main.get_status(status="completed", repo_name="repo-a", limit=10, skip=0)
     assert resp["count"] == 1
     assert resp["total"] == 1
 
 
 @pytest.mark.asyncio
-async def test_list_repos(fake_mongo):
+async def test_list_repos(fake_db):
     resp = await main.list_repos()
     assert resp["repos"] == ["repo-a", "repo-b"]
 
 
 @pytest.mark.asyncio
-async def test_delete_job_status_paths(fake_mongo):
-    fake_mongo.job = None
+async def test_delete_job_status_paths(fake_db):
+    fake_db.job = None
     with pytest.raises(HTTPException) as exc_not_found:
         await main.delete_job("00000000-0000-0000-0000-000000000001")
     assert exc_not_found.value.status_code == 404
 
-    fake_mongo.job = {"status": "running"}
+    fake_db.job = {"status": "running"}
     with pytest.raises(HTTPException) as exc_conflict:
         await main.delete_job("00000000-0000-0000-0000-000000000001")
     assert exc_conflict.value.status_code == 409
 
-    fake_mongo.job = {"status": "completed"}
-    fake_mongo.delete_job_ok = False
+    fake_db.job = {"status": "completed"}
+    fake_db.delete_job_ok = False
     with pytest.raises(HTTPException) as exc_failed:
         await main.delete_job("00000000-0000-0000-0000-000000000001")
     assert exc_failed.value.status_code == 500
 
-    fake_mongo.delete_job_ok = True
+    fake_db.delete_job_ok = True
     resp = await main.delete_job("00000000-0000-0000-0000-000000000001")
     assert resp["deleted"] is True
 
 
 @pytest.mark.asyncio
-async def test_health_healthy_and_unhealthy(fake_mongo, monkeypatch):
+async def test_health_healthy_and_unhealthy(fake_db, monkeypatch):
     healthy_resp = await main.health()
     assert healthy_resp.status_code == 200
 
-    fake_mongo.health = {"status": "unhealthy", "error": "down"}
+    fake_db.health = {"status": "unhealthy", "error": "down"}
     unhealthy_resp = await main.health()
     assert unhealthy_resp.status_code == 503
 
-    class BoomMongo:
+    class BoomDB:
         def health_check(self):
             raise RuntimeError("boom")
 
-    monkeypatch.setattr(main, "get_mongo_client", lambda: BoomMongo())
+    monkeypatch.setattr(main, "get_db_client", lambda: BoomDB())
     error_resp = await main.health()
     assert error_resp.status_code == 503

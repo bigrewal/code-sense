@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from tqdm import tqdm
 from ..config import Config
-from ..db import get_mongo_client
+from ..db import get_db_client
 from ..llm_grok import GrokLLM
 from .file_state import RepoFileChanges, build_repo_file_changes
 
@@ -47,8 +47,8 @@ class PreIngestionAnalysisStage:
         file_changes: Optional[RepoFileChanges] = None,
         previous_state: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        mongo = get_mongo_client()
-        previous_state = previous_state if previous_state is not None else mongo.get_repo_file_states(self.repo_name)
+        db_client = get_db_client()
+        previous_state = previous_state if previous_state is not None else db_client.get_repo_file_states(self.repo_name)
         file_changes = file_changes or build_repo_file_changes(repo_path=repo_path, previous_state=previous_state)
 
         file_metrics, scan_stats, state_rows = await self.scan(
@@ -56,8 +56,8 @@ class PreIngestionAnalysisStage:
             file_changes=file_changes,
             previous_state=previous_state,
         )
-        mongo.upsert_repo_file_states(self.repo_name, state_rows)
-        mongo.delete_repo_file_states(self.repo_name, list(file_changes.deleted_files))
+        db_client.upsert_repo_file_states(self.repo_name, state_rows)
+        db_client.delete_repo_file_states(self.repo_name, list(file_changes.deleted_files))
 
         summary = self.summarize(file_metrics=file_metrics, scan_stats=scan_stats)
         summary.update(

@@ -17,9 +17,6 @@ cd "$ROOT_DIR"
 
 # --- prerequisites (we skip installing uv, per request) ---
 have uv || die "uv not found. Install uv first: https://docs.astral.sh/uv/"
-have docker || die "docker not found."
-docker compose version >/dev/null 2>&1 || die "docker compose not available."
-
 # --- ensure env file ---
 if [[ ! -f .env.local ]]; then
   if [[ -f .env.local.example ]]; then
@@ -40,10 +37,5 @@ set +a
 bold "Installing language servers..."
 bash "$ROOT_DIR/scripts/install_language_servers.sh"
 
-# --- start datastores ---
-if [[ -f docker-compose.yml ]]; then
-  bold "Starting MongoDB (docker compose --env-file .env.local up -d mongo)..."
-  docker compose --env-file .env.local up -d mongo
-else
-  warn "docker-compose.yml not found. Skipping datastore startup."
-fi
+mkdir -p data
+bold "SQLite datastore will be created at ${SQLITE_DB_PATH:-data/code_sense.sqlite3} on API startup."

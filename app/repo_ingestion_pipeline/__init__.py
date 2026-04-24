@@ -5,7 +5,7 @@ from typing import Optional
 from uuid import uuid4
 
 from ..models.data_model import IngestionJobStatus, IngestionStage, IngestionStageStatus
-from ..db import get_mongo_client
+from ..db import get_db_client
 from ..llm_grok import GrokLLM
 from .file_state import build_repo_file_changes
 from .mental_model_gen import MentalModelStage
@@ -17,12 +17,12 @@ async def start_ingestion_pipeline(
     job_id: Optional[str] = None,
 ) -> dict[str, str]:
     try:
-        mongo = get_mongo_client()
+        db_client = get_db_client()
         llm = GrokLLM()
 
         job_id = job_id or str(uuid4())
 
-        mongo.upsert_ingestion_job(
+        db_client.upsert_ingestion_job(
             IngestionJobStatus(
                 job_id=job_id,
                 repo_name=repo_name,
@@ -35,13 +35,13 @@ async def start_ingestion_pipeline(
             )
         )
 
-        previous_state = mongo.get_repo_file_states(repo_name)
+        previous_state = db_client.get_repo_file_states(repo_name)
         file_changes_obj = build_repo_file_changes(local_repo_path, previous_state)
         file_changes = asdict(file_changes_obj)
 
         # ---------- PRECHECK ----------
         try:
-            mongo.upsert_ingestion_job(
+            db_client.upsert_ingestion_job(
                 IngestionJobStatus(
                     job_id=job_id,
                     repo_name=repo_name,
@@ -69,7 +69,7 @@ async def start_ingestion_pipeline(
                 }
             )
 
-            mongo.upsert_ingestion_job(
+            db_client.upsert_ingestion_job(
                 IngestionJobStatus(
                     job_id=job_id,
                     repo_name=repo_name,
@@ -85,7 +85,7 @@ async def start_ingestion_pipeline(
             )
 
         except PreIngestionAnalysisError as pie:
-            mongo.upsert_ingestion_job(
+            db_client.upsert_ingestion_job(
                 IngestionJobStatus(
                     job_id=job_id,
                     repo_name=repo_name,
@@ -102,7 +102,7 @@ async def start_ingestion_pipeline(
             )
             return
         except Exception as e:
-            mongo.upsert_ingestion_job(
+            db_client.upsert_ingestion_job(
                 IngestionJobStatus(
                     job_id=job_id,
                     repo_name=repo_name,
@@ -121,7 +121,7 @@ async def start_ingestion_pipeline(
 
         # ---------- MENTAL MODEL ----------
         try:
-            mongo.upsert_ingestion_job(
+            db_client.upsert_ingestion_job(
                 IngestionJobStatus(
                     job_id=job_id,
                     repo_name=repo_name,
@@ -140,7 +140,7 @@ async def start_ingestion_pipeline(
                 file_changes=file_changes,
             )
 
-            mongo.upsert_ingestion_job(
+            db_client.upsert_ingestion_job(
                 IngestionJobStatus(
                     job_id=job_id,
                     repo_name=repo_name,
@@ -159,7 +159,7 @@ async def start_ingestion_pipeline(
                 )
             )
         except Exception as e:
-            mongo.upsert_ingestion_job(
+            db_client.upsert_ingestion_job(
                 IngestionJobStatus(
                     job_id=job_id,
                     repo_name=repo_name,
@@ -177,10 +177,10 @@ async def start_ingestion_pipeline(
             return
 
         # ---------- COMPLETION ----------
-        mongo.add_ingested_repo(repo_name=repo_name, job_id=job_id)
+        db_client.add_ingested_repo(repo_name=repo_name, job_id=job_id)
 
         return {"status": "completed", "job_id": job_id}
 
     except asyncio.CancelledError:
-        mongo.cancel_active_ingestion_jobs(f"Ingestion cancelled: job {job_id} interrupted")
+        db_client.cancel_active_ingestion_jobs(f"Ingestion cancelled: job {job_id} interrupted")
         raise

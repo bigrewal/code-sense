@@ -22,15 +22,7 @@ def mock_config():
     config.NEO4J_CONNECTION_TIMEOUT = 30
     config.NEO4J_BATCH_SIZE = 1000
 
-    config.MONGO_URI = "mongodb://testuser:testpassword@localhost:27018"
-    config.MONGO_DB_NAME = "test_code_comprehension"
-    config.MONGO_MAX_POOL_SIZE = 50
-    config.MONGO_MIN_POOL_SIZE = 10
-    config.MONGO_MAX_IDLE_TIME_MS = 300000
-    config.MONGO_SERVER_SELECTION_TIMEOUT_MS = 30000
-    config.MONGO_CONNECT_TIMEOUT_MS = 20000
-    config.MONGO_SOCKET_TIMEOUT_MS = 300000
-
+    config.SQLITE_DB_PATH = ":memory:"
     config.LOG_DB_QUERIES = False
 
     return config
@@ -50,14 +42,14 @@ def reset_singletons():
     if hasattr(db, 'Neo4jClient'):
         db.Neo4jClient._instance = None
 
-    # Reset MyMongoClient singleton
-    if hasattr(db, 'MyMongoClient'):
-        db.MyMongoClient._instance = None
+    # Reset database singleton
+    if hasattr(db, 'SQLiteClient'):
+        db.SQLiteClient._instance = None
 
     yield
 
     # Cleanup after test
     if hasattr(db, 'Neo4jClient'):
         db.Neo4jClient._instance = None
-    if hasattr(db, 'MyMongoClient'):
-        db.MyMongoClient._instance = None
+    if hasattr(db, 'SQLiteClient'):
+        db.SQLiteClient._instance = None

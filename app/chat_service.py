@@ -6,33 +6,20 @@ import asyncio
 from datetime import datetime, timezone
 import json
 import logging
-import re
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
-from bson import ObjectId
 from pydantic import BaseModel, Field
 
-from .db import get_mongo_client
+from .db import get_db_client
 from .llm_grok import GrokLLM
 from .tools.fetch_code_file import fetch_code_file
 
-MENTAL_MODEL_COL = "mental_model"
-CONVERSATIONS_COL = "conversations"
-MESSAGES_COL = "messages"
 MESSAGE_TYPE_CHAT = "chat_message"
 MESSAGE_TYPE_PROGRESS = "progress_event"
 logger = logging.getLogger(__name__)
 
 llm = GrokLLM()
 
-
-def _collections():
-    mongo = get_mongo_client()
-    return (
-        mongo[MENTAL_MODEL_COL],
-        mongo[CONVERSATIONS_COL],
-        mongo[MESSAGES_COL],
-    )
 
 class FileSelection(BaseModel):
     file_path: str
@@ -68,27 +55,18 @@ class ChatEventRecorder:
         if not self.conversation_id:
             return
 
-        _mental_model_col, conversations_col, messages_col = _collections()
+        db_client = get_db_client()
         timestamp = created_at or _utc_now()
-        doc = {
-            "conversation_id": self.conversation_id,
-            "role": role,
-            "content": content,
-            "message_type": message_type,
-            "created_at": timestamp,
-        }
-        if stage:
-            doc["stage"] = stage
-        if status:
-            doc["status"] = status
-        if metadata:
-            doc["metadata"] = metadata
-
-        await asyncio.to_thread(messages_col.insert_one, doc)
         await asyncio.to_thread(
-            conversations_col.update_one,
-            {"_id": ObjectId(self.conversation_id)},
-            {"$set": {"updated_at": timestamp}},
+            db_client.persist_message,
+            conversation_id=self.conversation_id,
+            role=role,
+            content=content,
+            message_type=message_type,
+            stage=stage,
+            status=status,
+            metadata=metadata or {},
+            created_at=timestamp,
         )
 
     async def persist_chat_message(self, *, role: str, content: str) -> None:
@@ -157,23 +135,16 @@ class ChatEventRecorder:
 # ---------------------------
 
 async def stream_chat(conversation_id: str, user_message: str):
-    _mental_model_col, conversations_col, messages_col = _collections()
+    db_client = get_db_client()
     recorder = ChatEventRecorder(conversation_id=conversation_id)
-    conv = await asyncio.to_thread(conversations_col.find_one, {"_id": ObjectId(conversation_id)})
+    conv = await asyncio.to_thread(db_client.get_conversation, conversation_id)
     if not conv:
         yield recorder.emit_error("Conversation not found.")
         return
 
     repo_name = conv["repo_name"]
 
-    history_cursor = messages_col.find(
-        {
-            "conversation_id": conversation_id,
-            "message_type": {"$ne": MESSAGE_TYPE_PROGRESS},
-        }
-    ).sort("created_at", 1)
-
-    history_docs = await asyncio.to_thread(list, history_cursor)
+    history_docs = await asyncio.to_thread(db_client.list_chat_history, conversation_id)
     messages_for_llm: List[Dict[str, str]] = [
         {"role": m["role"], "content": m["content"]}
         for m in history_docs
@@ -294,7 +265,7 @@ async def get_rephrased_question(messages: List[Dict[str, str]], repo_name: str)
 
 
 async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[Dict[str, Any], None]:
-    mental_model_col, _conversations_col, _messages_col = _collections()
+    db_client = get_db_client()
 
     async def _select_files_for_query(
         repo_context: str,
@@ -545,12 +516,7 @@ async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[Di
         "message": "Selecting relevant files",
         "metadata": {},
     }
-    arch_doc = await asyncio.to_thread(
-        mental_model_col.find_one,
-        {"repo_name": repo_name, "document_type": "REPO_CONTEXT"},
-        {"_id": 0, "context": 1},
-    )
-    repo_context = (arch_doc or {}).get("context", "")
+    repo_context = await asyncio.to_thread(db_client.get_repo_context, repo_name)
 
     additional_info_required_task = asyncio.create_task(
         _select_files_for_query(repo_context=repo_context)

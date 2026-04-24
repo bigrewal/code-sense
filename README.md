@@ -57,11 +57,11 @@ Search-based approaches inevitably expose the model to only a small subset of th
 
 * **Pre-ingestion analysis**: scans files, filters directories, estimates size/budget, and persists supported-file state for incremental re-ingestion.
 * **Mental model generation**: uses source code plus an LLM to produce short file-level briefs and criticality labels.
-* **Repo context builder**: assembles a **global repo context** from critical-file briefs, then stores it in MongoDB.
+* **Repo context builder**: assembles a **global repo context** from critical-file briefs, then stores it in SQLite.
 
 **Storage**
 
-* **MongoDB**: ingestion jobs, supported-file state, file briefs, and global repo context
+* **SQLite**: ingestion jobs, supported-file state, file briefs, chat history, and global repo context
 
 
 ## Evaluation
@@ -131,7 +131,7 @@ Make sure you have **Docker** and **Docker Compose** installed.
    git clone https://github.com/cyberlis/dictquery.git data/dictquery
    ```
 
-3. Start the full stack (API + MongoDB):
+3. Start the API:
 
    ```bash
    docker compose up --build
@@ -140,7 +140,7 @@ Make sure you have **Docker** and **Docker Compose** installed.
 4. Verify:
 
    * API docs: http://localhost:8000/docs#/
-   * MongoDB: `mongodb://localhost:27017`
+   * SQLite database: `data/code_sense.sqlite3`
 
 5. Optional UI:
 
@@ -154,7 +154,7 @@ Make sure you have **Docker** and **Docker Compose** installed.
 
 ### Option B: Host development workflow
 
-Make sure you have **Docker**, **Docker Compose**, and **`uv`** installed.
+Make sure you have **`uv`** installed.
 
 1. Install dependencies and create the virtual environment:
 
@@ -173,19 +173,13 @@ Make sure you have **Docker**, **Docker Compose**, and **`uv`** installed.
 
    * `XAI_API_KEY`
 
-3. Start MongoDB:
-
-   ```bash
-   docker compose up -d mongo
-   ```
-
-4. Run the API:
+3. Run the API:
 
    ```bash
    uv run uvicorn app.main:app --reload
    ```
 
-5. Verify API docs at http://localhost:8000/docs#/
+4. Verify API docs at http://localhost:8000/docs#/
 
 
 ---
@@ -201,7 +195,7 @@ Make sure you have **Docker**, **Docker Compose**, and **`uv`** installed.
 
 ### Shutdown Services
 
-To stop the Docker stack (API + MongoDB):
+To stop the Docker stack:
 
 ```bash
 docker compose down
@@ -218,11 +212,10 @@ docker compose down -v
 **Hard requirements**
 
 * `XAI_API_KEY`
-* A reachable MongoDB instance
 * A repository checked out under `data/`
+* Optional: `SQLITE_DB_PATH` (defaults to `data/code_sense.sqlite3`)
 
 **Endpoints**
 
 * API: [http://localhost:8000](http://localhost:8000)
-* MongoDB: mongodb://localhost:27017
 * CodeSense UI: http://localhost:5173/

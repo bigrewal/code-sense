@@ -8,7 +8,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from tqdm import tqdm
 
 from ..config import Config
-from ..db import get_mongo_client
+from ..db import get_db_client
 from ..llm_grok import GrokLLM
 
 logger = logging.getLogger(__name__)
@@ -65,8 +65,7 @@ class MentalModelStage:
 
     def __init__(self, llm_grok: GrokLLM, config: Optional[dict] = None):
         config = config or {}
-        self.mongo_client = get_mongo_client()
-        self.mental_model_collection = self.mongo_client["mental_model"]
+        self.db_client = get_db_client()
         self.llm_client = llm_grok
         self.job_id = config.get("job_id", "unknown")
         self.batch_size = int(config.get("batch_size", 20))
@@ -130,14 +129,11 @@ class MentalModelStage:
                 logger.warning("Job %s: unable to read %s; marking ignored", self.job_id, file_path)
                 return file_path, "IGNORE", None, None
 
-            cached = self.mental_model_collection.find_one(
-                {
-                    "repo_name": repo_name,
-                    "file_path": file_path,
-                    "document_type": {"$in": [MENTAL_MODEL_TYPES["BRIEF"], MENTAL_MODEL_TYPES["IGNORED"]]},
-                    "sha1": sha1,
-                },
-                {"_id": 0, "data": 1},
+            cached = self.db_client.find_mental_model_document(
+                repo_name=repo_name,
+                file_path=file_path,
+                document_types=[MENTAL_MODEL_TYPES["BRIEF"], MENTAL_MODEL_TYPES["IGNORED"]],
+                sha1=sha1,
             )
             if cached:
                 return file_path, cached["data"], code, sha1
@@ -195,39 +191,29 @@ class MentalModelStage:
         return insights, ignored
 
     async def create_repo_context(self, repo_name: str) -> int:
-        critical_files = set(self.mongo_client.get_critical_file_paths(repo_name))
+        critical_files = set(self.db_client.get_critical_file_paths(repo_name))
         context_parts: list[str] = []
 
         for file_path in critical_files:
-            brief = self.mongo_client.get_brief_file_overview(repo_name, file_path)
+            brief = self.db_client.get_brief_file_overview(repo_name, file_path)
             if brief:
                 context_parts.append(brief)
 
         repo_context = "\n\n".join(context_parts)
         repo_context_token_count = self.llm_client.count_tokens(repo_context)
 
-        doc = {
-            "repo_name": repo_name,
-            "document_type": "REPO_CONTEXT",
-            "context": repo_context,
-        }
-        self.mental_model_collection.update_one(
-            {
-                "repo_name": repo_name,
-                "document_type": "REPO_CONTEXT",
-            },
-            {"$set": doc},
-            upsert=True,
-        )
+        self.db_client.upsert_repo_context(repo_name, repo_context)
 
         return repo_context_token_count
 
     def _get_repo_file_classification_counts(self, repo_name: str) -> tuple[int, int]:
-        critical_total = self.mental_model_collection.count_documents(
-            {"repo_name": repo_name, "document_type": MENTAL_MODEL_TYPES["BRIEF"]}
+        critical_total = self.db_client.count_mental_model_documents(
+            repo_name=repo_name,
+            document_type=MENTAL_MODEL_TYPES["BRIEF"],
         )
-        ignored_total = self.mental_model_collection.count_documents(
-            {"repo_name": repo_name, "document_type": MENTAL_MODEL_TYPES["IGNORED"]}
+        ignored_total = self.db_client.count_mental_model_documents(
+            repo_name=repo_name,
+            document_type=MENTAL_MODEL_TYPES["IGNORED"],
         )
         return critical_total, ignored_total
 
@@ -254,23 +240,19 @@ class MentalModelStage:
 
     def _upsert_document(self, document: Dict):
         """Persist a mental model document via upsert."""
-        self.mental_model_collection.update_one(
-            {
-                "repo_name": document["repo_name"],
-                "file_path": document["file_path"],
-                "document_type": document["document_type"],
-            },
-            {"$set": document},
-            upsert=True,
+        self.db_client.upsert_mental_model_document(
+            repo_name=document["repo_name"],
+            file_path=document["file_path"],
+            document_type=document["document_type"],
+            data=document["data"],
+            sha1=document.get("sha1"),
         )
 
     def _replace_file_document(self, repo_name: str, file_path: str, doc_type: str, data: str, sha1: str):
-        self.mental_model_collection.delete_many(
-            {
-                "repo_name": repo_name,
-                "file_path": file_path,
-                "document_type": {"$in": [MENTAL_MODEL_TYPES["BRIEF"], MENTAL_MODEL_TYPES["IGNORED"]]},
-            }
+        self.db_client.delete_mental_model_documents(
+            repo_name=repo_name,
+            file_paths=[file_path],
+            document_types=[MENTAL_MODEL_TYPES["BRIEF"], MENTAL_MODEL_TYPES["IGNORED"]],
         )
         self._upsert_document(
             {
@@ -289,12 +271,10 @@ class MentalModelStage:
     ):
         if not deleted_files:
             return
-        self.mental_model_collection.delete_many(
-            {
-                "repo_name": repo_name,
-                "file_path": {"$in": deleted_files},
-                "document_type": {"$in": [MENTAL_MODEL_TYPES["BRIEF"], MENTAL_MODEL_TYPES["IGNORED"]]},
-            }
+        self.db_client.delete_mental_model_documents(
+            repo_name=repo_name,
+            file_paths=deleted_files,
+            document_types=[MENTAL_MODEL_TYPES["BRIEF"], MENTAL_MODEL_TYPES["IGNORED"]],
         )
 
     def _select_files_to_process(
@@ -311,12 +291,9 @@ class MentalModelStage:
         selected.update(file_changes.get("changed_files", []) if file_changes else [])
 
         # Backfill missing mental-model docs even when there are no file deltas.
-        existing = self.mental_model_collection.find(
-            {
-                "repo_name": repo_name,
-                "document_type": {"$in": [MENTAL_MODEL_TYPES["BRIEF"], MENTAL_MODEL_TYPES["IGNORED"]]},
-            },
-            {"_id": 0, "file_path": 1},
+        existing = self.db_client.list_mental_model_documents(
+            repo_name=repo_name,
+            document_types=[MENTAL_MODEL_TYPES["BRIEF"], MENTAL_MODEL_TYPES["IGNORED"]],
         )
         documented_files = {doc.get("file_path") for doc in existing if doc.get("file_path")}
         for path in all_files:
