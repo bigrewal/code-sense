@@ -40,7 +40,7 @@ PROMPT_USER_TEMPLATE = """
 
     Instructions:
     - If NOT critical, output exactly: IGNORE
-    - If CRITICAL, output one concise paragraph in this exact 3-sentence format:
+    - If CRITICAL, output one concise paragraph in this exact format:
 
     "`{file_path}` <what this file does and why it exists>. It does this by <how it works end-to-end, explicitly naming every major component/function/class defined in this file and each component's role>. It interacts upstream with <key files/modules that call or depend on this file> and downstream with <key files/modules/services this file calls or depends on>."
 
