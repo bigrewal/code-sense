@@ -110,49 +110,7 @@ I believe this is a meaningful step toward more robust, doc-independent reposito
 
 ## Run Locally
 
-### Option A: Docker-first (recommended)
-
-Make sure you have **Docker** and **Docker Compose** installed.
-
-1. Create your local environment file:
-
-   ```bash
-   cp .env.local.example .env.local
-   ```
-
-   Then set:
-
-   * `XAI_API_KEY`
-
-2. Create `data/` and clone a repo to ingest. For example:
-
-   ```bash
-   mkdir -p data
-   git clone https://github.com/cyberlis/dictquery.git data/dictquery
-   ```
-
-3. Start the API:
-
-   ```bash
-   docker compose up --build
-   ```
-
-4. Verify:
-
-   * API docs: http://localhost:8000/docs#/
-   * SQLite database: `data/code_sense.sqlite3`
-
-5. Optional UI:
-
-   ```bash
-   git clone https://github.com/bigrewal/code-sense-ui
-   cd code-sense-ui
-   npm install
-   # Create .env.local and set VITE_API_BASE=http://localhost:8000
-   npm run dev
-   ```
-
-### Option B: Host development workflow
+### Host development workflow (recommended)
 
 Make sure you have **`uv`** installed.
 
@@ -173,13 +131,43 @@ Make sure you have **`uv`** installed.
 
    * `XAI_API_KEY`
 
-3. Run the API:
+3. Create `data/` and clone a repo to ingest. For example:
+
+   ```bash
+   mkdir -p data
+   git clone https://github.com/cyberlis/dictquery.git data/dictquery
+   ```
+
+4. Run the API:
 
    ```bash
    uv run uvicorn app.main:app --reload
    ```
 
-4. Verify API docs at http://localhost:8000/docs#/
+5. Verify:
+
+   * API docs: http://localhost:8000/docs#/
+   * SQLite database: `data/code_sense.sqlite3`
+
+6. Optional UI:
+
+   ```bash
+   git clone https://github.com/bigrewal/code-sense-ui
+   cd code-sense-ui
+   npm install
+   # Create .env.local and set VITE_API_BASE=http://localhost:8000
+   npm run dev
+   ```
+
+### Docker Compose workflow
+
+If you want to run the API in Docker instead:
+
+```bash
+cp .env.local.example .env.local
+mkdir -p data
+docker compose up --build
+```
 
 
 ---
@@ -195,7 +183,7 @@ Make sure you have **`uv`** installed.
 
 ### Shutdown Services
 
-To stop the Docker stack:
+To stop the Docker stack if you used Docker Compose:
 
 ```bash
 docker compose down
