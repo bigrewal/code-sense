@@ -2,11 +2,11 @@ import asyncio
 from dataclasses import dataclass
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from tqdm import tqdm
 from ..config import Config
-from ..db import get_mongo_client
+from ..db import get_db_client
 from ..llm_grok import GrokLLM
 from .file_state import RepoFileChanges, build_repo_file_changes
 
@@ -28,7 +28,7 @@ class PreIngestionAnalysisError(ValueError):
         self,
         message: str,
         *,
-        metrics: Optional[Dict[str, Any]] = None,
+        metrics: dict[str, Any] | None = None,
         code: str = "PRECHECK_FAILED",
     ):
         super().__init__(message)
@@ -44,11 +44,11 @@ class PreIngestionAnalysisStage:
     async def run(
         self,
         repo_path: Path,
-        file_changes: Optional[RepoFileChanges] = None,
-        previous_state: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        mongo = get_mongo_client()
-        previous_state = previous_state if previous_state is not None else mongo.get_repo_file_states(self.repo_name)
+        file_changes: RepoFileChanges | None = None,
+        previous_state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        db_client = get_db_client()
+        previous_state = previous_state if previous_state is not None else db_client.get_repo_file_states(self.repo_name)
         file_changes = file_changes or build_repo_file_changes(repo_path=repo_path, previous_state=previous_state)
 
         file_metrics, scan_stats, state_rows = await self.scan(
@@ -56,8 +56,8 @@ class PreIngestionAnalysisStage:
             file_changes=file_changes,
             previous_state=previous_state,
         )
-        mongo.upsert_repo_file_states(self.repo_name, state_rows)
-        mongo.delete_repo_file_states(self.repo_name, list(file_changes.deleted_files))
+        db_client.upsert_repo_file_states(self.repo_name, state_rows)
+        db_client.delete_repo_file_states(self.repo_name, list(file_changes.deleted_files))
 
         summary = self.summarize(file_metrics=file_metrics, scan_stats=scan_stats)
         summary.update(
@@ -75,10 +75,10 @@ class PreIngestionAnalysisStage:
         self,
         repo_path: Path,
         file_changes: RepoFileChanges,
-        previous_state: Dict[str, Any],
-    ) -> Tuple[List[FileMetric], Dict[str, Any], List[Dict[str, Any]]]:
-        metrics: List[FileMetric] = []
-        state_rows: List[Dict[str, Any]] = []
+        previous_state: dict[str, Any],
+    ) -> tuple[list[FileMetric], dict[str, Any], list[dict[str, Any]]]:
+        metrics: list[FileMetric] = []
+        state_rows: list[dict[str, Any]] = []
         total_files_seen = len(file_changes.current_files)
         total_files_tokenized = 0
         tokenization_errors = 0
@@ -161,9 +161,9 @@ class PreIngestionAnalysisStage:
         }
         return metrics, scan_stats, state_rows
 
-    def summarize(self, file_metrics: List[FileMetric], scan_stats: Dict[str, Any]) -> Dict[str, Any]:
-        tokens_by_lang: Dict[str, int] = {}
-        files_by_lang: Dict[str, int] = {}
+    def summarize(self, file_metrics: list[FileMetric], scan_stats: dict[str, Any]) -> dict[str, Any]:
+        tokens_by_lang: dict[str, int] = {}
+        files_by_lang: dict[str, int] = {}
 
         supported_tokens = 0
         supported_file_count = 0
@@ -177,12 +177,9 @@ class PreIngestionAnalysisStage:
             tokens_by_lang[m.language] = tokens_by_lang.get(m.language, 0) + m.tokens
             files_by_lang[m.language] = files_by_lang.get(m.language, 0) + 1
 
-            if m.supported:
-                supported_tokens += m.tokens
-                supported_file_count += 1
-            else:
-                # unsupported_tokens += m.tokens
-                unsupported_file_count += 1
+            supported_tokens += m.tokens if m.supported else 0
+            supported_file_count += int(m.supported)
+            unsupported_file_count += int(not m.supported)
 
         # Compute language distribution only for supported languages (more meaningful),
         # but keep unsupported/unknown visible separately.
@@ -204,44 +201,28 @@ class PreIngestionAnalysisStage:
             else {}
         )
 
-        single_language_dominant = False
-        if language_distribution_pct:
-            top_pct = max(language_distribution_pct.values())
-            single_language_dominant = top_pct >= 70.0
+        single_language_dominant = bool(language_distribution_pct) and max(language_distribution_pct.values()) >= 70.0
         
         total_files_seen = scan_stats.get("total_files_seen", 0)
         total_files_tokenized = scan_stats.get("total_files_tokenized", 0)
 
-
         return {
             "passes_precheck": True,
-
-            # High-level counts
             "total_files_seen": total_files_seen,
             "total_files_tokenized": total_files_tokenized,
             "tokenization_errors": scan_stats.get("tokenization_errors", 0),
-
             "excluded_file_count": scan_stats.get("excluded_file_count", 0),
             "excluded_paths_top": scan_stats.get("excluded_paths_top", []),
-
             "supported_file_count": supported_file_count,
             "unsupported_file_count": unsupported_file_count,
             "coverage_ratio": (total_files_tokenized / total_files_seen) if total_files_seen else 0,
-
-            # Token totals
             "supported_tokens": supported_tokens,
             "min_supported_cov_ratio": Config.min_supported_cov_ratio,
-
-            # Language insight
             "supported_languages": supported_langs,
             "primary_language": primary_language,
             "language_distribution_pct": language_distribution_pct,
-
-            # Raw breakdowns (still useful for debugging / power users)
             "tokens_by_lang": tokens_by_lang,
             "files_by_lang": files_by_lang,
-
-            # Outliers / cost drivers
             "max_file_tokens": max_file_tokens,
             "largest_files": [
                 {
@@ -252,14 +233,11 @@ class PreIngestionAnalysisStage:
                 }
                 for m in largest_files
             ],
-
-            # Quick heuristics
             "single_language_dominant": single_language_dominant,
-
             "recommendations": [],
         }
 
-    def validate(self, summary: Dict[str, Any]) -> None:
+    def validate(self, summary: dict[str, Any]) -> None:
         supported_tokens = int(summary.get("supported_tokens") or 0)
 
         if supported_tokens <= 0:

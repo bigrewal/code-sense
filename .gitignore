@@ -9,7 +9,7 @@ wheels/
 # Virtual environments
 .venv
 .env.local
-data/
+.codesense/
 evals/
 tests/evals/
 # macOS cruft

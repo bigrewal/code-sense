@@ -1,9 +1,7 @@
 import os
 from pathlib import Path
-from typing import List
 
 if Path(".env.local").exists():
-    # Optional local-only overrides; production should rely on env vars.
     from dotenv import load_dotenv
 
     load_dotenv(".env.local")
@@ -15,12 +13,16 @@ class Config:
     LLM_TEMPERATURE = 0.7
     LLM_MAX_TOKENS = 10240
 
-    # Base directory to store cloned repositories
-    BASE_REPO_DIR: str = "data"
+    BASE_REPO_DIR: str = os.getenv("BASE_REPO_DIR", ".codesense/repos")
 
-    # MongoDB Configuration
-    MONGO_URI: str = os.getenv("MONGO_URI")
-    MONGO_DB_NAME: str = "code_comprehension"
+    REPO_BROWSER_ROOTS: list[str] = [
+        root.strip()
+        for root in os.getenv("REPO_BROWSER_ROOTS", str(Path.home())).split(",")
+        if root.strip()
+    ]
+    REPO_BROWSER_MAX_ENTRIES: int = int(os.getenv("REPO_BROWSER_MAX_ENTRIES", "500"))
+
+    SQLITE_DB_PATH: str = os.getenv("SQLITE_DB_PATH", ".codesense/code_sense.sqlite3")
 
     IGNORE_FOLDERS: set[str] = {
         "test",
@@ -78,54 +80,24 @@ class Config:
 
     min_supported_cov_ratio: float = 0.5
 
-    # ========== Database Connection Pool Configuration ==========
-
-    # MongoDB Connection Pool Settings
-    MONGO_MAX_POOL_SIZE: int = int(os.getenv("MONGO_MAX_POOL_SIZE", "50"))
-    MONGO_MIN_POOL_SIZE: int = int(os.getenv("MONGO_MIN_POOL_SIZE", "10"))
-    MONGO_MAX_IDLE_TIME_MS: int = int(
-        os.getenv("MONGO_MAX_IDLE_TIME_MS", "300000")
-    ) 
-    MONGO_SERVER_SELECTION_TIMEOUT_MS: int = int(
-        os.getenv("MONGO_SERVER_SELECTION_TIMEOUT_MS", "30000")
-    )
-    MONGO_CONNECT_TIMEOUT_MS: int = int(
-        os.getenv("MONGO_CONNECT_TIMEOUT_MS", "20000")
-    )
-    MONGO_SOCKET_TIMEOUT_MS: int = int(
-        os.getenv("MONGO_SOCKET_TIMEOUT_MS", "300000")
-    )
-
-    # ========== Security ==========
-
-    # Disable query logging in production for security
     LOG_DB_QUERIES: bool = os.getenv("LOG_DB_QUERIES", "false").lower() == "true"
 
-    # CORS allowed origins
-    ALLOWED_ORIGINS: List[str] = os.getenv(
+    ALLOWED_ORIGINS: list[str] = os.getenv(
         "ALLOWED_ORIGINS",
         "http://localhost:5173,http://localhost:8000"
     ).split(",")
 
-    DB_OPERATION_TIMEOUT: int = int(os.getenv("DB_OPERATION_TIMEOUT", "30"))  # 30s
+    DB_OPERATION_TIMEOUT: int = int(os.getenv("DB_OPERATION_TIMEOUT", "30"))
 
 
 def validate_required_settings() -> None:
     """Fail fast with a clear list of missing required environment values."""
-    # Check required environment variables
     required = {
         "XAI_API_KEY": Config.XAI_API_KEY,
-        "MONGO_URI": Config.MONGO_URI,
+        "SQLITE_DB_PATH": Config.SQLITE_DB_PATH,
     }
     missing = [name for name, value in required.items() if not value]
     if missing:
         raise RuntimeError(
             f"Missing required environment variables: {', '.join(missing)}"
-        )
-
-    # Validate numeric ranges for database configuration
-    if Config.MONGO_MAX_POOL_SIZE < Config.MONGO_MIN_POOL_SIZE:
-        raise ValueError(
-            f"MONGO_MAX_POOL_SIZE ({Config.MONGO_MAX_POOL_SIZE}) must be >= "
-            f"MONGO_MIN_POOL_SIZE ({Config.MONGO_MIN_POOL_SIZE})"
         )

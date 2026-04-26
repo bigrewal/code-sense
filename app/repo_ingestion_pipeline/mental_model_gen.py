@@ -3,12 +3,11 @@ import hashlib
 import logging
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
 
 from tqdm import tqdm
 
 from ..config import Config
-from ..db import get_mongo_client
+from ..db import get_db_client
 from ..llm_grok import GrokLLM
 
 logger = logging.getLogger(__name__)
@@ -26,8 +25,8 @@ PROMPT_SYSTEM = (
     "A file is NOT critical if it is primarily tests, fixtures, docs, examples, demos, generated code, config-only, or thin wrappers with no meaningful domain behavior.\n\n"
     "If NOT critical, output exactly: IGNORE\n\n"
     "If the file is critical, output exactly a concise summary using the required sentence template.\n"
-    "Be factual and concise. Use evidence from code and dependency context.\n"
-    "If dependency context is unavailable or empty, infer the most likely upstream/downstream relationships from the code itself rather than assuming there are none.\n"
+    "Be factual and concise. Use evidence from the code and surrounding repository structure.\n"
+    "Infer the most likely upstream/downstream relationships with the other source files from imports, exports, call sites, framework conventions, and surrounding code structure rather than assuming there are none.\n"
     "No bullets, no markdown, no extra commentary."
 )
 
@@ -38,15 +37,9 @@ PROMPT_USER_TEMPLATE = """
     Code:
     {code}
 
-    Upstream dependencies (who calls/uses this file):
-    {upstream}
-
-    Downstream dependencies (what this file calls/uses):
-    {downstream}
-
     Instructions:
     - If NOT critical, output exactly: IGNORE
-    - If CRITICAL, output one concise paragraph in this exact 3-sentence format:
+    - If CRITICAL, output one concise paragraph in this exact format:
 
     "`{file_path}` <what this file does and why it exists>. It does this by <how it works end-to-end, explicitly naming every major component/function/class defined in this file and each component's role>. It interacts upstream with <key files/modules that call or depend on this file> and downstream with <key files/modules/services this file calls or depends on>."
 
@@ -54,7 +47,6 @@ PROMPT_USER_TEMPLATE = """
     - Keep it very concise: 100-200 words total.
     - Mention concrete identifiers when available.
     - The second sentence must mention every major component in this file.
-    - If an upstream/downstream section says dependency interaction data is unavailable, infer the likely relationship from imports, exports, call sites, framework conventions, and surrounding code structure.
     - Do not claim there are no upstream/downstream interactions unless the code itself clearly supports that conclusion.
     - No bullets, no markdown, no extra text.
     """.strip()
@@ -63,10 +55,9 @@ PROMPT_USER_TEMPLATE = """
 class MentalModelStage:
     """Stage for generating and storing the hierarchical mental model."""
 
-    def __init__(self, llm_grok: GrokLLM, config: Optional[dict] = None):
+    def __init__(self, llm_grok: GrokLLM, config: dict | None = None):
         config = config or {}
-        self.mongo_client = get_mongo_client()
-        self.mental_model_collection = self.mongo_client["mental_model"]
+        self.db_client = get_db_client()
         self.llm_client = llm_grok
         self.job_id = config.get("job_id", "unknown")
         self.batch_size = int(config.get("batch_size", 20))
@@ -76,7 +67,7 @@ class MentalModelStage:
         self,
         repo_name: str,
         local_repo_path: Path,
-        file_changes: Optional[dict] = None,
+        file_changes: dict | None = None,
     ):
         self.repo_name = repo_name
         self.local_repo_path = local_repo_path
@@ -113,14 +104,13 @@ class MentalModelStage:
 
     async def identify_critical_files(
         self,
-        dir_tree: List[str],
+        dir_tree: list[str],
         repo_name: str,
-    ) -> Tuple[List[Dict[str, str]], Set[str]]:
-        """Generate a comprehensive overview of the repo by summarizing critical files, ignoring non-critical ones."""
+    ) -> tuple[list[dict[str, str]], set[str]]:
 
         semaphore = asyncio.Semaphore(self.max_concurrency)
 
-        async def summarize_file(file_path: str) -> tuple[str, str, str | None, str | None]:
+        async def summarize_file(file_path: str) -> tuple[str, str, str | None]:
             try:
                 full_path = self.local_repo_path / file_path
                 code_bytes = full_path.read_bytes()
@@ -128,33 +118,21 @@ class MentalModelStage:
                 sha1 = hashlib.sha1(code_bytes).hexdigest()
             except Exception:
                 logger.warning("Job %s: unable to read %s; marking ignored", self.job_id, file_path)
-                return file_path, "IGNORE", None, None
+                return file_path, "IGNORE", None
 
-            cached = self.mental_model_collection.find_one(
-                {
-                    "repo_name": repo_name,
-                    "file_path": file_path,
-                    "document_type": {"$in": [MENTAL_MODEL_TYPES["BRIEF"], MENTAL_MODEL_TYPES["IGNORED"]]},
-                    "sha1": sha1,
-                },
-                {"_id": 0, "data": 1},
+            cached = self.db_client.find_mental_model_document(
+                repo_name=repo_name,
+                file_path=file_path,
+                document_types=[MENTAL_MODEL_TYPES["BRIEF"], MENTAL_MODEL_TYPES["IGNORED"]],
+                sha1=sha1,
             )
             if cached:
-                return file_path, cached["data"], code, sha1
-
-            upstream_block = (
-                "Dependency interaction data is unavailable for this direction."
-            )
-            downstream_block = (
-                "Dependency interaction data is unavailable for this direction."
-            )
+                return file_path, cached["data"], sha1
 
             user_prompt = PROMPT_USER_TEMPLATE.format(
                 repo_name=repo_name,
                 file_path=file_path,
                 code=code,
-                upstream=upstream_block,
-                downstream=downstream_block,
             )
 
             async with semaphore:
@@ -164,12 +142,12 @@ class MentalModelStage:
                     temperature=0.0,
                     max_tokens=150,
                 )
-            return file_path, response.strip(), code, sha1
+            return file_path, response.strip(), sha1
 
         all_files = dir_tree
 
-        insights: List[Dict[str, str]] = []
-        ignored: Set[str] = set()
+        insights: list[dict[str, str]] = []
+        ignored: set[str] = set()
 
         pbar = tqdm(total=len(all_files), desc="Processing files")
 
@@ -178,7 +156,7 @@ class MentalModelStage:
             tasks = [summarize_file(fp) for fp in batch]
             results = await asyncio.gather(*tasks)
 
-            for fp, summary, _code, sha1 in results:
+            for fp, summary, sha1 in results:
                 if summary == "IGNORE":
                     ignored.add(fp)
                     if sha1:
@@ -195,44 +173,33 @@ class MentalModelStage:
         return insights, ignored
 
     async def create_repo_context(self, repo_name: str) -> int:
-        critical_files = set(self.mongo_client.get_critical_file_paths(repo_name))
+        critical_files = set(self.db_client.get_critical_file_paths(repo_name))
         context_parts: list[str] = []
 
         for file_path in critical_files:
-            brief = self.mongo_client.get_brief_file_overview(repo_name, file_path)
+            brief = self.db_client.get_brief_file_overview(repo_name, file_path)
             if brief:
                 context_parts.append(brief)
 
         repo_context = "\n\n".join(context_parts)
         repo_context_token_count = self.llm_client.count_tokens(repo_context)
 
-        doc = {
-            "repo_name": repo_name,
-            "document_type": "REPO_CONTEXT",
-            "context": repo_context,
-        }
-        self.mental_model_collection.update_one(
-            {
-                "repo_name": repo_name,
-                "document_type": "REPO_CONTEXT",
-            },
-            {"$set": doc},
-            upsert=True,
-        )
+        self.db_client.upsert_repo_context(repo_name, repo_context)
 
         return repo_context_token_count
 
     def _get_repo_file_classification_counts(self, repo_name: str) -> tuple[int, int]:
-        critical_total = self.mental_model_collection.count_documents(
-            {"repo_name": repo_name, "document_type": MENTAL_MODEL_TYPES["BRIEF"]}
+        critical_total = self.db_client.count_mental_model_documents(
+            repo_name=repo_name,
+            document_type=MENTAL_MODEL_TYPES["BRIEF"],
         )
-        ignored_total = self.mental_model_collection.count_documents(
-            {"repo_name": repo_name, "document_type": MENTAL_MODEL_TYPES["IGNORED"]}
+        ignored_total = self.db_client.count_mental_model_documents(
+            repo_name=repo_name,
+            document_type=MENTAL_MODEL_TYPES["IGNORED"],
         )
         return critical_total, ignored_total
 
-    def _build_dir_tree(self) -> List[str]:
-        """Build a list of code file paths by walking the repository."""
+    def _build_dir_tree(self) -> list[str]:
         code_files = []
         supported_extensions = set(Config.SUPPORTED_LANGUAGES.keys())
         ignore_folders = Config.IGNORE_FOLDERS
@@ -252,25 +219,20 @@ class MentalModelStage:
 
         return sorted(code_files)
 
-    def _upsert_document(self, document: Dict):
-        """Persist a mental model document via upsert."""
-        self.mental_model_collection.update_one(
-            {
-                "repo_name": document["repo_name"],
-                "file_path": document["file_path"],
-                "document_type": document["document_type"],
-            },
-            {"$set": document},
-            upsert=True,
+    def _upsert_document(self, document: dict):
+        self.db_client.upsert_mental_model_document(
+            repo_name=document["repo_name"],
+            file_path=document["file_path"],
+            document_type=document["document_type"],
+            data=document["data"],
+            sha1=document.get("sha1"),
         )
 
     def _replace_file_document(self, repo_name: str, file_path: str, doc_type: str, data: str, sha1: str):
-        self.mental_model_collection.delete_many(
-            {
-                "repo_name": repo_name,
-                "file_path": file_path,
-                "document_type": {"$in": [MENTAL_MODEL_TYPES["BRIEF"], MENTAL_MODEL_TYPES["IGNORED"]]},
-            }
+        self.db_client.delete_mental_model_documents(
+            repo_name=repo_name,
+            file_paths=[file_path],
+            document_types=[MENTAL_MODEL_TYPES["BRIEF"], MENTAL_MODEL_TYPES["IGNORED"]],
         )
         self._upsert_document(
             {
@@ -285,43 +247,37 @@ class MentalModelStage:
     def _delete_removed_artifacts(
         self,
         repo_name: str,
-        deleted_files: List[str],
+        deleted_files: list[str],
     ):
         if not deleted_files:
             return
-        self.mental_model_collection.delete_many(
-            {
-                "repo_name": repo_name,
-                "file_path": {"$in": deleted_files},
-                "document_type": {"$in": [MENTAL_MODEL_TYPES["BRIEF"], MENTAL_MODEL_TYPES["IGNORED"]]},
-            }
+        self.db_client.delete_mental_model_documents(
+            repo_name=repo_name,
+            file_paths=deleted_files,
+            document_types=[MENTAL_MODEL_TYPES["BRIEF"], MENTAL_MODEL_TYPES["IGNORED"]],
         )
 
     def _select_files_to_process(
         self,
         repo_name: str,
-        all_files: List[str],
-        file_changes: Optional[dict],
-    ) -> List[str]:
+        all_files: list[str],
+        file_changes: dict | None,
+    ) -> list[str]:
         if not file_changes:
             return all_files
 
-        selected: Set[str] = set()
-        selected.update(file_changes.get("new_files", []) if file_changes else [])
-        selected.update(file_changes.get("changed_files", []) if file_changes else [])
+        selected: set[str] = set()
+        selected.update(file_changes.get("new_files", []))
+        selected.update(file_changes.get("changed_files", []))
 
         # Backfill missing mental-model docs even when there are no file deltas.
-        existing = self.mental_model_collection.find(
-            {
-                "repo_name": repo_name,
-                "document_type": {"$in": [MENTAL_MODEL_TYPES["BRIEF"], MENTAL_MODEL_TYPES["IGNORED"]]},
-            },
-            {"_id": 0, "file_path": 1},
+        existing = self.db_client.list_mental_model_documents(
+            repo_name=repo_name,
+            document_types=[MENTAL_MODEL_TYPES["BRIEF"], MENTAL_MODEL_TYPES["IGNORED"]],
         )
         documented_files = {doc.get("file_path") for doc in existing if doc.get("file_path")}
         for path in all_files:
             if path not in documented_files:
                 selected.add(path)
 
-        allowed = set(all_files)
-        return sorted([p for p in selected if p in allowed])
+        return sorted(set(all_files) & selected)

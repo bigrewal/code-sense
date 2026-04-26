@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import grpc
 from xai_sdk import Client, AsyncClient
@@ -19,16 +19,13 @@ BASE_BACKOFF_SECONDS = 60
 
 
 def _is_rate_limit_error(exc: Exception) -> bool:
-    if isinstance(exc, grpc.RpcError):
-        if exc.code() == grpc.StatusCode.RESOURCE_EXHAUSTED:
-            return True
-
+    if isinstance(exc, grpc.RpcError) and exc.code() == grpc.StatusCode.RESOURCE_EXHAUSTED:
+        return True
     aio = getattr(grpc, "aio", None)
     if aio is not None and isinstance(exc, aio.AioRpcError) and exc.code() == grpc.StatusCode.RESOURCE_EXHAUSTED:
         return True
-
     msg = str(exc).lower()
-    return "429" in msg or "rate limit" in msg or "resource_exhausted" in msg
+    return any(marker in msg for marker in ("429", "rate limit", "resource_exhausted"))
 
 
 def _raise_api_error(exc: Exception, *, async_mode: bool = False) -> None:
@@ -51,34 +48,27 @@ def _normalise_content(content: Any) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        parts: List[str] = []
-        for part in content:
-            if isinstance(part, dict):
-                text = part.get("text")
-                if isinstance(text, str):
-                    parts.append(text)
-            else:
-                parts.append(str(part))
-        return "".join(parts)
+        return "".join(
+            part["text"]
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+            else str(part)
+            for part in content
+            if not isinstance(part, dict) or isinstance(part.get("text"), str)
+        )
     return str(content)
 
 
-def _convert_messages(messages: List[Any]) -> List[Any]:
-    converted: List[Any] = []
+def _convert_messages(messages: list[Any]) -> list[Any]:
+    converted: list[Any] = []
+    factories = {"system": system_message, "user": user_message, "assistant": assistant_message}
     for msg in messages:
         if not isinstance(msg, dict):
             converted.append(msg)
             continue
         role = msg.get("role")
-        content = _normalise_content(msg.get("content", ""))
-        if role == "system":
-            converted.append(system_message(content))
-        elif role == "user":
-            converted.append(user_message(content))
-        elif role == "assistant":
-            converted.append(assistant_message(content))
-        else:
+        if role not in factories:
             raise ValueError(f"Unsupported message role for xai-sdk: {role!r}")
+        converted.append(factories[role](_normalise_content(msg.get("content", ""))))
     return converted
 
 
@@ -86,64 +76,86 @@ def _build_message_objects(
     *,
     prompt: str,
     system_prompt: str,
-    messages: Optional[List[Any]] = None,
-) -> List[Any]:
+    messages: list[Any] | None = None,
+) -> list[Any]:
     if messages:
         return _convert_messages(messages)
-    message_objs: List[Any] = []
-    if system_prompt:
-        message_objs.append(system_message(system_prompt))
-    if prompt:
-        message_objs.append(user_message(prompt))
-    return message_objs
+    return [
+        message
+        for message in (
+            system_message(system_prompt) if system_prompt else None,
+            user_message(prompt) if prompt else None,
+        )
+        if message
+    ]
 
 
 def _chat_kwargs(
     *,
     model: str,
-    temperature: Optional[float],
-    max_tokens: Optional[int],
-    response_format: Optional[Dict[str, Any]],
-    reasoning_effort: Optional[str],
-    tools: Optional[list] = None,
-    tool_choice: Optional[str] = None,
-) -> Dict[str, Any]:
-    kwargs: Dict[str, Any] = {
+    temperature: float | None,
+    max_tokens: int | None,
+    response_format: dict[str, Any] | None,
+    reasoning_effort: str | None,
+    tools: list | None = None,
+    tool_choice: str | None = None,
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
         "model": model,
         "temperature": temperature if temperature is not None else Config.LLM_TEMPERATURE,
         "max_tokens": max_tokens if max_tokens is not None else Config.LLM_MAX_TOKENS,
     }
-    if tools:
-        kwargs["tools"] = tools
-    if tool_choice:
-        kwargs["tool_choice"] = tool_choice
-    if response_format:
-        kwargs["response_format"] = response_format
-    if reasoning_effort:
-        kwargs["reasoning_effort"] = reasoning_effort
+    kwargs.update(
+        {
+            key: value
+            for key, value in {
+                "tools": tools,
+                "tool_choice": tool_choice,
+                "response_format": response_format,
+                "reasoning_effort": reasoning_effort,
+            }.items()
+            if value
+        }
+    )
     return kwargs
 
 
 class GrokLLM:
     def __init__(self):
-        client_kwargs: Dict[str, Any] = {}
+        client_kwargs: dict[str, Any] = {}
         if hasattr(Config, "XAI_API_KEY"):
             client_kwargs["api_key"] = Config.XAI_API_KEY
         self.client = Client(**client_kwargs)
         self.async_client = AsyncClient(**client_kwargs)
+
+    def _handle_retry(self, exc: Exception, attempt: int, *, async_mode: bool = False) -> int:
+        if not _is_rate_limit_error(exc):
+            _raise_api_error(exc, async_mode=async_mode)
+        if attempt == MAX_ATTEMPTS - 1:
+            raise _rate_limit_exhausted(async_mode=async_mode) from exc
+        wait_time = _retry_delay(attempt)
+        mode = " (async)" if async_mode else ""
+        logger.info(
+            "Rate limit hit for Grok{}, waiting {} seconds before retry {}/{}",
+            mode,
+            wait_time,
+            attempt + 1,
+            MAX_ATTEMPTS,
+        )
+        return wait_time
 
     def _build_chat(
         self,
         model: str,
         prompt: str,
         system_prompt: str,
-        messages: Optional[List[Any]],
-        temperature: Optional[float],
-        max_tokens: Optional[int],
-        response_format: Optional[Dict[str, Any]],
-        reasoning_effort: Optional[str],
-        tools: Optional[list],
-        tool_choice: Optional[str],
+        messages: list[Any] | None,
+        temperature: float | None,
+        max_tokens: int | None,
+        response_format: dict[str, Any] | None,
+        reasoning_effort: str | None,
+        tools: list | None,
+        tool_choice: str | None,
     ):
         message_objs = _build_message_objects(prompt=prompt, system_prompt=system_prompt, messages=messages)
         logger.debug("Total input tokens for GrokLLM: {}", sum(len(m.content or "") for m in message_objs) // 4)
@@ -166,15 +178,15 @@ class GrokLLM:
         self,
         prompt: str = "",
         system_prompt: str = "",
-        max_tokens: Optional[int] = None,
-        temperature: Optional[float] = None,
-        response_format: Optional[Dict[str, Any]] = None,
-        reasoning_effort: Optional[str] = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        response_format: dict[str, Any] | None = None,
+        reasoning_effort: str | None = None,
         model: str = Config.GROK_4_NON_REASONING_MODEL,
         stream: bool = False,
-        tools: Optional[list] = None,
+        tools: list | None = None,
         tool_choice: str = None,
-        messages: Optional[List[Any]] = None,
+        messages: list[Any] | None = None,
         return_raw: bool = False,
     ) -> Any:
         for attempt in range(MAX_ATTEMPTS):
@@ -196,13 +208,7 @@ class GrokLLM:
                 response = chat.sample()
                 return response if return_raw else (response.content or "").strip()
             except Exception as exc:
-                if not _is_rate_limit_error(exc):
-                    _raise_api_error(exc)
-                if attempt == MAX_ATTEMPTS - 1:
-                    raise _rate_limit_exhausted() from exc
-                wait_time = _retry_delay(attempt)
-                logger.info("Rate limit hit for Grok, waiting {} seconds before retry {}/{}", wait_time, attempt + 1, MAX_ATTEMPTS)
-                time.sleep(wait_time)
+                time.sleep(self._handle_retry(exc, attempt))
 
     def count_tokens(self, text: str) -> int:
         for attempt in range(MAX_ATTEMPTS):
@@ -210,22 +216,16 @@ class GrokLLM:
                 tokens = self.client.tokenize.tokenize_text(model=Config.GROK_4_NON_REASONING_MODEL, text=text)
                 return len(tokens)
             except Exception as exc:
-                if not _is_rate_limit_error(exc):
-                    _raise_api_error(exc)
-                if attempt == MAX_ATTEMPTS - 1:
-                    raise _rate_limit_exhausted() from exc
-                wait_time = _retry_delay(attempt)
-                logger.info("Rate limit hit for Grok, waiting {} seconds before retry {}/{}", wait_time, attempt + 1, MAX_ATTEMPTS)
-                time.sleep(wait_time)
+                time.sleep(self._handle_retry(exc, attempt))
 
     async def generate_async(
         self,
         prompt: str,
         system_prompt: str = "",
-        max_tokens: Optional[int] = None,
-        temperature: Optional[float] = None,
-        response_format: Optional[Dict[str, Any]] = None,
-        reasoning_effort: Optional[str] = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        response_format: dict[str, Any] | None = None,
+        reasoning_effort: str | None = None,
         model: str = Config.GROK_4_NON_REASONING_MODEL,
     ) -> str:
         for attempt in range(MAX_ATTEMPTS):
@@ -245,15 +245,4 @@ class GrokLLM:
                 response = await chat.sample()
                 return (response.content or "").strip()
             except Exception as exc:
-                if not _is_rate_limit_error(exc):
-                    _raise_api_error(exc, async_mode=True)
-                if attempt == MAX_ATTEMPTS - 1:
-                    raise _rate_limit_exhausted(async_mode=True) from exc
-                wait_time = _retry_delay(attempt)
-                logger.info(
-                    "Rate limit hit for Grok (async), waiting {} seconds before retry {}/{}",
-                    wait_time,
-                    attempt + 1,
-                    MAX_ATTEMPTS,
-                )
-                await asyncio.sleep(wait_time)
+                await asyncio.sleep(self._handle_retry(exc, attempt, async_mode=True))

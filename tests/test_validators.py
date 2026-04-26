@@ -2,7 +2,13 @@
 
 import pytest
 from fastapi import HTTPException
-from app.validators import validate_repo_name, validate_conversation_id, validate_job_id
+from app.validators import (
+    derive_repo_name_from_path,
+    validate_repo_name,
+    validate_repo_path,
+    validate_conversation_id,
+    validate_job_id,
+)
 
 
 class TestValidateRepoName:
@@ -39,6 +45,28 @@ class TestValidateRepoName:
             validate_repo_name("a" * 256)
         assert exc_info.value.status_code == 400
         assert "too long" in str(exc_info.value.detail).lower()
+
+
+class TestValidateRepoPath:
+    def test_existing_directory_accepted(self, tmp_path):
+        assert validate_repo_path(str(tmp_path)) == tmp_path.resolve()
+
+    def test_missing_path_rejected(self, tmp_path):
+        with pytest.raises(HTTPException) as exc_info:
+            validate_repo_path(str(tmp_path / "missing"))
+        assert exc_info.value.status_code == 404
+
+    def test_file_path_rejected(self, tmp_path):
+        file_path = tmp_path / "repo.py"
+        file_path.write_text("print('x')", encoding="utf-8")
+        with pytest.raises(HTTPException) as exc_info:
+            validate_repo_path(str(file_path))
+        assert exc_info.value.status_code == 400
+
+    def test_derive_repo_name_from_path_sanitizes_folder_name(self, tmp_path):
+        repo_path = tmp_path / "my repo!"
+        repo_path.mkdir()
+        assert derive_repo_name_from_path(repo_path) == "my-repo"
 
 
 class TestValidateConversationId:

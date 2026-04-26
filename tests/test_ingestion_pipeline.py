@@ -8,7 +8,7 @@ from app.repo_ingestion_pipeline.file_state import FileEntry, RepoFileChanges
 import app.repo_ingestion_pipeline as rp
 
 
-class FakeMongo:
+class FakeDB:
     def __init__(self):
         self.upserts = []
         self.ingested = []
@@ -20,8 +20,8 @@ class FakeMongo:
     def get_repo_file_states(self, _repo_name):
         return {}
 
-    def add_ingested_repo(self, repo_name, job_id):
-        self.ingested.append((repo_name, job_id))
+    def add_ingested_repo(self, repo_name, job_id, local_path=None):
+        self.ingested.append((repo_name, job_id, local_path))
 
     def cancel_active_ingestion_jobs(self, reason):
         self.cancel_reason = reason
@@ -78,15 +78,15 @@ def _empty_changes() -> RepoFileChanges:
 
 
 def test_initial_stage_is_precheck():
-    fake_mongo = FakeMongo()
-    assert fake_mongo is not None
+    fake_db = FakeDB()
+    assert fake_db is not None
     assert IngestionStage.PRECHECK.value == "precheck"
 
 
 @pytest.mark.asyncio
 async def test_start_ingestion_pipeline_happy_path(monkeypatch, tmp_path: Path):
-    fake_mongo = FakeMongo()
-    monkeypatch.setattr(rp, "get_mongo_client", lambda: fake_mongo)
+    fake_db = FakeDB()
+    monkeypatch.setattr(rp, "get_db_client", lambda: fake_db)
     monkeypatch.setattr(rp, "GrokLLM", lambda: object())
     monkeypatch.setattr(rp, "build_repo_file_changes", lambda *_args, **_kwargs: _empty_changes())
     monkeypatch.setattr(rp, "PreIngestionAnalysisStage", DummyPrecheckStage)
@@ -99,13 +99,13 @@ async def test_start_ingestion_pipeline_happy_path(monkeypatch, tmp_path: Path):
     )
 
     assert result == {"status": "completed", "job_id": "job-1"}
-    assert fake_mongo.ingested == [("repo-a", "job-1")]
+    assert fake_db.ingested == [("repo-a", "job-1", str(tmp_path.resolve()))]
 
 
 @pytest.mark.asyncio
 async def test_start_ingestion_pipeline_precheck_failure(monkeypatch, tmp_path: Path):
-    fake_mongo = FakeMongo()
-    monkeypatch.setattr(rp, "get_mongo_client", lambda: fake_mongo)
+    fake_db = FakeDB()
+    monkeypatch.setattr(rp, "get_db_client", lambda: fake_db)
     monkeypatch.setattr(rp, "GrokLLM", lambda: object())
     monkeypatch.setattr(rp, "build_repo_file_changes", lambda *_args, **_kwargs: _empty_changes())
     monkeypatch.setattr(rp, "PreIngestionAnalysisStage", FailingPrecheckStage)
@@ -116,14 +116,14 @@ async def test_start_ingestion_pipeline_precheck_failure(monkeypatch, tmp_path: 
         job_id="job-2",
     )
     assert result is None
-    assert any(u["job"].current_stage == IngestionStage.PRECHECK for u in fake_mongo.upserts)
-    assert any(u["job"].status == "failed" for u in fake_mongo.upserts)
+    assert any(u["job"].current_stage == IngestionStage.PRECHECK for u in fake_db.upserts)
+    assert any(u["job"].status == "failed" for u in fake_db.upserts)
 
 
 @pytest.mark.asyncio
 async def test_start_ingestion_pipeline_mental_model_failure(monkeypatch, tmp_path: Path):
-    fake_mongo = FakeMongo()
-    monkeypatch.setattr(rp, "get_mongo_client", lambda: fake_mongo)
+    fake_db = FakeDB()
+    monkeypatch.setattr(rp, "get_db_client", lambda: fake_db)
     monkeypatch.setattr(rp, "GrokLLM", lambda: object())
     monkeypatch.setattr(rp, "build_repo_file_changes", lambda *_args, **_kwargs: _empty_changes())
     monkeypatch.setattr(rp, "PreIngestionAnalysisStage", DummyPrecheckStage)
@@ -135,13 +135,13 @@ async def test_start_ingestion_pipeline_mental_model_failure(monkeypatch, tmp_pa
         job_id="job-4",
     )
     assert result is None
-    assert any(u["job"].current_stage == IngestionStage.MENTAL_MODEL for u in fake_mongo.upserts)
+    assert any(u["job"].current_stage == IngestionStage.MENTAL_MODEL for u in fake_db.upserts)
 
 
 @pytest.mark.asyncio
 async def test_start_ingestion_pipeline_marks_cancelled_on_task_cancellation(monkeypatch, tmp_path: Path):
-    fake_mongo = FakeMongo()
-    monkeypatch.setattr(rp, "get_mongo_client", lambda: fake_mongo)
+    fake_db = FakeDB()
+    monkeypatch.setattr(rp, "get_db_client", lambda: fake_db)
     monkeypatch.setattr(rp, "GrokLLM", lambda: object())
     monkeypatch.setattr(rp, "build_repo_file_changes", lambda *_args, **_kwargs: _empty_changes())
     monkeypatch.setattr(rp, "PreIngestionAnalysisStage", DummyPrecheckStage)
@@ -154,4 +154,4 @@ async def test_start_ingestion_pipeline_marks_cancelled_on_task_cancellation(mon
             job_id="job-5",
         )
 
-    assert "job-5" in fake_mongo.cancel_reason
+    assert "job-5" in fake_db.cancel_reason

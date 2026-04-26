@@ -57,11 +57,11 @@ Search-based approaches inevitably expose the model to only a small subset of th
 
 * **Pre-ingestion analysis**: scans files, filters directories, estimates size/budget, and persists supported-file state for incremental re-ingestion.
 * **Mental model generation**: uses source code plus an LLM to produce short file-level briefs and criticality labels.
-* **Repo context builder**: assembles a **global repo context** from critical-file briefs, then stores it in MongoDB.
+* **Repo context builder**: assembles a **global repo context** from critical-file briefs, then stores it in SQLite.
 
 **Storage**
 
-* **MongoDB**: ingestion jobs, supported-file state, file briefs, and global repo context
+* **SQLite**: ingestion jobs, supported-file state, file briefs, chat history, and global repo context
 
 
 ## Evaluation
@@ -110,39 +110,29 @@ I believe this is a meaningful step toward more robust, doc-independent reposito
 
 ## Run Locally
 
-### Option A: Docker-first (recommended)
+Make sure you have **`uv`** installed.
 
-Make sure you have **Docker** and **Docker Compose** installed.
+1. Install backend dependencies:
 
-1. Create your local environment file:
+   ```bash
+   uv sync
+   ```
+
+2. Configure the backend:
 
    ```bash
    cp .env.local.example .env.local
    ```
 
-   Then set:
+   Set `XAI_API_KEY` in `.env.local`.
 
-   * `XAI_API_KEY`
-
-2. Create `data/` and clone a repo to ingest. For example:
+3. Start the backend:
 
    ```bash
-   mkdir -p data
-   git clone https://github.com/cyberlis/dictquery.git data/dictquery
+   uv run uvicorn app.main:app
    ```
 
-3. Start the full stack (API + MongoDB):
-
-   ```bash
-   docker compose up --build
-   ```
-
-4. Verify:
-
-   * API docs: http://localhost:8000/docs#/
-   * MongoDB: `mongodb://localhost:27017`
-
-5. Optional UI:
+4. Start the UI in a separate terminal:
 
    ```bash
    git clone https://github.com/bigrewal/code-sense-ui
@@ -152,40 +142,16 @@ Make sure you have **Docker** and **Docker Compose** installed.
    npm run dev
    ```
 
-### Option B: Host development workflow
+5. Open http://localhost:5173/ and select a local repository from the UI.
 
-Make sure you have **Docker**, **Docker Compose**, and **`uv`** installed.
+   The repository can live anywhere the backend process can read. CodeSense
+   stores its own state in `.codesense/`.
 
-1. Install dependencies and create the virtual environment:
+**Optional Local Settings**
 
-   ```bash
-   uv sync
-   source .venv/bin/activate
-   ```
-
-2. Create your local environment file:
-
-   ```bash
-   cp .env.local.example .env.local
-   ```
-
-   Then set:
-
-   * `XAI_API_KEY`
-
-3. Start MongoDB:
-
-   ```bash
-   docker compose up -d mongo
-   ```
-
-4. Run the API:
-
-   ```bash
-   uv run uvicorn app.main:app --reload
-   ```
-
-5. Verify API docs at http://localhost:8000/docs#/
+* `REPO_BROWSER_ROOTS=/path/one,/path/two` constrains which folders the UI can browse. By default, browsing starts at your home directory.
+* `SQLITE_DB_PATH=.codesense/code_sense.sqlite3` changes where CodeSense stores its SQLite database.
+* API docs are available at http://localhost:8000/docs#/.
 
 
 ---
@@ -199,30 +165,14 @@ Make sure you have **Docker**, **Docker Compose**, and **`uv`** installed.
 
 ---
 
-### Shutdown Services
-
-To stop the Docker stack (API + MongoDB):
-
-```bash
-docker compose down
-```
-
-To stop and remove volumes as well:
-
-```bash
-docker compose down -v
-```
-
----
-
 **Hard requirements**
 
 * `XAI_API_KEY`
-* A reachable MongoDB instance
-* A repository checked out under `data/`
+* A local repository path accessible to the API process
+* Optional: `SQLITE_DB_PATH` (defaults to `.codesense/code_sense.sqlite3`)
+* Optional: `REPO_BROWSER_ROOTS` (defaults to the API user's home directory)
 
 **Endpoints**
 
 * API: [http://localhost:8000](http://localhost:8000)
-* MongoDB: mongodb://localhost:27017
 * CodeSense UI: http://localhost:5173/
