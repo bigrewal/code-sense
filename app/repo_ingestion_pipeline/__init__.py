@@ -177,7 +177,7 @@ async def start_ingestion_pipeline(
             return
 
         # ---------- COMPLETION ----------
-        db_client.add_ingested_repo(repo_name=repo_name, job_id=job_id)
+        db_client.add_ingested_repo(repo_name=repo_name, job_id=job_id, local_path=str(local_repo_path.resolve()))
 
         return {"status": "completed", "job_id": job_id}
 

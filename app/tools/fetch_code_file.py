@@ -2,6 +2,7 @@ from pathlib import Path
 import logging
 
 from ..config import Config
+from ..db import get_db_client
 
 logger = logging.getLogger(__name__)
 
@@ -13,7 +14,13 @@ def fetch_code_file(repo_name: str, file_path: str) -> str:
     if Path(file_path).is_absolute():
         raise ValueError("file_path must be repo-relative")
 
-    repo_root = (Path(Config.BASE_REPO_DIR) / repo_name).resolve()
+    db_client = get_db_client()
+    registered_path = db_client.get_repo_local_path(repo_name)
+    repo_root = (
+        Path(registered_path).expanduser().resolve(strict=False)
+        if registered_path
+        else (Path(Config.BASE_REPO_DIR) / repo_name).resolve(strict=False)
+    )
     full_path = (repo_root / file_path).resolve()
 
     try:
@@ -28,4 +35,3 @@ def fetch_code_file(repo_name: str, file_path: str) -> str:
     except Exception as e:
         logger.exception("Failed to fetch code file: repo=%s path=%s", repo_name, file_path)
         raise RuntimeError(f"Failed to read file: {e}") from e
-    

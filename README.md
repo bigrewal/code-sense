@@ -110,46 +110,29 @@ I believe this is a meaningful step toward more robust, doc-independent reposito
 
 ## Run Locally
 
-### Host development workflow (recommended)
-
 Make sure you have **`uv`** installed.
 
-1. Install dependencies and create the virtual environment:
+1. Install backend dependencies:
 
    ```bash
    uv sync
-   source .venv/bin/activate
    ```
 
-2. Create your local environment file:
+2. Configure the backend:
 
    ```bash
    cp .env.local.example .env.local
    ```
 
-   Then set:
+   Set `XAI_API_KEY` in `.env.local`.
 
-   * `XAI_API_KEY`
-
-3. Create `data/` and clone a repo to ingest. For example:
+3. Start the backend:
 
    ```bash
-   mkdir -p data
-   git clone https://github.com/cyberlis/dictquery.git data/dictquery
+   uv run uvicorn app.main:app
    ```
 
-4. Run the API:
-
-   ```bash
-   uv run uvicorn app.main:app --reload
-   ```
-
-5. Verify:
-
-   * API docs: http://localhost:8000/docs#/
-   * SQLite database: `data/code_sense.sqlite3`
-
-6. Optional UI:
+4. Start the UI in a separate terminal:
 
    ```bash
    git clone https://github.com/bigrewal/code-sense-ui
@@ -159,15 +142,16 @@ Make sure you have **`uv`** installed.
    npm run dev
    ```
 
-### Docker Compose workflow
+5. Open http://localhost:5173/ and select a local repository from the UI.
 
-If you want to run the API in Docker instead:
+   The repository can live anywhere the backend process can read. CodeSense
+   stores its own state in `.codesense/`.
 
-```bash
-cp .env.local.example .env.local
-mkdir -p data
-docker compose up --build
-```
+**Optional Local Settings**
+
+* `REPO_BROWSER_ROOTS=/path/one,/path/two` constrains which folders the UI can browse. By default, browsing starts at your home directory.
+* `SQLITE_DB_PATH=.codesense/code_sense.sqlite3` changes where CodeSense stores its SQLite database.
+* API docs are available at http://localhost:8000/docs#/.
 
 
 ---
@@ -181,27 +165,12 @@ docker compose up --build
 
 ---
 
-### Shutdown Services
-
-To stop the Docker stack if you used Docker Compose:
-
-```bash
-docker compose down
-```
-
-To stop and remove volumes as well:
-
-```bash
-docker compose down -v
-```
-
----
-
 **Hard requirements**
 
 * `XAI_API_KEY`
-* A repository checked out under `data/`
-* Optional: `SQLITE_DB_PATH` (defaults to `data/code_sense.sqlite3`)
+* A local repository path accessible to the API process
+* Optional: `SQLITE_DB_PATH` (defaults to `.codesense/code_sense.sqlite3`)
+* Optional: `REPO_BROWSER_ROOTS` (defaults to the API user's home directory)
 
 **Endpoints**
 

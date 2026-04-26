@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,7 +22,13 @@ from .db import (
     init_db_client,
 )
 from .repo_ingestion_pipeline import start_ingestion_pipeline
-from .validators import validate_repo_name, validate_conversation_id, validate_job_id
+from .validators import (
+    derive_repo_name_from_path,
+    validate_repo_name,
+    validate_repo_path,
+    validate_conversation_id,
+    validate_job_id,
+)
 from .timeouts import with_timeout
 from .error_handlers import (
     http_exception_handler,
@@ -136,7 +143,139 @@ class ConversationMessagesResponse(BaseModel):
     messages: List[MessageModel]
 
 class IngestRequest(BaseModel):
-    repo_name: str
+    repo_name: Optional[str] = None
+    repo_path: Optional[str] = None
+
+
+class RepoBrowserRoot(BaseModel):
+    name: str
+    path: str
+
+
+class RepoBrowserEntry(BaseModel):
+    name: str
+    path: str
+    has_git: bool
+
+
+class RepoBrowserResponse(BaseModel):
+    path: str
+    parent_path: Optional[str] = None
+    roots: List[RepoBrowserRoot]
+    entries: List[RepoBrowserEntry]
+
+
+def _paths_match(left: str, right: Path) -> bool:
+    return Path(left).expanduser().resolve(strict=False) == right.resolve(strict=False)
+
+
+def _path_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _allowed_repo_browser_roots() -> List[Path]:
+    roots: List[Path] = []
+    seen: set[str] = set()
+    for raw_root in Config.REPO_BROWSER_ROOTS:
+        try:
+            root = Path(raw_root).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError):
+            logger.warning("Ignoring unavailable repo browser root: %s", raw_root)
+            continue
+        if not root.is_dir():
+            continue
+        key = str(root)
+        if key not in seen:
+            roots.append(root)
+            seen.add(key)
+    return roots
+
+
+def _resolve_repo_browser_path(path: Optional[str], roots: List[Path]) -> Path:
+    if not roots:
+        raise HTTPException(status_code=500, detail="No valid repo browser roots configured")
+
+    if not path:
+        return roots[0]
+
+    try:
+        resolved = Path(path).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise HTTPException(status_code=404, detail=f"Directory not found: {path}") from exc
+
+    if not resolved.is_dir():
+        raise HTTPException(status_code=400, detail="path must be a directory")
+
+    if not any(_path_relative_to(resolved, root) for root in roots):
+        raise HTTPException(status_code=400, detail="path is outside configured repo browser roots")
+
+    return resolved
+
+
+def _repo_browser_parent_path(path: Path, roots: List[Path]) -> Optional[str]:
+    if any(path == root for root in roots):
+        return None
+    parent = path.parent
+    if any(_path_relative_to(parent, root) for root in roots):
+        return str(parent)
+    return None
+
+
+def _browse_repo_directory(path: Optional[str]) -> RepoBrowserResponse:
+    roots = _allowed_repo_browser_roots()
+    current = _resolve_repo_browser_path(path, roots)
+    entries: List[RepoBrowserEntry] = []
+
+    try:
+        children = sorted(current.iterdir(), key=lambda child: child.name.lower())
+    except OSError as exc:
+        raise HTTPException(status_code=403, detail=f"Unable to read directory: {current}") from exc
+
+    for child in children:
+        if len(entries) >= Config.REPO_BROWSER_MAX_ENTRIES:
+            break
+        if child.name.startswith("."):
+            continue
+        try:
+            if not child.is_dir():
+                continue
+            resolved_child = child.resolve(strict=True)
+        except OSError:
+            continue
+        entries.append(
+            RepoBrowserEntry(
+                name=child.name,
+                path=str(resolved_child),
+                has_git=(resolved_child / ".git").exists(),
+            )
+        )
+
+    return RepoBrowserResponse(
+        path=str(current),
+        parent_path=_repo_browser_parent_path(current, roots),
+        roots=[RepoBrowserRoot(name=root.name or str(root), path=str(root)) for root in roots],
+        entries=entries,
+    )
+
+
+def _repo_name_for_ingest_path(db_client, repo_path: Path, requested_repo_name: Optional[str]) -> str:
+    repo_name = validate_repo_name(requested_repo_name) if requested_repo_name else derive_repo_name_from_path(repo_path)
+    existing_path = db_client.get_repo_local_path(repo_name)
+
+    if existing_path and not _paths_match(existing_path, repo_path):
+        if requested_repo_name:
+            raise HTTPException(
+                status_code=409,
+                detail=f"repo_name already exists for a different path: {repo_name}",
+            )
+        suffix = hashlib.sha1(str(repo_path).encode("utf-8")).hexdigest()[:8]
+        repo_name = validate_repo_name(f"{repo_name[:246]}-{suffix}")
+
+    return repo_name
 
 
 async def _run_ingestion_job(**kwargs):
@@ -298,20 +437,38 @@ async def stateless_chat(req: StatelessChatRequest):
     )
 
 
+@app.get("/local/repos/browse", response_model=RepoBrowserResponse)
+async def browse_local_repos(path: Optional[str] = None):
+    return await with_timeout(
+        asyncio.to_thread(_browse_repo_directory, path),
+        timeout_seconds=Config.DB_OPERATION_TIMEOUT,
+        operation_name="Browse local repositories",
+    )
+
+
 @app.post("/ingest", responses={404: {"model": ErrorResponse}})
 async def ingest_repo(
     background_tasks: BackgroundTasks,
     ingest_request: IngestRequest = None,
 ):
-    if not ingest_request or not ingest_request.repo_name:
-        raise HTTPException(status_code=400, detail="Provide repo_name")
+    if not ingest_request or not (ingest_request.repo_name or ingest_request.repo_path):
+        raise HTTPException(status_code=400, detail="Provide repo_path or repo_name")
 
-    repo_name = validate_repo_name(ingest_request.repo_name)
     db_client = get_db_client()
-    logger.info(f"Processing repo for ingestion: {repo_name}")
-    local_repo_path = get_repo_path(repo_name)
-    if not local_repo_path.exists():
-        raise HTTPException(status_code=404, detail=f"Repository not found: {local_repo_path}")
+
+    if ingest_request.repo_path:
+        local_repo_path = validate_repo_path(ingest_request.repo_path)
+        repo_name = _repo_name_for_ingest_path(db_client, local_repo_path, ingest_request.repo_name)
+    else:
+        repo_name = validate_repo_name(ingest_request.repo_name)
+        local_repo_path = get_repo_path(repo_name)
+        if not local_repo_path.exists():
+            raise HTTPException(status_code=404, detail=f"Repository not found: {local_repo_path}")
+        if not local_repo_path.is_dir():
+            raise HTTPException(status_code=400, detail=f"Repository path is not a directory: {local_repo_path}")
+        local_repo_path = local_repo_path.resolve()
+
+    logger.info("Processing repo for ingestion: %s path=%s", repo_name, local_repo_path)
 
     async with _ingest_admission_lock:
         active_job = await with_timeout(
@@ -368,16 +525,27 @@ async def ingest_repo(
 async def delete_repo(repo_name: str, delete_files: bool = False):
     """Delete a code repository and its associated data, including ingestion jobs."""
     repo_name = validate_repo_name(repo_name)
-    local_repo_path = get_repo_path(repo_name)
+    db_client = get_db_client()
+    stored_repo_path = await with_timeout(
+        asyncio.to_thread(db_client.get_repo_local_path, repo_name),
+        timeout_seconds=Config.DB_OPERATION_TIMEOUT,
+        operation_name="Get repo path",
+    )
+    local_repo_path = Path(stored_repo_path).expanduser() if stored_repo_path else get_repo_path(repo_name)
 
-    # Additional safety: ensure path is within BASE_REPO_DIR
+    # Only managed repos under BASE_REPO_DIR can be physically deleted by the API.
     base_dir = Path(Config.BASE_REPO_DIR).resolve()
-    repo_path = Path(local_repo_path).resolve()
-
-    if not str(repo_path).startswith(str(base_dir)):
-        raise HTTPException(status_code=400, detail="Invalid repo path")
+    repo_path = Path(local_repo_path).resolve(strict=False)
 
     if delete_files:
+        try:
+            repo_path.relative_to(base_dir)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="delete_files is only supported for managed repos under BASE_REPO_DIR",
+            ) from exc
+
         if local_repo_path.exists():
             try:
                 import shutil
@@ -387,7 +555,6 @@ async def delete_repo(repo_name: str, delete_files: bool = False):
                 raise HTTPException(status_code=500, detail="Failed to delete repo files")
         else:
             logger.info("Repo files not found for %s, continuing with DB cleanup", repo_name)
-    db_client = get_db_client()
 
     try:
         deletion_result = await with_timeout(

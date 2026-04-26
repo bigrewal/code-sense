@@ -15,11 +15,20 @@ class Config:
     LLM_TEMPERATURE = 0.7
     LLM_MAX_TOKENS = 10240
 
-    # Base directory to store cloned repositories
-    BASE_REPO_DIR: str = "data"
+    # Legacy repo-name ingestion base. The normal UI flow uses absolute repo_path.
+    BASE_REPO_DIR: str = os.getenv("BASE_REPO_DIR", ".codesense/repos")
+
+    # Local roots the UI may browse when selecting repositories. The API process
+    # must be able to read these paths.
+    REPO_BROWSER_ROOTS: List[str] = [
+        root.strip()
+        for root in os.getenv("REPO_BROWSER_ROOTS", str(Path.home())).split(",")
+        if root.strip()
+    ]
+    REPO_BROWSER_MAX_ENTRIES: int = int(os.getenv("REPO_BROWSER_MAX_ENTRIES", "500"))
 
     # SQLite Configuration
-    SQLITE_DB_PATH: str = os.getenv("SQLITE_DB_PATH", "data/code_sense.sqlite3")
+    SQLITE_DB_PATH: str = os.getenv("SQLITE_DB_PATH", ".codesense/code_sense.sqlite3")
 
     IGNORE_FOLDERS: set[str] = {
         "test",

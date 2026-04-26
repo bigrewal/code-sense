@@ -20,6 +20,7 @@ class FakeDB:
         self.health = {"status": "healthy", "response_time_ms": 1.0}
         self.active_job = None
         self.cancel_reason = None
+        self.repo_paths = {}
 
     def create_conversation(self, repo_name: str):
         return {
@@ -69,6 +70,9 @@ class FakeDB:
 
     def list_ingested_repos(self):
         return ["repo-a", "repo-b"]
+
+    def get_repo_local_path(self, repo_name):
+        return self.repo_paths.get(repo_name)
 
     def get_job(self, _job_id):
         return self.job
@@ -150,6 +154,54 @@ async def test_stateless_chat_validation_errors():
 
 
 @pytest.mark.asyncio
+async def test_browse_local_repos_lists_allowed_directory(fake_db, monkeypatch, tmp_path: Path):
+    repo_dir = tmp_path / "repo-a"
+    repo_dir.mkdir()
+    (repo_dir / ".git").mkdir()
+    (tmp_path / "file.txt").write_text("not a directory", encoding="utf-8")
+    (tmp_path / ".hidden-repo").mkdir()
+
+    monkeypatch.setattr(main.Config, "REPO_BROWSER_ROOTS", [str(tmp_path)])
+
+    resp = await main.browse_local_repos()
+
+    assert resp.path == str(tmp_path.resolve())
+    assert resp.parent_path is None
+    assert resp.roots[0].path == str(tmp_path.resolve())
+    assert [(entry.name, entry.path, entry.has_git) for entry in resp.entries] == [
+        ("repo-a", str(repo_dir.resolve()), True)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_browse_local_repos_parent_path_within_root(fake_db, monkeypatch, tmp_path: Path):
+    child_dir = tmp_path / "parent" / "child"
+    child_dir.mkdir(parents=True)
+
+    monkeypatch.setattr(main.Config, "REPO_BROWSER_ROOTS", [str(tmp_path)])
+
+    resp = await main.browse_local_repos(path=str(child_dir))
+
+    assert resp.path == str(child_dir.resolve())
+    assert resp.parent_path == str(child_dir.parent.resolve())
+
+
+@pytest.mark.asyncio
+async def test_browse_local_repos_blocks_outside_root(fake_db, monkeypatch, tmp_path: Path):
+    allowed = tmp_path / "allowed"
+    outside = tmp_path / "outside"
+    allowed.mkdir()
+    outside.mkdir()
+
+    monkeypatch.setattr(main.Config, "REPO_BROWSER_ROOTS", [str(allowed)])
+
+    with pytest.raises(HTTPException) as exc:
+        await main.browse_local_repos(path=str(outside))
+
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
 async def test_ingest_repo_not_found(fake_db, monkeypatch, tmp_path: Path):
     missing = tmp_path / "repo-a"
     monkeypatch.setattr(main, "get_repo_path", lambda _repo_name: missing)
@@ -177,6 +229,46 @@ async def test_ingest_repo_success(fake_db, monkeypatch, tmp_path: Path):
     assert resp["status"] == "queued"
     assert scheduled["func"] is main._run_ingestion_job
     assert scheduled["kwargs"]["repo_name"] == "repo-a"
+    assert scheduled["kwargs"]["local_repo_path"] == repo_dir.resolve()
+
+
+@pytest.mark.asyncio
+async def test_ingest_repo_path_success_derives_repo_name(fake_db, monkeypatch, tmp_path: Path):
+    repo_dir = tmp_path / "repo a"
+    repo_dir.mkdir()
+
+    scheduled = {}
+
+    def _fake_add_task(func, **kwargs):
+        scheduled["func"] = func
+        scheduled["kwargs"] = kwargs
+
+    background = BackgroundTasks()
+    monkeypatch.setattr(background, "add_task", _fake_add_task)
+
+    resp = await main.ingest_repo(background, main.IngestRequest(repo_path=str(repo_dir)))
+
+    assert resp["status"] == "queued"
+    assert resp["repo_name"] == "repo-a"
+    assert scheduled["kwargs"]["repo_name"] == "repo-a"
+    assert scheduled["kwargs"]["local_repo_path"] == repo_dir.resolve()
+
+
+@pytest.mark.asyncio
+async def test_ingest_repo_path_explicit_name_conflict(fake_db, tmp_path: Path):
+    repo_dir = tmp_path / "repo-a"
+    other_dir = tmp_path / "other"
+    repo_dir.mkdir()
+    other_dir.mkdir()
+    fake_db.repo_paths["repo-a"] = str(other_dir)
+
+    with pytest.raises(HTTPException) as exc:
+        await main.ingest_repo(
+            BackgroundTasks(),
+            main.IngestRequest(repo_name="repo-a", repo_path=str(repo_dir)),
+        )
+
+    assert exc.value.status_code == 409
 
 
 @pytest.mark.asyncio
@@ -220,7 +312,7 @@ async def test_delete_repo_invalid_path(fake_db, monkeypatch, tmp_path: Path):
     monkeypatch.setattr(main, "get_repo_path", lambda _repo_name: outside)
 
     with pytest.raises(HTTPException) as exc:
-        await main.delete_repo("repo-a", delete_files=False)
+        await main.delete_repo("repo-a", delete_files=True)
     assert exc.value.status_code == 400
 
 

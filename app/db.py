@@ -244,6 +244,7 @@ class SQLiteClient:
                 CREATE TABLE IF NOT EXISTS ingested_repos (
                     repo_name TEXT PRIMARY KEY,
                     job_id TEXT NOT NULL,
+                    local_path TEXT,
                     ingested_at TEXT NOT NULL
                 );
 
@@ -282,7 +283,13 @@ class SQLiteClient:
                     ON mental_model(repo_name, document_type);
                 """
             )
+            self._ensure_column("ingested_repos", "local_path", "TEXT")
             conn.commit()
+
+    def _ensure_column(self, table_name: str, column_name: str, definition: str) -> None:
+        columns = {row["name"] for row in self._query(f"PRAGMA table_info({table_name})")}
+        if column_name not in columns:
+            self._require_conn().execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
 
     def get_brief_file_overview(self, repo_name: str, file_path: str) -> str:
         row = self._query(
@@ -468,14 +475,24 @@ class SQLiteClient:
             for row in rows
         ]
 
-    def add_ingested_repo(self, repo_name: str, job_id: str):
+    def add_ingested_repo(self, repo_name: str, job_id: str, local_path: Optional[str] = None):
         self._execute(
             """
-            INSERT OR IGNORE INTO ingested_repos (repo_name, job_id, ingested_at)
-            VALUES (?, ?, ?)
+            INSERT INTO ingested_repos (repo_name, job_id, local_path, ingested_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(repo_name) DO UPDATE SET
+                job_id = excluded.job_id,
+                local_path = COALESCE(excluded.local_path, ingested_repos.local_path),
+                ingested_at = excluded.ingested_at
             """,
-            (repo_name, job_id, datetime.now(timezone.utc).isoformat()),
+            (repo_name, job_id, local_path, datetime.now(timezone.utc).isoformat()),
         )
+
+    def get_repo_local_path(self, repo_name: str) -> Optional[str]:
+        rows = self._query("SELECT local_path FROM ingested_repos WHERE repo_name = ?", (repo_name,))
+        if not rows:
+            return None
+        return rows[0]["local_path"]
 
     def upsert_ingestion_job(
         self,

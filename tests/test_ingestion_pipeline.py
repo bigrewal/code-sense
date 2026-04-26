@@ -20,8 +20,8 @@ class FakeDB:
     def get_repo_file_states(self, _repo_name):
         return {}
 
-    def add_ingested_repo(self, repo_name, job_id):
-        self.ingested.append((repo_name, job_id))
+    def add_ingested_repo(self, repo_name, job_id, local_path=None):
+        self.ingested.append((repo_name, job_id, local_path))
 
     def cancel_active_ingestion_jobs(self, reason):
         self.cancel_reason = reason
@@ -99,7 +99,7 @@ async def test_start_ingestion_pipeline_happy_path(monkeypatch, tmp_path: Path):
     )
 
     assert result == {"status": "completed", "job_id": "job-1"}
-    assert fake_db.ingested == [("repo-a", "job-1")]
+    assert fake_db.ingested == [("repo-a", "job-1", str(tmp_path.resolve()))]
 
 
 @pytest.mark.asyncio

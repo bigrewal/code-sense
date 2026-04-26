@@ -106,7 +106,8 @@ def test_create_conversation_wraps_errors(tmp_path):
 
 def test_ingestion_job_and_repo_helpers(tmp_path):
     client = _client(tmp_path)
-    client.add_ingested_repo("repo-a", "j1")
+    local_path = str(tmp_path / "repo-a")
+    client.add_ingested_repo("repo-a", "j1", local_path=local_path)
     client.upsert_repo_file_states(
         "repo-a",
         [{"file_path": "a.py", "sha1": "abc", "language": "python", "supported": True}],
@@ -140,6 +141,11 @@ def test_ingestion_job_and_repo_helpers(tmp_path):
 
     assert client.list_ingested_repos() == ["repo-a"]
     assert client.is_repo_ingested("repo-a") is True
+    assert client.get_repo_local_path("repo-a") == local_path
+
+    updated_path = str(tmp_path / "repo-a-renamed")
+    client.add_ingested_repo("repo-a", "j2", local_path=updated_path)
+    assert client.get_repo_local_path("repo-a") == updated_path
 
     assert client.get_repo_file_states("repo-a") == {
         "a.py": {
