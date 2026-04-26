@@ -6,7 +6,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any
 
 from .config import Config
 from .db_exceptions import (
@@ -35,39 +35,46 @@ _KNOWN_TABLES = {
     MENTAL_MODEL_TABLE,
     INGESTION_FILE_STATE_TABLE,
 }
+_JOB_FIELDS = (
+    "job_id",
+    "repo_name",
+    "status",
+    "current_stage",
+    "stages",
+    "error",
+    "operation",
+    "created_at",
+    "updated_at",
+)
+_REPO_DATA_TABLES = [
+    CONVERSATIONS_TABLE,
+    MESSAGES_TABLE,
+    MENTAL_MODEL_TABLE,
+    INGESTED_REPOS_TABLE,
+    INGESTION_FILE_STATE_TABLE,
+    INGESTION_JOBS_TABLE,
+]
+_ALLOWED_PRECHECK_METRICS = {
+    "skipped",
+    "supported_file_count",
+    "unsupported_file_count",
+    "language_distribution_pct",
+    "supported_tokens",
+}
 
 
-def _serialize_job(job_doc: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "job_id": job_doc.get("job_id"),
-        "repo_name": job_doc.get("repo_name"),
-        "status": job_doc.get("status"),
-        "current_stage": job_doc.get("current_stage"),
-        "stages": job_doc.get("stages", {}),
-        "error": job_doc.get("error"),
-        "operation": job_doc.get("operation"),
-        "created_at": job_doc.get("created_at"),
-        "updated_at": job_doc.get("updated_at"),
-    }
+def _serialize_job(job_doc: dict[str, Any]) -> dict[str, Any]:
+    return {field: job_doc.get(field, {} if field == "stages" else None) for field in _JOB_FIELDS}
 
 
-def _filter_stage_metrics(job: Dict[str, Any]) -> Dict[str, Any]:
-    ALLOWED_PRECHECK_METRICS = {
-        "skipped",
-        "supported_file_count",
-        "unsupported_file_count",
-        "language_distribution_pct",
-        "supported_tokens",
-    }
+def _filter_stage_metrics(job: dict[str, Any]) -> dict[str, Any]:
     stages = job.get("stages") or {}
-
     pre = stages.get(IngestionStage.PRECHECK.value)
     if pre and "metrics" in pre:
         pre["metrics"] = {
             k: v for k, v in pre["metrics"].items()
-            if k in ALLOWED_PRECHECK_METRICS
+            if k in _ALLOWED_PRECHECK_METRICS
         }
-
     return job
 
 
@@ -113,31 +120,22 @@ def _parse_dt(value: Any) -> Any:
 
 
 class SQLiteTableAccessor:
-    """Compatibility wrapper for legacy table-style reads."""
-
     def __init__(self, client: "SQLiteClient", table_name: str):
         self.client = client
         self.table_name = table_name
 
-    def find_one(self, query: Optional[dict] = None, projection: Optional[dict] = None, sort: Optional[list] = None):
+    def find_one(self, query: dict | None = None, projection: dict | None = None, sort: list | None = None):
         rows = self.client._find_documents(self.table_name, query or {}, projection, sort=sort, limit=1)
         return rows[0] if rows else None
 
-    def find(self, query: Optional[dict] = None, projection: Optional[dict] = None):
+    def find(self, query: dict | None = None, projection: dict | None = None):
         return self.client._find_documents(self.table_name, query or {}, projection)
 
-    def count_documents(self, query: Optional[dict] = None) -> int:
+    def count_documents(self, query: dict | None = None) -> int:
         return len(self.client._find_documents(self.table_name, query or {}, None))
 
 
 class SQLiteClient:
-    """
-    SQLite database client wrapper.
-
-    Some public method names intentionally match the previous database client
-    so endpoint and ingestion code can migrate without a broad rewrite.
-    """
-
     _instance = None
     _lock = threading.Lock()
 
@@ -145,10 +143,10 @@ class SQLiteClient:
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
-                    cls._instance = super(SQLiteClient, cls).__new__(cls)
+                    cls._instance = super().__new__(cls)
         return cls._instance
 
-    def __init__(self, db_path: Optional[str] = None, *args, **kwargs):
+    def __init__(self, db_path: str | None = None, *args, **kwargs):
         if hasattr(self, "_initialized") and self._initialized:
             return
 
@@ -159,8 +157,7 @@ class SQLiteClient:
         self._thread_lock = threading.RLock()
         self._initialized = True
 
-    def connect(self, db_name: Optional[str] = None):
-        _ = db_name
+    def connect(self, db_name: str | None = None):
         try:
             if self._db_path != ":memory:":
                 Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -311,7 +308,7 @@ class SQLiteClient:
         )
         return cursor.rowcount > 0
 
-    def get_critical_file_paths(self, repo_name: str) -> List[str]:
+    def get_critical_file_paths(self, repo_name: str) -> list[str]:
         rows = self._query(
             """
             SELECT file_path FROM mental_model
@@ -322,7 +319,7 @@ class SQLiteClient:
         )
         return [row["file_path"] for row in rows if row["file_path"]]
 
-    def get_repo_file_states(self, repo_name: str) -> Dict[str, Dict[str, Any]]:
+    def get_repo_file_states(self, repo_name: str) -> dict[str, dict[str, Any]]:
         rows = self._query(
             """
             SELECT file_path, sha1, language, supported, token_count
@@ -343,7 +340,7 @@ class SQLiteClient:
             if row["file_path"]
         }
 
-    def upsert_repo_file_states(self, repo_name: str, rows: List[Dict[str, Any]]) -> None:
+    def upsert_repo_file_states(self, repo_name: str, rows: list[dict[str, Any]]) -> None:
         now = now_ts()
         with self._thread_lock:
             conn = self._require_conn()
@@ -378,7 +375,7 @@ class SQLiteClient:
             )
             conn.commit()
 
-    def delete_repo_file_states(self, repo_name: str, file_paths: List[str]) -> int:
+    def delete_repo_file_states(self, repo_name: str, file_paths: list[str]) -> int:
         if not file_paths:
             return 0
         placeholders = ",".join("?" for _ in file_paths)
@@ -388,7 +385,7 @@ class SQLiteClient:
         )
         return int(cursor.rowcount)
 
-    def delete_repo_data(self, repo_name: str) -> Dict[str, Any]:
+    def delete_repo_data(self, repo_name: str) -> dict[str, Any]:
         start_time = time.time()
         _validate_repo_name(repo_name)
 
@@ -396,21 +393,14 @@ class SQLiteClient:
             total_deleted = 0
             with self._thread_lock:
                 conn = self._require_conn()
-                for table in [
-                    CONVERSATIONS_TABLE,
-                    MESSAGES_TABLE,
-                    MENTAL_MODEL_TABLE,
-                    INGESTED_REPOS_TABLE,
-                    INGESTION_FILE_STATE_TABLE,
-                    INGESTION_JOBS_TABLE,
-                ]:
+                for table in _REPO_DATA_TABLES:
                     cursor = conn.execute(f"DELETE FROM {table} WHERE repo_name = ?", (repo_name,))
                     total_deleted += cursor.rowcount
                 conn.commit()
 
             return {
                 "repo_name": repo_name,
-                "collections_processed": 6,
+                "collections_processed": len(_REPO_DATA_TABLES),
                 "total_deleted": total_deleted,
                 "duration_ms": (time.time() - start_time) * 1000,
             }
@@ -442,7 +432,7 @@ class SQLiteClient:
     def list_conversations(
         self,
         *,
-        repo_name: Optional[str] = None,
+        repo_name: str | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
@@ -475,7 +465,7 @@ class SQLiteClient:
             for row in rows
         ]
 
-    def add_ingested_repo(self, repo_name: str, job_id: str, local_path: Optional[str] = None):
+    def add_ingested_repo(self, repo_name: str, job_id: str, local_path: str | None = None):
         self._execute(
             """
             INSERT INTO ingested_repos (repo_name, job_id, local_path, ingested_at)
@@ -488,11 +478,9 @@ class SQLiteClient:
             (repo_name, job_id, local_path, datetime.now(timezone.utc).isoformat()),
         )
 
-    def get_repo_local_path(self, repo_name: str) -> Optional[str]:
+    def get_repo_local_path(self, repo_name: str) -> str | None:
         rows = self._query("SELECT local_path FROM ingested_repos WHERE repo_name = ?", (repo_name,))
-        if not rows:
-            return None
-        return rows[0]["local_path"]
+        return rows[0]["local_path"] if rows else None
 
     def upsert_ingestion_job(
         self,
@@ -536,7 +524,7 @@ class SQLiteClient:
             ),
         )
 
-    def get_job_status(self, job_id: str) -> Optional[Dict[str, Any]]:
+    def get_job_status(self, job_id: str) -> dict[str, Any] | None:
         job_doc = self.get_job(job_id)
         if not job_doc:
             return None
@@ -545,12 +533,12 @@ class SQLiteClient:
     def list_jobs(
         self,
         *,
-        status: Optional[str] = None,
-        repo_name: Optional[str] = None,
+        status: str | None = None,
+        repo_name: str | None = None,
         limit: int = 50,
         skip: int = 0,
         include_total: bool = False,
-    ) -> Union[List[Dict[str, Any]], Tuple[List[Dict[str, Any]], int]]:
+    ) -> list[dict[str, Any]] | tuple[list[dict[str, Any]], int]:
         clauses = []
         params: list[Any] = []
         if status:
@@ -579,7 +567,7 @@ class SQLiteClient:
 
         return jobs
 
-    def get_active_ingestion_job(self) -> Optional[Dict[str, Any]]:
+    def get_active_ingestion_job(self) -> dict[str, Any] | None:
         rows = self._query(
             """
             SELECT * FROM ingestion_jobs
@@ -601,7 +589,7 @@ class SQLiteClient:
         )
         return int(cursor.rowcount)
 
-    def list_ingested_repos(self) -> List[str]:
+    def list_ingested_repos(self) -> list[str]:
         rows = self._query("SELECT repo_name FROM ingested_repos ORDER BY repo_name")
         return [row["repo_name"] for row in rows]
 
@@ -667,10 +655,10 @@ class SQLiteClient:
         role: str,
         content: str,
         message_type: str,
-        stage: Optional[str] = None,
-        status: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        created_at: Optional[datetime] = None,
+        stage: str | None = None,
+        status: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        created_at: datetime | None = None,
     ) -> None:
         timestamp = (created_at or datetime.now(timezone.utc)).isoformat()
         conv = self.get_conversation(conversation_id)
@@ -697,7 +685,7 @@ class SQLiteClient:
         )
         self._execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (timestamp, conversation_id))
 
-    def get_conversation(self, conversation_id: str) -> Optional[Dict[str, Any]]:
+    def get_conversation(self, conversation_id: str) -> dict[str, Any] | None:
         if not _valid_conversation_id(conversation_id):
             raise ValueError("Invalid conversation id")
         rows = self._query(
@@ -753,10 +741,10 @@ class SQLiteClient:
         self,
         *,
         repo_name: str,
-        file_path: Optional[str] = None,
-        document_types: Optional[list[str]] = None,
-        sha1: Optional[str] = None,
-    ) -> Optional[Dict[str, Any]]:
+        file_path: str | None = None,
+        document_types: list[str] | None = None,
+        sha1: str | None = None,
+    ) -> dict[str, Any] | None:
         docs = self.list_mental_model_documents(
             repo_name=repo_name,
             file_path=file_path,
@@ -770,11 +758,11 @@ class SQLiteClient:
         self,
         *,
         repo_name: str,
-        file_path: Optional[str] = None,
-        document_types: Optional[list[str]] = None,
-        sha1: Optional[str] = None,
-        limit: Optional[int] = None,
-    ) -> list[Dict[str, Any]]:
+        file_path: str | None = None,
+        document_types: list[str] | None = None,
+        sha1: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
         clauses = ["repo_name = ?"]
         params: list[Any] = [repo_name]
         if file_path is not None:
@@ -819,7 +807,7 @@ class SQLiteClient:
         file_path: str,
         document_type: str,
         data: str,
-        sha1: Optional[str] = None,
+        sha1: str | None = None,
     ) -> None:
         self._execute(
             """
@@ -836,8 +824,8 @@ class SQLiteClient:
         self,
         *,
         repo_name: str,
-        file_paths: Optional[list[str]] = None,
-        document_types: Optional[list[str]] = None,
+        file_paths: list[str] | None = None,
+        document_types: list[str] | None = None,
     ) -> int:
         clauses = ["repo_name = ?"]
         params: list[Any] = [repo_name]
@@ -864,7 +852,7 @@ class SQLiteClient:
         )
         return int(rows[0]["count"])
 
-    def health_check(self) -> Dict[str, Any]:
+    def health_check(self) -> dict[str, Any]:
         start_time = time.time()
 
         if self._conn is None:
@@ -912,7 +900,7 @@ class SQLiteClient:
         finally:
             self._conn = None
 
-    def _job_row_to_dict(self, row: sqlite3.Row, *, include_stages: bool = True) -> Dict[str, Any]:
+    def _job_row_to_dict(self, row: sqlite3.Row, *, include_stages: bool = True) -> dict[str, Any]:
         result = {
             "job_id": row["job_id"],
             "repo_name": row["repo_name"],
@@ -931,10 +919,10 @@ class SQLiteClient:
         self,
         table_name: str,
         query: dict[str, Any],
-        projection: Optional[dict[str, int]],
+        projection: dict[str, int] | None,
         *,
-        sort: Optional[list] = None,
-        limit: Optional[int] = None,
+        sort: list | None = None,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         if table_name == MENTAL_MODEL_TABLE:
             return self._find_mental_model_compat(query, projection, limit=limit)
@@ -948,9 +936,9 @@ class SQLiteClient:
     def _find_mental_model_compat(
         self,
         query: dict[str, Any],
-        projection: Optional[dict[str, int]],
+        projection: dict[str, int] | None,
         *,
-        limit: Optional[int] = None,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         document_types = None
         doc_type_query = query.get("document_type")
@@ -967,7 +955,7 @@ class SQLiteClient:
         )
         return [self._project(doc, projection) for doc in docs]
 
-    def _project(self, doc: Optional[dict[str, Any]], projection: Optional[dict[str, int]]) -> Optional[dict[str, Any]]:
+    def _project(self, doc: dict[str, Any] | None, projection: dict[str, int] | None) -> dict[str, Any] | None:
         if doc is None or projection is None:
             return doc
         if projection == {"_id": 0}:

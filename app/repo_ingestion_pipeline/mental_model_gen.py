@@ -3,7 +3,6 @@ import hashlib
 import logging
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
 
 from tqdm import tqdm
 
@@ -56,7 +55,7 @@ PROMPT_USER_TEMPLATE = """
 class MentalModelStage:
     """Stage for generating and storing the hierarchical mental model."""
 
-    def __init__(self, llm_grok: GrokLLM, config: Optional[dict] = None):
+    def __init__(self, llm_grok: GrokLLM, config: dict | None = None):
         config = config or {}
         self.db_client = get_db_client()
         self.llm_client = llm_grok
@@ -68,7 +67,7 @@ class MentalModelStage:
         self,
         repo_name: str,
         local_repo_path: Path,
-        file_changes: Optional[dict] = None,
+        file_changes: dict | None = None,
     ):
         self.repo_name = repo_name
         self.local_repo_path = local_repo_path
@@ -105,14 +104,13 @@ class MentalModelStage:
 
     async def identify_critical_files(
         self,
-        dir_tree: List[str],
+        dir_tree: list[str],
         repo_name: str,
-    ) -> Tuple[List[Dict[str, str]], Set[str]]:
-        """Generate a comprehensive overview of the repo by summarizing critical files, ignoring non-critical ones."""
+    ) -> tuple[list[dict[str, str]], set[str]]:
 
         semaphore = asyncio.Semaphore(self.max_concurrency)
 
-        async def summarize_file(file_path: str) -> tuple[str, str, str | None, str | None]:
+        async def summarize_file(file_path: str) -> tuple[str, str, str | None]:
             try:
                 full_path = self.local_repo_path / file_path
                 code_bytes = full_path.read_bytes()
@@ -120,7 +118,7 @@ class MentalModelStage:
                 sha1 = hashlib.sha1(code_bytes).hexdigest()
             except Exception:
                 logger.warning("Job %s: unable to read %s; marking ignored", self.job_id, file_path)
-                return file_path, "IGNORE", None, None
+                return file_path, "IGNORE", None
 
             cached = self.db_client.find_mental_model_document(
                 repo_name=repo_name,
@@ -129,7 +127,7 @@ class MentalModelStage:
                 sha1=sha1,
             )
             if cached:
-                return file_path, cached["data"], code, sha1
+                return file_path, cached["data"], sha1
 
             user_prompt = PROMPT_USER_TEMPLATE.format(
                 repo_name=repo_name,
@@ -144,12 +142,12 @@ class MentalModelStage:
                     temperature=0.0,
                     max_tokens=150,
                 )
-            return file_path, response.strip(), code, sha1
+            return file_path, response.strip(), sha1
 
         all_files = dir_tree
 
-        insights: List[Dict[str, str]] = []
-        ignored: Set[str] = set()
+        insights: list[dict[str, str]] = []
+        ignored: set[str] = set()
 
         pbar = tqdm(total=len(all_files), desc="Processing files")
 
@@ -158,7 +156,7 @@ class MentalModelStage:
             tasks = [summarize_file(fp) for fp in batch]
             results = await asyncio.gather(*tasks)
 
-            for fp, summary, _code, sha1 in results:
+            for fp, summary, sha1 in results:
                 if summary == "IGNORE":
                     ignored.add(fp)
                     if sha1:
@@ -201,8 +199,7 @@ class MentalModelStage:
         )
         return critical_total, ignored_total
 
-    def _build_dir_tree(self) -> List[str]:
-        """Build a list of code file paths by walking the repository."""
+    def _build_dir_tree(self) -> list[str]:
         code_files = []
         supported_extensions = set(Config.SUPPORTED_LANGUAGES.keys())
         ignore_folders = Config.IGNORE_FOLDERS
@@ -222,8 +219,7 @@ class MentalModelStage:
 
         return sorted(code_files)
 
-    def _upsert_document(self, document: Dict):
-        """Persist a mental model document via upsert."""
+    def _upsert_document(self, document: dict):
         self.db_client.upsert_mental_model_document(
             repo_name=document["repo_name"],
             file_path=document["file_path"],
@@ -251,7 +247,7 @@ class MentalModelStage:
     def _delete_removed_artifacts(
         self,
         repo_name: str,
-        deleted_files: List[str],
+        deleted_files: list[str],
     ):
         if not deleted_files:
             return
@@ -264,15 +260,15 @@ class MentalModelStage:
     def _select_files_to_process(
         self,
         repo_name: str,
-        all_files: List[str],
-        file_changes: Optional[dict],
-    ) -> List[str]:
+        all_files: list[str],
+        file_changes: dict | None,
+    ) -> list[str]:
         if not file_changes:
             return all_files
 
-        selected: Set[str] = set()
-        selected.update(file_changes.get("new_files", []) if file_changes else [])
-        selected.update(file_changes.get("changed_files", []) if file_changes else [])
+        selected: set[str] = set()
+        selected.update(file_changes.get("new_files", []))
+        selected.update(file_changes.get("changed_files", []))
 
         # Backfill missing mental-model docs even when there are no file deltas.
         existing = self.db_client.list_mental_model_documents(
@@ -284,5 +280,4 @@ class MentalModelStage:
             if path not in documented_files:
                 selected.add(path)
 
-        allowed = set(all_files)
-        return sorted([p for p in selected if p in allowed])
+        return sorted(set(all_files) & selected)

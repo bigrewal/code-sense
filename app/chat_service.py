@@ -6,7 +6,7 @@ import asyncio
 from datetime import datetime, timezone
 import json
 import logging
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator
 
 from pydantic import BaseModel, Field
 
@@ -27,7 +27,7 @@ class FileSelection(BaseModel):
 
 
 class FileSelectionResponse(BaseModel):
-    files_to_fetch: List[FileSelection] = Field(default_factory=list)
+    files_to_fetch: list[FileSelection] = Field(default_factory=list)
 
 
 def _utc_now() -> datetime:
@@ -35,11 +35,14 @@ def _utc_now() -> datetime:
 
 
 class ChatEventRecorder:
-    def __init__(self, conversation_id: Optional[str] = None):
+    def __init__(self, conversation_id: str | None = None):
         self.conversation_id = conversation_id
 
-    def _serialize(self, payload: Dict[str, Any]) -> str:
+    def _serialize(self, payload: dict[str, Any]) -> str:
         return json.dumps(payload, default=str) + "\n"
+
+    def _event(self, event_type: str, **payload) -> str:
+        return self._serialize({"type": event_type, **payload, "created_at": _utc_now().isoformat()})
 
     async def _persist_message(
         self,
@@ -47,10 +50,10 @@ class ChatEventRecorder:
         role: str,
         content: str,
         message_type: str,
-        stage: Optional[str] = None,
-        status: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        created_at: Optional[datetime] = None,
+        stage: str | None = None,
+        status: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        created_at: datetime | None = None,
     ) -> None:
         if not self.conversation_id:
             return
@@ -82,53 +85,36 @@ class ChatEventRecorder:
         stage: str,
         status: str,
         message: str,
-        metadata: Optional[Dict[str, Any]] = None,
+        metadata: dict[str, Any] | None = None,
     ) -> str:
         timestamp = _utc_now()
-        payload = {
-            "type": "progress",
-            "stage": stage,
-            "status": status,
-            "message": message,
-            "metadata": metadata or {},
-            "created_at": timestamp.isoformat(),
-        }
+        metadata = metadata or {}
         await self._persist_message(
             role="assistant",
             content=message,
             message_type=MESSAGE_TYPE_PROGRESS,
             stage=stage,
             status=status,
-            metadata=metadata or {},
+            metadata=metadata,
             created_at=timestamp,
         )
-        return self._serialize(payload)
+        return self._serialize({
+            "type": "progress",
+            "stage": stage,
+            "status": status,
+            "message": message,
+            "metadata": metadata,
+            "created_at": timestamp.isoformat(),
+        })
 
     def emit_content(self, delta: str) -> str:
-        return self._serialize(
-            {
-                "type": "content",
-                "delta": delta,
-                "created_at": _utc_now().isoformat(),
-            }
-        )
+        return self._event("content", delta=delta)
 
     def emit_error(self, message: str) -> str:
-        return self._serialize(
-            {
-                "type": "error",
-                "message": message,
-                "created_at": _utc_now().isoformat(),
-            }
-        )
+        return self._event("error", message=message)
 
     def emit_done(self) -> str:
-        return self._serialize(
-            {
-                "type": "done",
-                "created_at": _utc_now().isoformat(),
-            }
-        )
+        return self._event("done")
 
 # ---------------------------
 # Public API
@@ -145,7 +131,7 @@ async def stream_chat(conversation_id: str, user_message: str):
     repo_name = conv["repo_name"]
 
     history_docs = await asyncio.to_thread(db_client.list_chat_history, conversation_id)
-    messages_for_llm: List[Dict[str, str]] = [
+    messages_for_llm: list[dict[str, str]] = [
         {"role": m["role"], "content": m["content"]}
         for m in history_docs
         if m.get("role") in {"user", "assistant"}
@@ -168,7 +154,7 @@ async def stream_chat(conversation_id: str, user_message: str):
         metadata={"rephrased_question": rephrased_user_question},
     )
 
-    captured: List[str] = []
+    captured: list[str] = []
     async for event in stream_answer(
         user_question=rephrased_user_question,
         repo_name=repo_name,
@@ -231,7 +217,7 @@ async def stateless_stream_chat(repo_name: str, user_message: str):
 # Internal helpers
 # ---------------------------
 
-async def get_rephrased_question(messages: List[Dict[str, str]], repo_name: str):
+async def get_rephrased_question(messages: list[dict[str, str]], repo_name: str):
     if len(messages) <= 2:
         return messages[-1]["content"]
     
@@ -264,12 +250,12 @@ async def get_rephrased_question(messages: List[Dict[str, str]], repo_name: str)
     )
 
 
-async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[Dict[str, Any], None]:
+async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[dict[str, Any], None]:
     db_client = get_db_client()
 
     async def _select_files_for_query(
         repo_context: str,
-    ) -> List[FileSelection]:
+    ) -> list[FileSelection]:
         system_prompt = f"""
         You are a senior codebase analysis agent.
 
@@ -352,7 +338,7 @@ async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[Di
             logger.exception(f"Error selecting files for query: {response}")
             return []
         
-    async def _read_file_task(file_info: FileSelection) -> Dict[str, Any]:
+    async def _read_file_task(file_info: FileSelection) -> dict[str, Any]:
         try:
             code = fetch_code_file(repo_name=repo_name, file_path=file_info.file_path)
 
@@ -420,7 +406,7 @@ async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[Di
 
     async def _synth_final_answer(
         user_question: str,
-        file_insights: List[Any],
+        file_insights: list[Any],
         summary_insight: str,
     ):
         valid_file_insights = [
@@ -528,7 +514,7 @@ async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[Di
         )
     )
 
-    additional_info_required: List[FileSelection] = await additional_info_required_task
+    additional_info_required: list[FileSelection] = await additional_info_required_task
 
     yield {
         "type": "progress",
@@ -541,7 +527,7 @@ async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[Di
         },
     }
 
-    file_insights: List[Any] = []
+    file_insights: list[Any] = []
     if additional_info_required:
         for file_info in additional_info_required:
             yield {

@@ -9,8 +9,8 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from app.config import Config
 
 
-def _base_error_payload(request: Request) -> dict:
-    return {
+def _error_payload(request: Request, **extra) -> dict:
+    return extra | {
         "path": str(request.url.path),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "request_id": getattr(request.state, "request_id", None),
@@ -20,22 +20,22 @@ def _base_error_payload(request: Request) -> dict:
 async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     return JSONResponse(
         status_code=exc.status_code,
-        content={
-            "error": exc.detail,
-            "status_code": exc.status_code,
-            **_base_error_payload(request),
-        },
+        content=_error_payload(
+            request,
+            error=exc.detail,
+            status_code=exc.status_code,
+        ),
     )
 
 
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content={
-            "error": "Validation error",
-            "details": exc.errors(),
-            **_base_error_payload(request),
-        },
+        content=_error_payload(
+            request,
+            error="Validation error",
+            details=exc.errors(),
+        ),
     )
 
 
@@ -49,8 +49,5 @@ async def general_exception_handler(request: Request, exc: Exception):
 
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={
-            "error": error_detail,
-            **_base_error_payload(request),
-        },
+        content=_error_payload(request, error=error_detail),
     )

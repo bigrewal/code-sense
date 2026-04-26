@@ -1,5 +1,5 @@
-from pathlib import Path
 import logging
+from pathlib import Path
 
 from ..config import Config
 from ..db import get_db_client
@@ -10,17 +10,11 @@ logger = logging.getLogger(__name__)
 def fetch_code_file(repo_name: str, file_path: str) -> str:
     if not file_path or not isinstance(file_path, str):
         raise ValueError("Missing or invalid file_path parameter")
-
     if Path(file_path).is_absolute():
         raise ValueError("file_path must be repo-relative")
 
-    db_client = get_db_client()
-    registered_path = db_client.get_repo_local_path(repo_name)
-    repo_root = (
-        Path(registered_path).expanduser().resolve(strict=False)
-        if registered_path
-        else (Path(Config.BASE_REPO_DIR) / repo_name).resolve(strict=False)
-    )
+    registered_path = get_db_client().get_repo_local_path(repo_name)
+    repo_root = Path(registered_path or Path(Config.BASE_REPO_DIR) / repo_name).expanduser().resolve(strict=False)
     full_path = (repo_root / file_path).resolve()
 
     try:
@@ -29,8 +23,8 @@ def fetch_code_file(repo_name: str, file_path: str) -> str:
         raise ValueError("file_path escapes repository root") from exc
 
     try:
-        if not full_path.exists() or not full_path.is_file():
-            raise FileNotFoundError(f"File not found: {full_path}")
+        if not full_path.is_file():
+            raise FileNotFoundError(full_path)
         return full_path.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
         logger.exception("Failed to fetch code file: repo=%s path=%s", repo_name, file_path)

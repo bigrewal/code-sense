@@ -1,5 +1,6 @@
 import asyncio
-from typing import Awaitable, TypeVar
+from collections.abc import Awaitable
+from typing import TypeVar
 
 from fastapi import HTTPException
 from loguru import logger
@@ -14,9 +15,9 @@ async def with_timeout(
 ) -> T:
     try:
         return await asyncio.wait_for(coro, timeout=timeout_seconds)
-    except asyncio.TimeoutError:
+    except asyncio.TimeoutError as exc:
         logger.error("{} exceeded timeout: timeout_seconds={}", operation_name, timeout_seconds)
         raise HTTPException(
             status_code=504,
             detail=f"{operation_name} exceeded timeout of {timeout_seconds}s",
-        )
+        ) from exc

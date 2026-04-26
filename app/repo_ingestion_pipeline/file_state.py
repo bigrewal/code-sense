@@ -1,7 +1,6 @@
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Set
 
 from ..config import Config
 
@@ -9,17 +8,17 @@ from ..config import Config
 @dataclass
 class FileEntry:
     sha1: str
-    language: Optional[str]
+    language: str | None
     supported: bool
 
 
 @dataclass
 class RepoFileChanges:
-    current_files: Dict[str, FileEntry]
-    new_files: Set[str]
-    changed_files: Set[str]
-    deleted_files: Set[str]
-    unchanged_files: Set[str]
+    current_files: dict[str, FileEntry]
+    new_files: set[str]
+    changed_files: set[str]
+    deleted_files: set[str]
+    unchanged_files: set[str]
 
 
 def _is_excluded(path: Path, repo_path: Path) -> bool:
@@ -36,10 +35,10 @@ def _sha1_bytes(path: Path) -> str:
     return hashlib.sha1(path.read_bytes()).hexdigest()
 
 
-def build_repo_file_changes(repo_path: Path, previous_state: Dict[str, dict]) -> RepoFileChanges:
+def build_repo_file_changes(repo_path: Path, previous_state: dict[str, dict]) -> RepoFileChanges:
     repo_path = Path(repo_path)
-    current: Dict[str, FileEntry] = {}
-    supported_current_paths: Set[str] = set()
+    current: dict[str, FileEntry] = {}
+    supported_current_paths: set[str] = set()
 
     for path in repo_path.rglob("*"):
         if not path.is_file() or _is_excluded(path, repo_path):

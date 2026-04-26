@@ -1,4 +1,3 @@
-
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -8,6 +7,7 @@ class IngestionStage(str, Enum):
     QUEUED = "queued"
     PRECHECK = "precheck"
     MENTAL_MODEL = "mental_model"
+
 
 class IngestionStageStatus(str, Enum):
     PENDING = "pending"

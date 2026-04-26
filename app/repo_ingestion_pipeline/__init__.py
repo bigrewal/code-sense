@@ -1,7 +1,6 @@
 import asyncio
 from pathlib import Path
 from dataclasses import asdict
-from typing import Optional
 from uuid import uuid4
 
 from ..models.data_model import IngestionJobStatus, IngestionStage, IngestionStageStatus
@@ -11,10 +10,28 @@ from .file_state import build_repo_file_changes
 from .mental_model_gen import MentalModelStage
 from .pre_ingestion_analysis import PreIngestionAnalysisError, PreIngestionAnalysisStage
 
+
+def _save_job(db_client, job_id, repo_name, status, stage, stage_status, **kwargs):
+    db_client.upsert_ingestion_job(
+        IngestionJobStatus(
+            job_id=job_id,
+            repo_name=repo_name,
+            status=status,
+            current_stage=stage,
+            stage_status=stage_status,
+        ),
+        **kwargs,
+    )
+
+
+def _payload(status, **extra):
+    return {"status": status.value, **extra}
+
+
 async def start_ingestion_pipeline(
     local_repo_path: Path,
     repo_name: str,
-    job_id: Optional[str] = None,
+    job_id: str | None = None,
 ) -> dict[str, str]:
     try:
         db_client = get_db_client()
@@ -22,17 +39,12 @@ async def start_ingestion_pipeline(
 
         job_id = job_id or str(uuid4())
 
-        db_client.upsert_ingestion_job(
-            IngestionJobStatus(
-                job_id=job_id,
-                repo_name=repo_name,
-                status="running",
-                current_stage=IngestionStage.PRECHECK,
-                stage_status={
-                    IngestionStage.PRECHECK: IngestionStageStatus.PENDING,
-                    IngestionStage.MENTAL_MODEL: IngestionStageStatus.PENDING,
-                },
-            )
+        _save_job(
+            db_client, job_id, repo_name, "running", IngestionStage.PRECHECK,
+            {
+                IngestionStage.PRECHECK: IngestionStageStatus.PENDING,
+                IngestionStage.MENTAL_MODEL: IngestionStageStatus.PENDING,
+            },
         )
 
         previous_state = db_client.get_repo_file_states(repo_name)
@@ -41,14 +53,9 @@ async def start_ingestion_pipeline(
 
         # ---------- PRECHECK ----------
         try:
-            db_client.upsert_ingestion_job(
-                IngestionJobStatus(
-                    job_id=job_id,
-                    repo_name=repo_name,
-                    status="running",
-                    current_stage=IngestionStage.PRECHECK,
-                    stage_status={IngestionStage.PRECHECK: IngestionStageStatus.RUNNING},
-                )
+            _save_job(
+                db_client, job_id, repo_name, "running", IngestionStage.PRECHECK,
+                {IngestionStage.PRECHECK: IngestionStageStatus.RUNNING},
             )
 
             pre_ingestion_stage = PreIngestionAnalysisStage(
@@ -69,66 +76,31 @@ async def start_ingestion_pipeline(
                 }
             )
 
-            db_client.upsert_ingestion_job(
-                IngestionJobStatus(
-                    job_id=job_id,
-                    repo_name=repo_name,
-                    status="running",
-                    current_stage=IngestionStage.PRECHECK,
-                    stage_status={
-                        IngestionStage.PRECHECK: {
-                            "status": IngestionStageStatus.COMPLETED.value,
-                            "metrics": analysis_summary,
-                        }
-                    },
-                )
+            _save_job(
+                db_client, job_id, repo_name, "running", IngestionStage.PRECHECK,
+                {IngestionStage.PRECHECK: _payload(IngestionStageStatus.COMPLETED, metrics=analysis_summary)},
             )
 
         except PreIngestionAnalysisError as pie:
-            db_client.upsert_ingestion_job(
-                IngestionJobStatus(
-                    job_id=job_id,
-                    repo_name=repo_name,
-                    status="failed",
-                    current_stage=IngestionStage.PRECHECK,
-                    stage_status={
-                        IngestionStage.PRECHECK: {
-                            "status": IngestionStageStatus.FAILED.value,
-                            "error": str(pie),
-                        }
-                    },
-                ),
+            _save_job(
+                db_client, job_id, repo_name, "failed", IngestionStage.PRECHECK,
+                {IngestionStage.PRECHECK: _payload(IngestionStageStatus.FAILED, error=str(pie))},
                 error=str(pie),
             )
             return
         except Exception as e:
-            db_client.upsert_ingestion_job(
-                IngestionJobStatus(
-                    job_id=job_id,
-                    repo_name=repo_name,
-                    status="failed",
-                    current_stage=IngestionStage.PRECHECK,
-                    stage_status={
-                        IngestionStage.PRECHECK: {
-                            "status": IngestionStageStatus.FAILED.value,
-                            "error": str(e),
-                        }
-                    },
-                ),
+            _save_job(
+                db_client, job_id, repo_name, "failed", IngestionStage.PRECHECK,
+                {IngestionStage.PRECHECK: _payload(IngestionStageStatus.FAILED, error=str(e))},
                 error=str(e),
             )
             raise
 
         # ---------- MENTAL MODEL ----------
         try:
-            db_client.upsert_ingestion_job(
-                IngestionJobStatus(
-                    job_id=job_id,
-                    repo_name=repo_name,
-                    status="running",
-                    current_stage=IngestionStage.MENTAL_MODEL,
-                    stage_status={IngestionStage.MENTAL_MODEL: IngestionStageStatus.RUNNING},
-                )
+            _save_job(
+                db_client, job_id, repo_name, "running", IngestionStage.MENTAL_MODEL,
+                {IngestionStage.MENTAL_MODEL: IngestionStageStatus.RUNNING},
             )
 
             critical_file_count, ignored_files_count, repo_context_token_count = await MentalModelStage(
@@ -140,38 +112,23 @@ async def start_ingestion_pipeline(
                 file_changes=file_changes,
             )
 
-            db_client.upsert_ingestion_job(
-                IngestionJobStatus(
-                    job_id=job_id,
-                    repo_name=repo_name,
-                    status="completed",
-                    current_stage=IngestionStage.MENTAL_MODEL,
-                    stage_status={
-                        IngestionStage.MENTAL_MODEL: {
-                            "status": IngestionStageStatus.COMPLETED.value,
-                            "metrics": {
-                                "critical_files": critical_file_count,
-                                "files_ignored": ignored_files_count,
-                                "repo_context_token_count": repo_context_token_count,
-                            },
-                        }
-                    },
-                )
+            _save_job(
+                db_client, job_id, repo_name, "completed", IngestionStage.MENTAL_MODEL,
+                {
+                    IngestionStage.MENTAL_MODEL: _payload(
+                        IngestionStageStatus.COMPLETED,
+                        metrics={
+                            "critical_files": critical_file_count,
+                            "files_ignored": ignored_files_count,
+                            "repo_context_token_count": repo_context_token_count,
+                        },
+                    )
+                },
             )
         except Exception as e:
-            db_client.upsert_ingestion_job(
-                IngestionJobStatus(
-                    job_id=job_id,
-                    repo_name=repo_name,
-                    status="failed",
-                    current_stage=IngestionStage.MENTAL_MODEL,
-                    stage_status={
-                        IngestionStage.MENTAL_MODEL: {
-                            "status": IngestionStageStatus.FAILED.value,
-                            "error": str(e),
-                        }
-                    },
-                ),
+            _save_job(
+                db_client, job_id, repo_name, "failed", IngestionStage.MENTAL_MODEL,
+                {IngestionStage.MENTAL_MODEL: _payload(IngestionStageStatus.FAILED, error=str(e))},
                 error=str(e),
             )
             return
