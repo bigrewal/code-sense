@@ -124,7 +124,18 @@ Make sure you have **`uv`** installed.
    cp .env.local.example .env.local
    ```
 
-   Set `XAI_API_KEY` in `.env.local`.
+   Choose a provider with `LLM_PROVIDER` and set its credentials in `.env.local`:
+
+   | Provider    | `LLM_PROVIDER` | Required env vars                                                  | Install                          |
+   |-------------|----------------|---------------------------------------------------------------------|----------------------------------|
+   | xAI Grok    | `grok` (default) | `XAI_API_KEY`                                                     | `uv sync` (built-in)             |
+   | OpenAI      | `openai`       | `OPENAI_API_KEY` (optional `OPENAI_BASE_URL` for compatible servers) | `uv sync --extra openai`         |
+   | Anthropic   | `anthropic`    | `ANTHROPIC_API_KEY`                                                 | `uv sync --extra anthropic`      |
+   | AWS Bedrock | `bedrock`      | `AWS_REGION` (+ standard AWS credential chain)                      | `uv sync --extra bedrock`        |
+
+   Override the model with `LLM_MODEL` (e.g. `LLM_MODEL=claude-sonnet-4-5` or
+   `LLM_MODEL=anthropic.claude-sonnet-4-5-v1:0`). If unset, each provider uses a
+   sensible default.
 
 3. Start the backend:
 
@@ -167,8 +178,9 @@ Make sure you have **`uv`** installed.
 
 **Hard requirements**
 
-* `XAI_API_KEY`
+* Credentials for the selected `LLM_PROVIDER` (see provider table above; defaults to xAI Grok and `XAI_API_KEY`)
 * A local repository path accessible to the API process
+* Optional: `LLM_PROVIDER` (defaults to `grok`), `LLM_MODEL` (defaults vary per provider)
 * Optional: `SQLITE_DB_PATH` (defaults to `.codesense/code_sense.sqlite3`)
 * Optional: `REPO_BROWSER_ROOTS` (defaults to the API user's home directory)
 

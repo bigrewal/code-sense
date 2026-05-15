@@ -11,14 +11,39 @@ from typing import Any, AsyncGenerator
 from pydantic import BaseModel, Field
 
 from .db import get_db_client
-from .llm_grok import GrokLLM
+from .llm import get_llm_provider
 from .tools.fetch_code_file import fetch_code_file
 
 MESSAGE_TYPE_CHAT = "chat_message"
 MESSAGE_TYPE_PROGRESS = "progress_event"
 logger = logging.getLogger(__name__)
 
-llm = GrokLLM()
+llm = get_llm_provider()
+
+_repo_context_cache: dict[str, str] = {}
+_repo_context_cache_lock = asyncio.Lock()
+
+
+def invalidate_repo_context_cache(repo_name: str | None = None) -> None:
+    """Clear cached repo context. Called after ingestion writes a new context."""
+    if repo_name is None:
+        _repo_context_cache.clear()
+    else:
+        _repo_context_cache.pop(repo_name, None)
+
+
+async def _get_cached_repo_context(repo_name: str) -> str:
+    cached = _repo_context_cache.get(repo_name)
+    if cached is not None:
+        return cached
+    async with _repo_context_cache_lock:
+        cached = _repo_context_cache.get(repo_name)
+        if cached is not None:
+            return cached
+        db_client = get_db_client()
+        context = await asyncio.to_thread(db_client.get_repo_context, repo_name)
+        _repo_context_cache[repo_name] = context
+        return context
 
 
 class FileSelection(BaseModel):
@@ -243,7 +268,7 @@ async def get_rephrased_question(messages: list[dict[str, str]], repo_name: str)
 
     Rephrase the LAST user message as a standalone question. Output ONLY the rephrased question:"""
 
-    return await llm.generate_async(
+    return await llm.generate(
         prompt=user_prompt,
         system_prompt=system_prompt,
         temperature=0.0,
@@ -251,11 +276,9 @@ async def get_rephrased_question(messages: list[dict[str, str]], repo_name: str)
 
 
 async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[dict[str, Any], None]:
-    db_client = get_db_client()
-
     async def _select_files_for_query(
         repo_context: str,
-    ) -> list[FileSelection]:
+    ) -> tuple[list[FileSelection], str | None]:
         system_prompt = f"""
         You are a senior codebase analysis agent.
 
@@ -331,12 +354,17 @@ async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[di
                 response_format=FileSelectionResponse,
             )
             logger.info("Raw file-selection LLM response: %r", response)
-            
-            return FileSelectionResponse.model_validate_json(response).files_to_fetch
-            
-        except Exception:
-            logger.exception(f"Error selecting files for query: {response}")
-            return []
+
+            return FileSelectionResponse.model_validate_json(response).files_to_fetch, None
+
+        except Exception as exc:
+            logger.error(
+                "File selection failed for repo=%s; falling back to summary-only answer. raw_response=%r",
+                repo_name,
+                response,
+                exc_info=True,
+            )
+            return [], f"{type(exc).__name__}: {exc}"
         
     async def _read_file_task(file_info: FileSelection) -> dict[str, Any]:
         try:
@@ -398,7 +426,7 @@ async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[di
             {user_question}
             """
         
-        return await llm.generate_async(
+        return await llm.generate(
             prompt=user_prompt,
             system_prompt=system_prompt,
             temperature=0.0,
@@ -475,25 +503,14 @@ async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[di
         You are synthesizing, not analyzing or extending.
         """
         
-        stream = llm.generate(
+        async for delta in llm.generate_stream(
             prompt=user_question,
             system_prompt=system_prompt,
             temperature=0.0,
-            stream=True,
-        )
-        
-        for _, chunk in stream:
-            content = getattr(chunk, "content", None)
-            if content:
-                yield {
-                    "type": "content",
-                    "delta": content,
-                }
+        ):
+            yield {"type": "content", "delta": delta}
 
-        yield {
-            "type": "content",
-            "delta": "\n",
-        }
+        yield {"type": "content", "delta": "\n"}
 
     yield {
         "type": "progress",
@@ -502,7 +519,7 @@ async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[di
         "message": "Selecting relevant files",
         "metadata": {},
     }
-    repo_context = await asyncio.to_thread(db_client.get_repo_context, repo_name)
+    repo_context = await _get_cached_repo_context(repo_name)
 
     additional_info_required_task = asyncio.create_task(
         _select_files_for_query(repo_context=repo_context)
@@ -514,18 +531,27 @@ async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[di
         )
     )
 
-    additional_info_required: list[FileSelection] = await additional_info_required_task
+    additional_info_required, file_selection_error = await additional_info_required_task
 
-    yield {
-        "type": "progress",
-        "stage": "selecting_files",
-        "status": "completed",
-        "message": "Completed file selection",
-        "metadata": {
-            "file_count": len(additional_info_required),
-            "files": [item.file_path for item in additional_info_required],
-        },
-    }
+    if file_selection_error:
+        yield {
+            "type": "progress",
+            "stage": "selecting_files",
+            "status": "failed",
+            "message": "File selection failed; answering from repository summaries only.",
+            "metadata": {"error": file_selection_error},
+        }
+    else:
+        yield {
+            "type": "progress",
+            "stage": "selecting_files",
+            "status": "completed",
+            "message": "Completed file selection",
+            "metadata": {
+                "file_count": len(additional_info_required),
+                "files": [item.file_path for item in additional_info_required],
+            },
+        }
 
     file_insights: list[Any] = []
     if additional_info_required:

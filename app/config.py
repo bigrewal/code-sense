@@ -8,10 +8,27 @@ if Path(".env.local").exists():
 
 
 class Config:
-    XAI_API_KEY = os.getenv("XAI_API_KEY")
-    GROK_4_NON_REASONING_MODEL = "grok-4-1-fast-non-reasoning"
+    LLM_PROVIDER = os.getenv("LLM_PROVIDER", "grok").lower()
+    LLM_MODEL = os.getenv("LLM_MODEL", "")
     LLM_TEMPERATURE = 0.7
     LLM_MAX_TOKENS = 10240
+
+    # xAI / Grok
+    XAI_API_KEY = os.getenv("XAI_API_KEY")
+    GROK_4_NON_REASONING_MODEL = "grok-4-1-fast-non-reasoning"
+
+    # OpenAI (also used for OpenAI-compatible endpoints via OPENAI_BASE_URL)
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+    OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "")
+
+    # Anthropic
+    ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
+    # AWS Bedrock (Claude)
+    AWS_REGION = os.getenv("AWS_REGION", "")
+    AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
+    AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+    AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN", "")
 
     BASE_REPO_DIR: str = os.getenv("BASE_REPO_DIR", ".codesense/repos")
 
@@ -90,14 +107,29 @@ class Config:
     DB_OPERATION_TIMEOUT: int = int(os.getenv("DB_OPERATION_TIMEOUT", "30"))
 
 
+_PROVIDER_REQUIRED_VARS: dict[str, tuple[str, ...]] = {
+    "grok": ("XAI_API_KEY",),
+    "openai": ("OPENAI_API_KEY",),
+    "anthropic": ("ANTHROPIC_API_KEY",),
+    "bedrock": ("AWS_REGION",),
+}
+
+
 def validate_required_settings() -> None:
     """Fail fast with a clear list of missing required environment values."""
-    required = {
-        "XAI_API_KEY": Config.XAI_API_KEY,
-        "SQLITE_DB_PATH": Config.SQLITE_DB_PATH,
-    }
+    required: dict[str, str] = {"SQLITE_DB_PATH": Config.SQLITE_DB_PATH}
+    provider = Config.LLM_PROVIDER
+    if provider not in _PROVIDER_REQUIRED_VARS:
+        raise RuntimeError(
+            f"Unsupported LLM_PROVIDER={provider!r}. "
+            f"Choose one of: {', '.join(_PROVIDER_REQUIRED_VARS)}."
+        )
+    for var in _PROVIDER_REQUIRED_VARS[provider]:
+        required[var] = getattr(Config, var, "") or ""
+
     missing = [name for name, value in required.items() if not value]
     if missing:
         raise RuntimeError(
-            f"Missing required environment variables: {', '.join(missing)}"
+            f"Missing required environment variables for LLM_PROVIDER={provider!r}: "
+            f"{', '.join(missing)}"
         )

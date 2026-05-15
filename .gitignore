@@ -14,3 +14,4 @@ evals/
 tests/evals/
 # macOS cruft
 .DS_Store
+.claude
