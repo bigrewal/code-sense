@@ -108,62 +108,72 @@ I believe this is a meaningful step toward more robust, doc-independent reposito
 * **Context window constraints**: CodeSense relies on fitting the compressed repo-wide mental model within the LLM’s context window. If the compressed representation exceeds the available context, this approach will not scale further without additional hierarchical compression. In practice, this design works well for most real-world repositories; for example, a ~1.2M LoC codebase (~5M raw tokens) was compressed to ~600k tokens, comfortably fitting within Grok’s 2M-token context window.
 --- 
 
-## Run Locally
+## Repository layout
 
-Make sure you have **`uv`** installed.
+```
+backend/   # FastAPI service (Python, managed with uv)
+frontend/  # React + Vite UI
+scripts/   # dev tooling (e.g. dev.sh runs both)
+```
 
-1. Install backend dependencies:
+## Quick start
 
-   ```bash
-   uv sync
-   ```
+Prerequisites: [`uv`](https://docs.astral.sh/uv/) and Node 18+.
 
-2. Configure the backend:
+```bash
+# 1. Install uv (skip if already installed)
+curl -LsSf https://astral.sh/uv/install.sh | sh
 
-   ```bash
-   cp .env.local.example .env.local
-   ```
+# 2. Set your API key
+cp backend/.env.local.example backend/.env.local
+# then edit backend/.env.local and set XAI_API_KEY (or another provider — see below)
 
-   Choose a provider with `LLM_PROVIDER` and set its credentials in `.env.local`:
+# 3. Spin up CodeSense (backend + frontend)
+./scripts/dev.sh
+```
 
-   | Provider    | `LLM_PROVIDER` | Required env vars                                                  | Install                          |
-   |-------------|----------------|---------------------------------------------------------------------|----------------------------------|
-   | xAI Grok    | `grok` (default) | `XAI_API_KEY`                                                     | `uv sync` (built-in)             |
-   | OpenAI      | `openai`       | `OPENAI_API_KEY` (optional `OPENAI_BASE_URL` for compatible servers) | `uv sync --extra openai`         |
-   | Anthropic   | `anthropic`    | `ANTHROPIC_API_KEY`                                                 | `uv sync --extra anthropic`      |
-   | AWS Bedrock | `bedrock`      | `AWS_REGION` (+ standard AWS credential chain)                      | `uv sync --extra bedrock`        |
+Open http://localhost:5173 and select a local repository to ingest. Press
+Ctrl+C in the dev script to shut both servers down.
 
-   Override the model with `LLM_MODEL` (e.g. `LLM_MODEL=claude-sonnet-4-5` or
-   `LLM_MODEL=anthropic.claude-sonnet-4-5-v1:0`). If unset, each provider uses a
-   sensible default.
+### LLM providers
 
-3. Start the backend:
+`grok` is the default. Set `LLM_PROVIDER` in `backend/.env.local` to switch.
 
-   ```bash
-   uv run uvicorn app.main:app
-   ```
+| Provider    | `LLM_PROVIDER`   | Required env vars                                                    | Install                          |
+|-------------|------------------|----------------------------------------------------------------------|----------------------------------|
+| xAI Grok    | `grok` (default) | `XAI_API_KEY`                                                        | `uv sync` (built-in)             |
+| OpenAI      | `openai`         | `OPENAI_API_KEY` (optional `OPENAI_BASE_URL` for compatible servers) | `uv sync --extra openai`         |
+| Anthropic   | `anthropic`      | `ANTHROPIC_API_KEY`                                                  | `uv sync --extra anthropic`      |
+| AWS Bedrock | `bedrock`        | `AWS_REGION` (+ standard AWS credential chain)                       | `uv sync --extra bedrock`        |
 
-4. Start the UI in a separate terminal:
+Override the model with `LLM_MODEL` (e.g. `LLM_MODEL=claude-sonnet-4-5`).
 
-   ```bash
-   git clone https://github.com/bigrewal/code-sense-ui
-   cd code-sense-ui
-   npm install
-   # Create .env.local and set VITE_API_BASE=http://localhost:8000
-   npm run dev
-   ```
+### Other settings
 
-5. Open http://localhost:5173/ and select a local repository from the UI.
+All optional, set in `backend/.env.local`:
 
-   The repository can live anywhere the backend process can read. CodeSense
-   stores its own state in `.codesense/`.
+- `SQLITE_DB_PATH` (default `.codesense/code_sense.sqlite3`) — where state lives.
+- `REPO_BROWSER_ROOTS` (default `$HOME`) — comma-separated dirs the UI may browse.
+- `ALLOWED_ORIGINS` — comma-separated CORS origins.
+- `VITE_API_BASE` (frontend, default `http://localhost:8000`) — backend origin.
 
-**Optional Local Settings**
+API docs: http://localhost:8000/docs. The API is mounted under `/v1`;
+`/health` is unversioned.
 
-* `REPO_BROWSER_ROOTS=/path/one,/path/two` constrains which folders the UI can browse. By default, browsing starts at your home directory.
-* `SQLITE_DB_PATH=.codesense/code_sense.sqlite3` changes where CodeSense stores its SQLite database.
-* API docs are available at http://localhost:8000/docs#/.
+### Running just one side
 
+```bash
+cd backend  && uv run uvicorn app.main:app    # backend only
+cd frontend && npm install && npm run dev     # frontend only
+```
+
+### Tests
+
+```bash
+cd backend
+uv sync --extra test
+XAI_API_KEY=test uv run python -m pytest      # any value works for tests
+```
 
 ---
 
@@ -173,18 +183,3 @@ Make sure you have **`uv`** installed.
 
 
 ![Demo screenshot](demo/screenshot.png)
-
----
-
-**Hard requirements**
-
-* Credentials for the selected `LLM_PROVIDER` (see provider table above; defaults to xAI Grok and `XAI_API_KEY`)
-* A local repository path accessible to the API process
-* Optional: `LLM_PROVIDER` (defaults to `grok`), `LLM_MODEL` (defaults vary per provider)
-* Optional: `SQLITE_DB_PATH` (defaults to `.codesense/code_sense.sqlite3`)
-* Optional: `REPO_BROWSER_ROOTS` (defaults to the API user's home directory)
-
-**Endpoints**
-
-* API: [http://localhost:8000](http://localhost:8000)
-* CodeSense UI: http://localhost:5173/
