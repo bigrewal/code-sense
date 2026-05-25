@@ -1,14 +1,28 @@
 import asyncio
+import logging
 from pathlib import Path
 from dataclasses import asdict
 from uuid import uuid4
 
 from ..models.data_model import IngestionJobStatus, IngestionStage, IngestionStageStatus
 from ..db import get_db_client
-from ..llm_grok import GrokLLM
+from ..llm import get_llm_provider
 from .file_state import build_repo_file_changes
 from .mental_model_gen import MentalModelStage
 from .pre_ingestion_analysis import PreIngestionAnalysisError, PreIngestionAnalysisStage
+
+logger = logging.getLogger(__name__)
+
+
+def _invalidate_chat_repo_context_cache(repo_name: str) -> None:
+    try:
+        from ..chat_service import invalidate_repo_context_cache
+    except Exception:
+        return
+    try:
+        invalidate_repo_context_cache(repo_name)
+    except Exception:
+        logger.exception("Failed to invalidate repo context cache for %s", repo_name)
 
 
 def _save_job(db_client, job_id, repo_name, status, stage, stage_status, **kwargs):
@@ -33,11 +47,14 @@ async def start_ingestion_pipeline(
     repo_name: str,
     job_id: str | None = None,
 ) -> dict[str, str]:
+    job_id = job_id or str(uuid4())
+    db_client = None
+    reached_terminal_state = False
+    current_stage = IngestionStage.PRECHECK
+
     try:
         db_client = get_db_client()
-        llm = GrokLLM()
-
-        job_id = job_id or str(uuid4())
+        llm = get_llm_provider()
 
         _save_job(
             db_client, job_id, repo_name, "running", IngestionStage.PRECHECK,
@@ -87,6 +104,7 @@ async def start_ingestion_pipeline(
                 {IngestionStage.PRECHECK: _payload(IngestionStageStatus.FAILED, error=str(pie))},
                 error=str(pie),
             )
+            reached_terminal_state = True
             return
         except Exception as e:
             _save_job(
@@ -94,9 +112,11 @@ async def start_ingestion_pipeline(
                 {IngestionStage.PRECHECK: _payload(IngestionStageStatus.FAILED, error=str(e))},
                 error=str(e),
             )
+            reached_terminal_state = True
             raise
 
         # ---------- MENTAL MODEL ----------
+        current_stage = IngestionStage.MENTAL_MODEL
         try:
             _save_job(
                 db_client, job_id, repo_name, "running", IngestionStage.MENTAL_MODEL,
@@ -125,19 +145,34 @@ async def start_ingestion_pipeline(
                     )
                 },
             )
+            _invalidate_chat_repo_context_cache(repo_name)
         except Exception as e:
             _save_job(
                 db_client, job_id, repo_name, "failed", IngestionStage.MENTAL_MODEL,
                 {IngestionStage.MENTAL_MODEL: _payload(IngestionStageStatus.FAILED, error=str(e))},
                 error=str(e),
             )
+            reached_terminal_state = True
             return
 
         # ---------- COMPLETION ----------
         db_client.add_ingested_repo(repo_name=repo_name, job_id=job_id, local_path=str(local_repo_path.resolve()))
-
+        reached_terminal_state = True
         return {"status": "completed", "job_id": job_id}
 
     except asyncio.CancelledError:
-        db_client.cancel_active_ingestion_jobs(f"Ingestion cancelled: job {job_id} interrupted")
+        if db_client is not None:
+            db_client.cancel_active_ingestion_jobs(f"Ingestion cancelled: job {job_id} interrupted")
+            reached_terminal_state = True
         raise
+    finally:
+        if not reached_terminal_state and db_client is not None:
+            try:
+                error_msg = f"Ingestion job {job_id} aborted before completion"
+                _save_job(
+                    db_client, job_id, repo_name, "failed", current_stage,
+                    {current_stage: _payload(IngestionStageStatus.FAILED, error=error_msg)},
+                    error=error_msg,
+                )
+            except Exception:
+                logger.exception("Failed to mark job %s as failed during cleanup", job_id)

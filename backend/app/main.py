@@ -1,17 +1,18 @@
 import asyncio
 import hashlib
 import logging
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .models.data_model import IngestionStage, IngestionStageStatus, IngestionJobStatus
 from .utils import get_repo_path
@@ -37,11 +38,11 @@ from .error_handlers import (
 )
 from .middleware import RequestLoggingMiddleware
 
+API_PREFIX = "/v1"
 MAX_LIMIT = 200
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Code Sense API", version="1.0.0")
 
 _ingest_admission_lock = asyncio.Lock()
 _ingest_execution_lock = asyncio.Lock()
@@ -52,6 +53,29 @@ def _cancel_active_jobs_on_lifecycle_event(reason: str) -> None:
     cancelled_count = db_client.cancel_active_ingestion_jobs(reason)
     if cancelled_count:
         logger.info("Marked %s active ingestion job(s) as cancelled", cancelled_count)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Initializing clients")
+    validate_required_settings()
+    init_db_client()
+    _cancel_active_jobs_on_lifecycle_event("Ingestion cancelled: service restarted")
+    try:
+        yield
+    finally:
+        logger.info("Shutting down application - closing database connections")
+        try:
+            _cancel_active_jobs_on_lifecycle_event("Ingestion cancelled: service shutting down")
+            db_client = get_db_client()
+            db_client.close()
+            logger.info("SQLite connection closed")
+        except Exception as exc:
+            logger.error("Error closing SQLite connection: %s", exc)
+        logger.info("Shutdown complete")
+
+
+app = FastAPI(title="Code Sense API", version="1.0.0", lifespan=lifespan)
 
 app.add_exception_handler(StarletteHTTPException, http_exception_handler)
 app.add_exception_handler(RequestValidationError, validation_exception_handler)
@@ -69,42 +93,27 @@ app.add_middleware(
 )
 
 
-@app.on_event("startup")
-async def on_startup():
-    logger.info("Initializing clients")
-    validate_required_settings()
-    init_db_client()
-    _cancel_active_jobs_on_lifecycle_event("Ingestion cancelled: service restarted")
-
-
-@app.on_event("shutdown")
-async def on_shutdown():
-    logger.info("Shutting down application - closing database connections")
-
-    try:
-        _cancel_active_jobs_on_lifecycle_event("Ingestion cancelled: service shutting down")
-        db_client = get_db_client()
-        db_client.close()
-        logger.info("SQLite connection closed")
-    except Exception as e:
-        logger.error("Error closing SQLite connection: %s", str(e))
-
-    logger.info("Shutdown complete")
+# ---------------------------------------------------------------------------
+# Request / response models
+# ---------------------------------------------------------------------------
 
 
 class ChatRequest(BaseModel):
-    conversation_id: str
-    message: str
+    conversation_id: str = Field(min_length=1)
+    message: str = Field(min_length=1)
+
 
 class StatelessChatRequest(BaseModel):
-    repo_name: str
-    message: str
+    repo_name: str = Field(min_length=1)
+    message: str = Field(min_length=1)
+
 
 class ErrorResponse(BaseModel):
     detail: str
 
+
 class ConversationCreateRequest(BaseModel):
-    repo_name: str
+    repo_name: str = Field(min_length=1)
 
 
 class ConversationCreateResponse(BaseModel):
@@ -115,7 +124,7 @@ class ConversationCreateResponse(BaseModel):
 
 class ConversationSummary(BaseModel):
     conversation_id: str
-    repo_name: str
+    repo_name: str | None = None
     created_at: datetime
     updated_at: datetime | None = None
     title: str | None = None
@@ -136,16 +145,21 @@ class ConversationMessagesResponse(BaseModel):
     messages: list[MessageModel]
 
 
-async def _db_call(operation_name: str, func, *args, **kwargs):
-    return await with_timeout(
-        asyncio.to_thread(func, *args, **kwargs),
-        timeout_seconds=Config.DB_OPERATION_TIMEOUT,
-        operation_name=operation_name,
-    )
-
 class IngestRequest(BaseModel):
     repo_name: str | None = None
     repo_path: str | None = None
+
+    @model_validator(mode="after")
+    def _exactly_one_target(self) -> "IngestRequest":
+        if not (self.repo_name or self.repo_path):
+            raise ValueError("Provide repo_name or repo_path")
+        return self
+
+
+class IngestResponse(BaseModel):
+    job_id: str
+    repo_name: str
+    status: str
 
 
 class RepoBrowserRoot(BaseModel):
@@ -164,6 +178,19 @@ class RepoBrowserResponse(BaseModel):
     parent_path: str | None = None
     roots: list[RepoBrowserRoot]
     entries: list[RepoBrowserEntry]
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+async def _db_call(operation_name: str, func, *args, **kwargs):
+    return await with_timeout(
+        asyncio.to_thread(func, *args, **kwargs),
+        timeout_seconds=Config.DB_OPERATION_TIMEOUT,
+        operation_name=operation_name,
+    )
 
 
 def _paths_match(left: str, right: Path) -> bool:
@@ -263,6 +290,22 @@ def _browse_repo_directory(path: str | None) -> RepoBrowserResponse:
     )
 
 
+def _enforce_ingest_path_under_browser_roots(repo_path: Path) -> None:
+    """Ingestion via repo_path must target a directory inside REPO_BROWSER_ROOTS.
+
+    The repo browser already enforces this for UI-driven flows; the API surface
+    needs the same boundary or it becomes a free-form path-traversal vector.
+    """
+    roots = _allowed_repo_browser_roots()
+    if not roots:
+        raise HTTPException(status_code=500, detail="No valid repo browser roots configured")
+    if not any(_path_relative_to(repo_path, root) for root in roots):
+        raise HTTPException(
+            status_code=400,
+            detail="repo_path is outside configured repo browser roots",
+        )
+
+
 def _repo_name_for_ingest_path(db_client, repo_path: Path, requested_repo_name: str | None) -> str:
     repo_name = validate_repo_name(requested_repo_name) if requested_repo_name else derive_repo_name_from_path(repo_path)
     existing_path = db_client.get_repo_local_path(repo_name)
@@ -297,9 +340,28 @@ async def _run_ingestion_job(**kwargs):
                 operation_name="Cancel interrupted ingestion job",
             )
             raise
-    
 
-@app.post("/conversations", response_model=ConversationCreateResponse)
+
+# ---------------------------------------------------------------------------
+# v1 routers
+# ---------------------------------------------------------------------------
+
+api = APIRouter(prefix=API_PREFIX)
+conversations_router = APIRouter(prefix="/conversations", tags=["conversations"])
+chat_router = APIRouter(tags=["chat"])
+repos_router = APIRouter(prefix="/repos", tags=["repositories"])
+ingest_router = APIRouter(tags=["ingestion"])
+jobs_router = APIRouter(prefix="/jobs", tags=["jobs"])
+local_router = APIRouter(prefix="/local", tags=["local"])
+
+
+# ---------------------------- conversations --------------------------------
+
+@conversations_router.post(
+    "",
+    response_model=ConversationCreateResponse,
+    status_code=status.HTTP_201_CREATED,
+)
 async def create_conversation(req: ConversationCreateRequest):
     repo_name = validate_repo_name(req.repo_name)
     result = await _db_call("Create conversation", get_db_client().create_conversation, repo_name=repo_name)
@@ -310,10 +372,10 @@ async def create_conversation(req: ConversationCreateRequest):
     )
 
 
-@app.get("/conversations", response_model=list[ConversationSummary])
+@conversations_router.get("", response_model=list[ConversationSummary])
 async def list_conversations(
     repo_name: str | None = None,
-    limit: int = Query(50, ge=1, le=200),
+    limit: int = Query(50, ge=1, le=MAX_LIMIT),
     offset: int = Query(0, ge=0),
 ):
     if repo_name:
@@ -339,8 +401,12 @@ async def list_conversations(
     ]
 
 
-@app.get("/conversations/{conversation_id}/messages", response_model=ConversationMessagesResponse)
-async def list_conversation_messages(conversation_id: str, limit: int = Query(200, ge=1, le=500)):
+@conversations_router.get(
+    "/{conversation_id}/messages",
+    response_model=ConversationMessagesResponse,
+    responses={404: {"model": ErrorResponse}},
+)
+async def list_conversation_messages(conversation_id: str, limit: int = Query(MAX_LIMIT, ge=1, le=500)):
     conversation_id = validate_conversation_id(conversation_id)
     db_client = get_db_client()
     exists = await _db_call("Check conversation exists", db_client.conversation_exists, conversation_id)
@@ -371,7 +437,10 @@ async def list_conversation_messages(conversation_id: str, limit: int = Query(20
     return ConversationMessagesResponse(conversation_id=conversation_id, messages=messages)
 
 
-@app.delete("/conversations/{conversation_id}")
+@conversations_router.delete(
+    "/{conversation_id}",
+    responses={404: {"model": ErrorResponse}},
+)
 async def delete_conversation(conversation_id: str):
     conversation_id = validate_conversation_id(conversation_id)
     db_client = get_db_client()
@@ -384,49 +453,65 @@ async def delete_conversation(conversation_id: str):
     return {"message": "Conversation deleted"}
 
 
-@app.post("/chat", responses={400: {"model": ErrorResponse}})
+# -------------------------------- chat -------------------------------------
+
+@chat_router.post(
+    "/chat",
+    responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
+)
 async def chat(req: ChatRequest):
-    if not req.conversation_id:
-        raise HTTPException(status_code=400, detail="conversation_id is required")
-    if not req.message:
-        raise HTTPException(status_code=400, detail="message is required")
+    conversation_id = validate_conversation_id(req.conversation_id)
+    db_client = get_db_client()
+    exists = await _db_call("Check conversation exists", db_client.conversation_exists, conversation_id)
+    if not exists:
+        raise HTTPException(status_code=404, detail="Conversation not found")
 
     return StreamingResponse(
-        stream_chat(conversation_id=req.conversation_id, user_message=req.message),
+        stream_chat(conversation_id=conversation_id, user_message=req.message),
         media_type="application/x-ndjson",
     )
 
 
-@app.post("/stateless/chat", responses={400: {"model": ErrorResponse}})
+@chat_router.post(
+    "/stateless/chat",
+    responses={400: {"model": ErrorResponse}},
+)
 async def stateless_chat(req: StatelessChatRequest):
-    if not req.repo_name:
-        raise HTTPException(status_code=400, detail="repo_name is required")
-    if not req.message:
-        raise HTTPException(status_code=400, detail="message is required")
-
+    repo_name = validate_repo_name(req.repo_name)
     return StreamingResponse(
-        stateless_stream_chat(repo_name=req.repo_name, user_message=req.message),
+        stateless_stream_chat(repo_name=repo_name, user_message=req.message),
         media_type="application/x-ndjson",
     )
 
 
-@app.get("/local/repos/browse", response_model=RepoBrowserResponse)
+# ------------------------------- local -------------------------------------
+
+@local_router.get("/repos/browse", response_model=RepoBrowserResponse)
 async def browse_local_repos(path: str | None = None):
     return await _db_call("Browse local repositories", _browse_repo_directory, path)
 
 
-@app.post("/ingest", responses={404: {"model": ErrorResponse}})
+# ------------------------------ ingest -------------------------------------
+
+@ingest_router.post(
+    "/ingest",
+    response_model=IngestResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    responses={
+        400: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
+    },
+)
 async def ingest_repo(
     background_tasks: BackgroundTasks,
-    ingest_request: IngestRequest = None,
+    ingest_request: IngestRequest,
 ):
-    if not ingest_request or not (ingest_request.repo_name or ingest_request.repo_path):
-        raise HTTPException(status_code=400, detail="Provide repo_path or repo_name")
-
     db_client = get_db_client()
 
     if ingest_request.repo_path:
         local_repo_path = validate_repo_path(ingest_request.repo_path)
+        _enforce_ingest_path_under_browser_roots(local_repo_path)
         repo_name = _repo_name_for_ingest_path(db_client, local_repo_path, ingest_request.repo_name)
     else:
         repo_name = validate_repo_name(ingest_request.repo_name)
@@ -475,13 +560,21 @@ async def ingest_repo(
             job_id=job_id,
         )
 
-    return {
-        "job_id": job_id,
-        "repo_name": repo_name,
-        "status": "queued",
-    }
+    return IngestResponse(job_id=job_id, repo_name=repo_name, status="queued")
 
-@app.delete("/repos", responses={404: {"model": ErrorResponse}, 500: {"model": ErrorResponse}})
+
+# ------------------------------- repos -------------------------------------
+
+@repos_router.get("")
+async def list_repos():
+    ingested_repos = await _db_call("List repos", get_db_client().list_ingested_repos)
+    return {"repos": ingested_repos}
+
+
+@repos_router.delete(
+    "/{repo_name}",
+    responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
+)
 async def delete_repo(repo_name: str, delete_files: bool = False):
     """Delete a code repository and its associated data, including ingestion jobs."""
     repo_name = validate_repo_name(repo_name)
@@ -504,7 +597,9 @@ async def delete_repo(repo_name: str, delete_files: bool = False):
         if local_repo_path.exists():
             try:
                 import shutil
-                shutil.rmtree(local_repo_path)
+                await asyncio.to_thread(shutil.rmtree, local_repo_path)
+            except HTTPException:
+                raise
             except Exception as exc:
                 logger.exception("Failed to delete repo files", exc_info=exc)
                 raise HTTPException(status_code=500, detail="Failed to delete repo files")
@@ -513,6 +608,8 @@ async def delete_repo(repo_name: str, delete_files: bool = False):
 
     try:
         deletion_result = await _db_call("Delete repo data", db_client.delete_repo_data, repo_name)
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("Failed to delete repo documents", exc_info=exc)
         raise HTTPException(status_code=500, detail="Failed to delete repo data")
@@ -522,27 +619,20 @@ async def delete_repo(repo_name: str, delete_files: bool = False):
         "total_deleted": deletion_result.get("total_deleted", 0),
     }
 
-@app.get("/status")
-async def get_status(
-    job_id: str | None = None,
+
+# ------------------------------- jobs --------------------------------------
+
+@jobs_router.get("")
+async def list_jobs(
     status: str | None = None,
     repo_name: str | None = None,
     limit: int = Query(50, ge=1, le=MAX_LIMIT),
     skip: int = Query(0, ge=0),
 ):
-    if job_id:
-        job_id = validate_job_id(job_id)
     if repo_name:
         repo_name = validate_repo_name(repo_name)
 
     db_client = get_db_client()
-
-    if job_id:
-        job = await _db_call("Get job status", db_client.get_job_status, job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail="Job not found")
-        return job
-
     jobs, total = await _db_call(
         "List jobs",
         db_client.list_jobs,
@@ -561,13 +651,20 @@ async def get_status(
     }
 
 
-@app.get("/repos")
-async def list_repos():
-    ingested_repos = await _db_call("List repos", get_db_client().list_ingested_repos)
-    return {"repos": ingested_repos}
+@jobs_router.get("/{job_id}", responses={404: {"model": ErrorResponse}})
+async def get_job(job_id: str):
+    job_id = validate_job_id(job_id)
+    db_client = get_db_client()
+    job = await _db_call("Get job status", db_client.get_job_status, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
 
 
-@app.delete("/jobs/{job_id}")
+@jobs_router.delete(
+    "/{job_id}",
+    responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
+)
 async def delete_job(job_id: str):
     job_id = validate_job_id(job_id)
     db_client = get_db_client()
@@ -589,20 +686,33 @@ async def delete_job(job_id: str):
     return {"job_id": job_id, "deleted": True}
 
 
-@app.get("/health")
-async def health():
-    from fastapi.responses import JSONResponse
+# Mount sub-routers under /v1, then mount /v1 on the app.
+api.include_router(conversations_router)
+api.include_router(chat_router)
+api.include_router(local_router)
+api.include_router(ingest_router)
+api.include_router(repos_router)
+api.include_router(jobs_router)
+app.include_router(api)
 
+
+# ---------------------------------------------------------------------------
+# Unversioned health probe (k8s-style)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/health", tags=["health"])
+async def health():
     overall_status = "healthy"
-    components = {}
+    components: dict[str, Any] = {}
 
     try:
         db_health = get_db_client().health_check()
         components["sqlite"] = db_health
         if db_health["status"] != "healthy":
             overall_status = "unhealthy"
-    except Exception as e:
-        components["sqlite"] = {"status": "unhealthy", "error": str(e)}
+    except Exception as exc:
+        components["sqlite"] = {"status": "unhealthy", "error": str(exc)}
         overall_status = "unhealthy"
 
     response = {

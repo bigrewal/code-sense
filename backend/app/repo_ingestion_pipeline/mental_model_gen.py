@@ -8,7 +8,7 @@ from tqdm import tqdm
 
 from ..config import Config
 from ..db import get_db_client
-from ..llm_grok import GrokLLM
+from ..llm import LLMProvider
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +55,7 @@ PROMPT_USER_TEMPLATE = """
 class MentalModelStage:
     """Stage for generating and storing the hierarchical mental model."""
 
-    def __init__(self, llm_grok: GrokLLM, config: dict | None = None):
+    def __init__(self, llm_grok: LLMProvider, config: dict | None = None):
         config = config or {}
         self.db_client = get_db_client()
         self.llm_client = llm_grok
@@ -136,7 +136,7 @@ class MentalModelStage:
             )
 
             async with semaphore:
-                response = await self.llm_client.generate_async(
+                response = await self.llm_client.generate(
                     prompt=user_prompt,
                     system_prompt=PROMPT_SYSTEM,
                     temperature=0.0,
@@ -173,13 +173,11 @@ class MentalModelStage:
         return insights, ignored
 
     async def create_repo_context(self, repo_name: str) -> int:
-        critical_files = set(self.db_client.get_critical_file_paths(repo_name))
-        context_parts: list[str] = []
-
-        for file_path in critical_files:
-            brief = self.db_client.get_brief_file_overview(repo_name, file_path)
-            if brief:
-                context_parts.append(brief)
+        briefs = self.db_client.list_mental_model_documents(
+            repo_name=repo_name,
+            document_types=[MENTAL_MODEL_TYPES["BRIEF"]],
+        )
+        context_parts = [doc["data"] for doc in briefs if doc.get("data")]
 
         repo_context = "\n\n".join(context_parts)
         repo_context_token_count = self.llm_client.count_tokens(repo_context)

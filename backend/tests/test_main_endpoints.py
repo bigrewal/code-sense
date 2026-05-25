@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 from fastapi import BackgroundTasks, HTTPException
+from pydantic import ValidationError
 
 from app import main
 
@@ -137,20 +138,33 @@ async def test_delete_conversation_404(fake_db):
     assert exc.value.status_code == 404
 
 
-@pytest.mark.asyncio
-async def test_chat_validation_errors():
-    with pytest.raises(HTTPException):
-        await main.chat(main.ChatRequest(conversation_id="", message="x"))
-    with pytest.raises(HTTPException):
-        await main.chat(main.ChatRequest(conversation_id="id", message=""))
+def test_chat_request_rejects_empty_fields():
+    with pytest.raises(ValidationError):
+        main.ChatRequest(conversation_id="", message="x")
+    with pytest.raises(ValidationError):
+        main.ChatRequest(conversation_id="id", message="")
+
+
+def test_stateless_chat_request_rejects_empty_fields():
+    with pytest.raises(ValidationError):
+        main.StatelessChatRequest(repo_name="", message="x")
+    with pytest.raises(ValidationError):
+        main.StatelessChatRequest(repo_name="repo-a", message="")
 
 
 @pytest.mark.asyncio
-async def test_stateless_chat_validation_errors():
-    with pytest.raises(HTTPException):
-        await main.stateless_chat(main.StatelessChatRequest(repo_name="", message="x"))
-    with pytest.raises(HTTPException):
-        await main.stateless_chat(main.StatelessChatRequest(repo_name="repo-a", message=""))
+async def test_chat_404_when_conversation_missing(fake_db):
+    req = main.ChatRequest(conversation_id="507f1f77bcf86cd799439012", message="hi")
+    with pytest.raises(HTTPException) as exc:
+        await main.chat(req)
+    assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_chat_returns_streaming_response(fake_db):
+    req = main.ChatRequest(conversation_id="507f1f77bcf86cd799439011", message="hi")
+    resp = await main.chat(req)
+    assert resp.media_type == "application/x-ndjson"
 
 
 @pytest.mark.asyncio
@@ -226,7 +240,7 @@ async def test_ingest_repo_success(fake_db, monkeypatch, tmp_path: Path):
     monkeypatch.setattr(background, "add_task", _fake_add_task)
 
     resp = await main.ingest_repo(background, main.IngestRequest(repo_name="repo-a"))
-    assert resp["status"] == "queued"
+    assert resp.status == "queued"
     assert scheduled["func"] is main._run_ingestion_job
     assert scheduled["kwargs"]["repo_name"] == "repo-a"
     assert scheduled["kwargs"]["local_repo_path"] == repo_dir.resolve()
@@ -236,6 +250,7 @@ async def test_ingest_repo_success(fake_db, monkeypatch, tmp_path: Path):
 async def test_ingest_repo_path_success_derives_repo_name(fake_db, monkeypatch, tmp_path: Path):
     repo_dir = tmp_path / "repo a"
     repo_dir.mkdir()
+    monkeypatch.setattr(main.Config, "REPO_BROWSER_ROOTS", [str(tmp_path)])
 
     scheduled = {}
 
@@ -248,19 +263,20 @@ async def test_ingest_repo_path_success_derives_repo_name(fake_db, monkeypatch, 
 
     resp = await main.ingest_repo(background, main.IngestRequest(repo_path=str(repo_dir)))
 
-    assert resp["status"] == "queued"
-    assert resp["repo_name"] == "repo-a"
+    assert resp.status == "queued"
+    assert resp.repo_name == "repo-a"
     assert scheduled["kwargs"]["repo_name"] == "repo-a"
     assert scheduled["kwargs"]["local_repo_path"] == repo_dir.resolve()
 
 
 @pytest.mark.asyncio
-async def test_ingest_repo_path_explicit_name_conflict(fake_db, tmp_path: Path):
+async def test_ingest_repo_path_explicit_name_conflict(fake_db, monkeypatch, tmp_path: Path):
     repo_dir = tmp_path / "repo-a"
     other_dir = tmp_path / "other"
     repo_dir.mkdir()
     other_dir.mkdir()
     fake_db.repo_paths["repo-a"] = str(other_dir)
+    monkeypatch.setattr(main.Config, "REPO_BROWSER_ROOTS", [str(tmp_path)])
 
     with pytest.raises(HTTPException) as exc:
         await main.ingest_repo(
@@ -269,6 +285,28 @@ async def test_ingest_repo_path_explicit_name_conflict(fake_db, tmp_path: Path):
         )
 
     assert exc.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_ingest_repo_path_blocked_outside_browser_roots(fake_db, monkeypatch, tmp_path: Path):
+    allowed = tmp_path / "allowed"
+    outside = tmp_path / "outside"
+    allowed.mkdir()
+    outside.mkdir()
+    monkeypatch.setattr(main.Config, "REPO_BROWSER_ROOTS", [str(allowed)])
+
+    with pytest.raises(HTTPException) as exc:
+        await main.ingest_repo(
+            BackgroundTasks(),
+            main.IngestRequest(repo_path=str(outside)),
+        )
+
+    assert exc.value.status_code == 400
+
+
+def test_ingest_request_requires_target():
+    with pytest.raises(ValidationError):
+        main.IngestRequest()
 
 
 @pytest.mark.asyncio
@@ -331,15 +369,21 @@ async def test_delete_repo_success(fake_db, monkeypatch, tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_get_status_by_job_not_found(fake_db):
+async def test_get_job_not_found(fake_db):
     with pytest.raises(HTTPException) as exc:
-        await main.get_status(job_id="00000000-0000-0000-0000-000000000000")
+        await main.get_job("00000000-0000-0000-0000-000000000000")
     assert exc.value.status_code == 404
 
 
 @pytest.mark.asyncio
-async def test_get_status_list(fake_db):
-    resp = await main.get_status(status="completed", repo_name="repo-a", limit=10, skip=0)
+async def test_get_job_found(fake_db):
+    resp = await main.get_job("00000000-0000-0000-0000-000000000001")
+    assert resp["job_id"] == "00000000-0000-0000-0000-000000000001"
+
+
+@pytest.mark.asyncio
+async def test_list_jobs(fake_db):
+    resp = await main.list_jobs(status="completed", repo_name="repo-a", limit=10, skip=0)
     assert resp["count"] == 1
     assert resp["total"] == 1
 

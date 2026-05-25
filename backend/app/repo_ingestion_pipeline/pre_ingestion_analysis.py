@@ -7,7 +7,7 @@ from typing import Any
 from tqdm import tqdm
 from ..config import Config
 from ..db import get_db_client
-from ..llm_grok import GrokLLM
+from ..llm import LLMProvider
 from .file_state import RepoFileChanges, build_repo_file_changes
 
 logger = logging.getLogger(__name__)
@@ -37,8 +37,8 @@ class PreIngestionAnalysisError(ValueError):
 
 
 class PreIngestionAnalysisStage:
-    def __init__(self, llm_grok: GrokLLM, repo_name: str):
-        self.llm_grok = llm_grok
+    def __init__(self, llm_grok: LLMProvider, repo_name: str):
+        self.llm = llm_grok
         self.repo_name = repo_name
 
     async def run(
@@ -110,7 +110,7 @@ class PreIngestionAnalysisStage:
                     if needs_retokenization:
                         content = await asyncio.to_thread((repo_path / rel).read_text, encoding="utf-8", errors="ignore")
                         async with sem:
-                            tok = await asyncio.to_thread(self.llm_grok.count_tokens, content)
+                            tok = await asyncio.to_thread(self.llm.count_tokens, content)
                         async with lock:
                             total_files_tokenized += 1
                     else:

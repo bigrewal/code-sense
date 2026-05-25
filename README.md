@@ -108,51 +108,75 @@ I believe this is a meaningful step toward more robust, doc-independent reposito
 * **Context window constraints**: CodeSense relies on fitting the compressed repo-wide mental model within the LLM’s context window. If the compressed representation exceeds the available context, this approach will not scale further without additional hierarchical compression. In practice, this design works well for most real-world repositories; for example, a ~1.2M LoC codebase (~5M raw tokens) was compressed to ~600k tokens, comfortably fitting within Grok’s 2M-token context window.
 --- 
 
-## Run Locally
+## Repository layout
 
-Make sure you have **`uv`** installed.
+```
+backend/   # FastAPI service (Python, managed with uv)
+frontend/  # React + Vite UI
+scripts/   # dev tooling (e.g. dev.sh runs both)
+```
 
-1. Install backend dependencies:
+## Quick start
 
-   ```bash
-   uv sync
-   ```
+Prerequisites: [`uv`](https://docs.astral.sh/uv/) and Node 18+.
 
-2. Configure the backend:
+```bash
+# 1. Install uv (skip if already installed)
+curl -LsSf https://astral.sh/uv/install.sh | sh
 
-   ```bash
-   cp .env.local.example .env.local
-   ```
+# 2. Set your API key
+cp .env.local.example .env.local
+# then edit .env.local and set XAI_API_KEY (or another provider — see below)
 
-   Set `XAI_API_KEY` in `.env.local`.
+# 3. Spin up CodeSense (backend + frontend)
+./scripts/dev.sh
+```
 
-3. Start the backend:
+Open the frontend URL printed by the script, usually http://localhost:5173,
+and select a local repository to ingest. Press Ctrl+C in the dev script to
+shut both servers down. If 5173 or 8000 is already busy, the script prints the
+alternate port it selected and wires the frontend to that backend automatically.
 
-   ```bash
-   uv run uvicorn app.main:app
-   ```
+### LLM providers
 
-4. Start the UI in a separate terminal:
+`grok` is the default. Set `LLM_PROVIDER` in `.env.local` to switch.
 
-   ```bash
-   git clone https://github.com/bigrewal/code-sense-ui
-   cd code-sense-ui
-   npm install
-   # Create .env.local and set VITE_API_BASE=http://localhost:8000
-   npm run dev
-   ```
+| Provider    | `LLM_PROVIDER`   | Required env vars                                                    | Install                          |
+|-------------|------------------|----------------------------------------------------------------------|----------------------------------|
+| xAI Grok    | `grok` (default) | `XAI_API_KEY`                                                        | `uv sync` (built-in)             |
+| OpenAI      | `openai`         | `OPENAI_API_KEY` (optional `OPENAI_BASE_URL` for compatible servers) | `uv sync --extra openai`         |
+| Anthropic   | `anthropic`      | `ANTHROPIC_API_KEY`                                                  | `uv sync --extra anthropic`      |
+| AWS Bedrock | `bedrock`        | `AWS_REGION` (+ standard AWS credential chain)                       | `uv sync --extra bedrock`        |
 
-5. Open http://localhost:5173/ and select a local repository from the UI.
+Override the model with `LLM_MODEL` (e.g. `LLM_MODEL=claude-sonnet-4-5`).
 
-   The repository can live anywhere the backend process can read. CodeSense
-   stores its own state in `.codesense/`.
+### Other settings
 
-**Optional Local Settings**
+All optional, set in `.env.local`:
 
-* `REPO_BROWSER_ROOTS=/path/one,/path/two` constrains which folders the UI can browse. By default, browsing starts at your home directory.
-* `SQLITE_DB_PATH=.codesense/code_sense.sqlite3` changes where CodeSense stores its SQLite database.
-* API docs are available at http://localhost:8000/docs#/.
+- `SQLITE_DB_PATH` (default `.codesense/code_sense.sqlite3`) — where state lives.
+- `REPO_BROWSER_ROOTS` (default `$HOME`) — comma-separated dirs the UI may browse.
+- `ALLOWED_ORIGINS` — comma-separated CORS origins.
+- `VITE_API_BASE` (frontend, default `http://localhost:8000`) — backend origin.
 
+API docs are at the backend URL printed by the script, usually
+http://localhost:8000/docs. The API is mounted under `/v1`; `/health` is
+unversioned.
+
+### Running just one side
+
+```bash
+cd backend  && uv run uvicorn app.main:app    # backend only
+cd frontend && npm install && npm run dev     # frontend only
+```
+
+### Tests
+
+```bash
+cd backend
+uv sync --extra test
+uv run --extra test python -m pytest
+```
 
 ---
 
@@ -162,17 +186,3 @@ Make sure you have **`uv`** installed.
 
 
 ![Demo screenshot](demo/screenshot.png)
-
----
-
-**Hard requirements**
-
-* `XAI_API_KEY`
-* A local repository path accessible to the API process
-* Optional: `SQLITE_DB_PATH` (defaults to `.codesense/code_sense.sqlite3`)
-* Optional: `REPO_BROWSER_ROOTS` (defaults to the API user's home directory)
-
-**Endpoints**
-
-* API: [http://localhost:8000](http://localhost:8000)
-* CodeSense UI: http://localhost:5173/

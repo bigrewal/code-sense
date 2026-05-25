@@ -11,14 +11,46 @@ from typing import Any, AsyncGenerator
 from pydantic import BaseModel, Field
 
 from .db import get_db_client
-from .llm_grok import GrokLLM
+from .llm import LLMProvider, get_llm_provider
 from .tools.fetch_code_file import fetch_code_file
 
 MESSAGE_TYPE_CHAT = "chat_message"
 MESSAGE_TYPE_PROGRESS = "progress_event"
 logger = logging.getLogger(__name__)
 
-llm = GrokLLM()
+_llm: LLMProvider | None = None
+
+
+def _get_llm() -> LLMProvider:
+    global _llm
+    if _llm is None:
+        _llm = get_llm_provider()
+    return _llm
+
+_repo_context_cache: dict[str, str] = {}
+_repo_context_cache_lock = asyncio.Lock()
+
+
+def invalidate_repo_context_cache(repo_name: str | None = None) -> None:
+    """Clear cached repo context. Called after ingestion writes a new context."""
+    if repo_name is None:
+        _repo_context_cache.clear()
+    else:
+        _repo_context_cache.pop(repo_name, None)
+
+
+async def _get_cached_repo_context(repo_name: str) -> str:
+    cached = _repo_context_cache.get(repo_name)
+    if cached is not None:
+        return cached
+    async with _repo_context_cache_lock:
+        cached = _repo_context_cache.get(repo_name)
+        if cached is not None:
+            return cached
+        db_client = get_db_client()
+        context = await asyncio.to_thread(db_client.get_repo_context, repo_name)
+        _repo_context_cache[repo_name] = context
+        return context
 
 
 class FileSelection(BaseModel):
@@ -123,62 +155,77 @@ class ChatEventRecorder:
 async def stream_chat(conversation_id: str, user_message: str):
     db_client = get_db_client()
     recorder = ChatEventRecorder(conversation_id=conversation_id)
-    conv = await asyncio.to_thread(db_client.get_conversation, conversation_id)
-    if not conv:
-        yield recorder.emit_error("Conversation not found.")
-        return
+    try:
+        conv = await asyncio.to_thread(db_client.get_conversation, conversation_id)
+        if not conv:
+            yield recorder.emit_error("Conversation not found.")
+            return
 
-    repo_name = conv["repo_name"]
+        repo_name = conv["repo_name"]
 
-    history_docs = await asyncio.to_thread(db_client.list_chat_history, conversation_id)
-    messages_for_llm: list[dict[str, str]] = [
-        {"role": m["role"], "content": m["content"]}
-        for m in history_docs
-        if m.get("role") in {"user", "assistant"}
-    ]
-    messages_for_llm.append({"role": "user", "content": user_message})
+        history_docs = await asyncio.to_thread(db_client.list_chat_history, conversation_id)
+        messages_for_llm: list[dict[str, str]] = [
+            {"role": m["role"], "content": m["content"]}
+            for m in history_docs
+            if m.get("role") in {"user", "assistant"}
+        ]
+        messages_for_llm.append({"role": "user", "content": user_message})
 
-    await recorder.persist_chat_message(role="user", content=user_message)
+        await recorder.persist_chat_message(role="user", content=user_message)
 
-    yield await recorder.emit_progress(
-        stage="rephrasing_question",
-        status="started",
-        message="Rephrasing question",
-    )
-    rephrased_user_question = await get_rephrased_question(messages=messages_for_llm, repo_name=repo_name)
-    logger.debug("Rephrased question for repo=%s", repo_name)
-    yield await recorder.emit_progress(
-        stage="rephrasing_question",
-        status="completed",
-        message="Question rephrased",
-        metadata={"rephrased_question": rephrased_user_question},
-    )
+        yield await recorder.emit_progress(
+            stage="rephrasing_question",
+            status="started",
+            message="Rephrasing question",
+        )
+        rephrased_user_question = await get_rephrased_question(messages=messages_for_llm, repo_name=repo_name)
+        logger.debug("Rephrased question for repo=%s", repo_name)
+        yield await recorder.emit_progress(
+            stage="rephrasing_question",
+            status="completed",
+            message="Question rephrased",
+            metadata={"rephrased_question": rephrased_user_question},
+        )
 
-    captured: list[str] = []
-    async for event in stream_answer(
-        user_question=rephrased_user_question,
-        repo_name=repo_name,
-    ):
-        if event["type"] == "content":
-            delta = event["delta"]
-            captured.append(delta)
-            yield recorder.emit_content(delta)
-            continue
+        captured: list[str] = []
+        async for event in stream_answer(
+            user_question=rephrased_user_question,
+            repo_name=repo_name,
+        ):
+            if event["type"] == "content":
+                delta = event["delta"]
+                captured.append(delta)
+                yield recorder.emit_content(delta)
+                continue
 
-        if event["type"] == "progress":
+            if event["type"] == "progress":
+                yield await recorder.emit_progress(
+                    stage=event["stage"],
+                    status=event["status"],
+                    message=event["message"],
+                    metadata=event.get("metadata"),
+                )
+                continue
+
+            yield recorder._serialize(event)
+
+        assistant_content = "".join(captured)
+        await recorder.persist_chat_message(role="assistant", content=assistant_content)
+        yield recorder.emit_done()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.exception("Chat stream failed for conversation=%s", conversation_id)
+        try:
             yield await recorder.emit_progress(
-                stage=event["stage"],
-                status=event["status"],
-                message=event["message"],
-                metadata=event.get("metadata"),
+                stage="chat",
+                status="failed",
+                message="Chat failed",
+                metadata={"error": str(exc)},
             )
-            continue
-
-        yield recorder._serialize(event)
-
-    assistant_content = "".join(captured)
-    await recorder.persist_chat_message(role="assistant", content=assistant_content)
-    yield recorder.emit_done()
+        except Exception:
+            logger.exception("Failed to persist chat failure for conversation=%s", conversation_id)
+        yield recorder.emit_error("Chat failed. Please try again.")
 
 
 async def stateless_stream_chat(repo_name: str, user_message: str):
@@ -186,32 +233,38 @@ async def stateless_stream_chat(repo_name: str, user_message: str):
     Stream a reply for a given repo_name and user message, ChatGPT-style.
     """
     recorder = ChatEventRecorder()
-    yield await recorder.emit_progress(
-        stage="rephrasing_question",
-        status="started",
-        message="Rephrasing question",
-    )
-    rephrased_user_question = await get_rephrased_question(
-        messages=[{"role": "user", "content": user_message}],
-        repo_name=repo_name,
-    )
-    yield await recorder.emit_progress(
-        stage="rephrasing_question",
-        status="completed",
-        message="Question rephrased",
-        metadata={"rephrased_question": rephrased_user_question},
-    )
+    try:
+        yield await recorder.emit_progress(
+            stage="rephrasing_question",
+            status="started",
+            message="Rephrasing question",
+        )
+        rephrased_user_question = await get_rephrased_question(
+            messages=[{"role": "user", "content": user_message}],
+            repo_name=repo_name,
+        )
+        yield await recorder.emit_progress(
+            stage="rephrasing_question",
+            status="completed",
+            message="Question rephrased",
+            metadata={"rephrased_question": rephrased_user_question},
+        )
 
-    async for event in stream_answer(
-        user_question=rephrased_user_question,
-        repo_name=repo_name
-    ):
-        if event["type"] == "content":
-            yield recorder.emit_content(event["delta"])
-        else:
-            yield recorder._serialize(event)
+        async for event in stream_answer(
+            user_question=rephrased_user_question,
+            repo_name=repo_name
+        ):
+            if event["type"] == "content":
+                yield recorder.emit_content(event["delta"])
+            else:
+                yield recorder._serialize(event)
 
-    yield recorder.emit_done()
+        yield recorder.emit_done()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.exception("Stateless chat stream failed for repo=%s", repo_name)
+        yield recorder.emit_error("Chat failed. Please try again.")
 
 # ---------------------------
 # Internal helpers
@@ -243,7 +296,7 @@ async def get_rephrased_question(messages: list[dict[str, str]], repo_name: str)
 
     Rephrase the LAST user message as a standalone question. Output ONLY the rephrased question:"""
 
-    return await llm.generate_async(
+    return await _get_llm().generate(
         prompt=user_prompt,
         system_prompt=system_prompt,
         temperature=0.0,
@@ -251,11 +304,11 @@ async def get_rephrased_question(messages: list[dict[str, str]], repo_name: str)
 
 
 async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[dict[str, Any], None]:
-    db_client = get_db_client()
+    llm = _get_llm()
 
     async def _select_files_for_query(
         repo_context: str,
-    ) -> list[FileSelection]:
+    ) -> tuple[list[FileSelection], str | None]:
         system_prompt = f"""
         You are a senior codebase analysis agent.
 
@@ -324,19 +377,24 @@ async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[di
         
         response = ""
         try:
-            response = await llm.generate_async(
+            response = await llm.generate(
                 prompt=user_question,
                 system_prompt=system_prompt,
                 temperature=0.0,
                 response_format=FileSelectionResponse,
             )
             logger.info("Raw file-selection LLM response: %r", response)
-            
-            return FileSelectionResponse.model_validate_json(response).files_to_fetch
-            
-        except Exception:
-            logger.exception(f"Error selecting files for query: {response}")
-            return []
+
+            return FileSelectionResponse.model_validate_json(response).files_to_fetch, None
+
+        except Exception as exc:
+            logger.error(
+                "File selection failed for repo=%s; falling back to summary-only answer. raw_response=%r",
+                repo_name,
+                response,
+                exc_info=True,
+            )
+            return [], f"{type(exc).__name__}: {exc}"
         
     async def _read_file_task(file_info: FileSelection) -> dict[str, Any]:
         try:
@@ -352,7 +410,7 @@ async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[di
 
                 """
 
-            insight = await llm.generate_async(
+            insight = await llm.generate(
                 prompt=user_prompt,
                 system_prompt="Your task is to only fetch the information requested from the provided code",
                 temperature=0.0,
@@ -398,7 +456,7 @@ async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[di
             {user_question}
             """
         
-        return await llm.generate_async(
+        return await llm.generate(
             prompt=user_prompt,
             system_prompt=system_prompt,
             temperature=0.0,
@@ -475,25 +533,14 @@ async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[di
         You are synthesizing, not analyzing or extending.
         """
         
-        stream = llm.generate(
+        async for delta in llm.generate_stream(
             prompt=user_question,
             system_prompt=system_prompt,
             temperature=0.0,
-            stream=True,
-        )
-        
-        for _, chunk in stream:
-            content = getattr(chunk, "content", None)
-            if content:
-                yield {
-                    "type": "content",
-                    "delta": content,
-                }
+        ):
+            yield {"type": "content", "delta": delta}
 
-        yield {
-            "type": "content",
-            "delta": "\n",
-        }
+        yield {"type": "content", "delta": "\n"}
 
     yield {
         "type": "progress",
@@ -502,7 +549,7 @@ async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[di
         "message": "Selecting relevant files",
         "metadata": {},
     }
-    repo_context = await asyncio.to_thread(db_client.get_repo_context, repo_name)
+    repo_context = await _get_cached_repo_context(repo_name)
 
     additional_info_required_task = asyncio.create_task(
         _select_files_for_query(repo_context=repo_context)
@@ -514,18 +561,27 @@ async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[di
         )
     )
 
-    additional_info_required: list[FileSelection] = await additional_info_required_task
+    additional_info_required, file_selection_error = await additional_info_required_task
 
-    yield {
-        "type": "progress",
-        "stage": "selecting_files",
-        "status": "completed",
-        "message": "Completed file selection",
-        "metadata": {
-            "file_count": len(additional_info_required),
-            "files": [item.file_path for item in additional_info_required],
-        },
-    }
+    if file_selection_error:
+        yield {
+            "type": "progress",
+            "stage": "selecting_files",
+            "status": "failed",
+            "message": "File selection failed; answering from repository summaries only.",
+            "metadata": {"error": file_selection_error},
+        }
+    else:
+        yield {
+            "type": "progress",
+            "stage": "selecting_files",
+            "status": "completed",
+            "message": "Completed file selection",
+            "metadata": {
+                "file_count": len(additional_info_required),
+                "files": [item.file_path for item in additional_info_required],
+            },
+        }
 
     file_insights: list[Any] = []
     if additional_info_required:

@@ -87,7 +87,7 @@ def test_initial_stage_is_precheck():
 async def test_start_ingestion_pipeline_happy_path(monkeypatch, tmp_path: Path):
     fake_db = FakeDB()
     monkeypatch.setattr(rp, "get_db_client", lambda: fake_db)
-    monkeypatch.setattr(rp, "GrokLLM", lambda: object())
+    monkeypatch.setattr(rp, "get_llm_provider", lambda: object())
     monkeypatch.setattr(rp, "build_repo_file_changes", lambda *_args, **_kwargs: _empty_changes())
     monkeypatch.setattr(rp, "PreIngestionAnalysisStage", DummyPrecheckStage)
     monkeypatch.setattr(rp, "MentalModelStage", DummyMentalModel)
@@ -106,7 +106,7 @@ async def test_start_ingestion_pipeline_happy_path(monkeypatch, tmp_path: Path):
 async def test_start_ingestion_pipeline_precheck_failure(monkeypatch, tmp_path: Path):
     fake_db = FakeDB()
     monkeypatch.setattr(rp, "get_db_client", lambda: fake_db)
-    monkeypatch.setattr(rp, "GrokLLM", lambda: object())
+    monkeypatch.setattr(rp, "get_llm_provider", lambda: object())
     monkeypatch.setattr(rp, "build_repo_file_changes", lambda *_args, **_kwargs: _empty_changes())
     monkeypatch.setattr(rp, "PreIngestionAnalysisStage", FailingPrecheckStage)
 
@@ -124,7 +124,7 @@ async def test_start_ingestion_pipeline_precheck_failure(monkeypatch, tmp_path: 
 async def test_start_ingestion_pipeline_mental_model_failure(monkeypatch, tmp_path: Path):
     fake_db = FakeDB()
     monkeypatch.setattr(rp, "get_db_client", lambda: fake_db)
-    monkeypatch.setattr(rp, "GrokLLM", lambda: object())
+    monkeypatch.setattr(rp, "get_llm_provider", lambda: object())
     monkeypatch.setattr(rp, "build_repo_file_changes", lambda *_args, **_kwargs: _empty_changes())
     monkeypatch.setattr(rp, "PreIngestionAnalysisStage", DummyPrecheckStage)
     monkeypatch.setattr(rp, "MentalModelStage", FailingMentalModel)
@@ -142,7 +142,7 @@ async def test_start_ingestion_pipeline_mental_model_failure(monkeypatch, tmp_pa
 async def test_start_ingestion_pipeline_marks_cancelled_on_task_cancellation(monkeypatch, tmp_path: Path):
     fake_db = FakeDB()
     monkeypatch.setattr(rp, "get_db_client", lambda: fake_db)
-    monkeypatch.setattr(rp, "GrokLLM", lambda: object())
+    monkeypatch.setattr(rp, "get_llm_provider", lambda: object())
     monkeypatch.setattr(rp, "build_repo_file_changes", lambda *_args, **_kwargs: _empty_changes())
     monkeypatch.setattr(rp, "PreIngestionAnalysisStage", DummyPrecheckStage)
     monkeypatch.setattr(rp, "MentalModelStage", CancelledMentalModel)

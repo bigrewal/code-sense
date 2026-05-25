@@ -1,0 +1,85 @@
+@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Source+Serif+4:wght@500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg-0: #f5f7fa;
+  --bg-1: #f1f4f8;
+  --surface: #ffffff;
+  --surface-soft: #ffffff;
+  --surface-2: #f8fbff;
+  --text: #1b2432;
+  --text-soft: #586375;
+  --line: rgba(103, 126, 168, 0.2);
+  --accent: #0a7f9a;
+  --accent-strong: #096a82;
+  --success: #1f9d57;
+  --warning: #b47b00;
+  --danger: #c13749;
+}
+
+body {
+  margin: 0;
+  font-family: 'Manrope', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  color: var(--text);
+  background: linear-gradient(180deg, var(--bg-0), var(--bg-1));
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  height: 100vh;
+}
+
+h1, h2, h3, h4, h5 {
+  font-family: 'Source Serif 4', Georgia, serif;
+  letter-spacing: -0.01em;
+}
+
+kbd {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(107, 130, 173, 0.5) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: rgba(107, 130, 173, 0.5);
+  border-radius: 999px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.surface-card {
+  background: var(--surface-soft);
+  border: 1px solid var(--line);
+  box-shadow:
+    0 1px 2px rgba(17, 28, 47, 0.03),
+    0 8px 18px rgba(17, 28, 47, 0.06);
+}
+
+.fade-in-up {
+  animation: fade-in-up 280ms ease-out;
+}
+
+@keyframes fade-in-up {
+  from {
+    transform: translateY(8px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}

@@ -1,16 +1,21 @@
-# Python-generated files
-__pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-
-# Virtual environments
-.venv
-.env.local
-.codesense/
-evals/
-tests/evals/
-# macOS cruft
+# Editor / OS cruft
 .DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.sublime-workspace
+*.sublime-project
+.claude
+
+# Local secrets (any subtree)
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Local app state
+.codesense/
+
+# Evaluation artifacts
+evals/
