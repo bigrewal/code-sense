@@ -7,6 +7,14 @@ from loguru import logger
 from starlette.middleware.base import BaseHTTPMiddleware
 
 
+def _log_level_for_status_code(status_code: int) -> str:
+    if status_code >= 500:
+        return "error"
+    if status_code >= 400:
+        return "warning"
+    return "info"
+
+
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable):
         request_id = str(uuid.uuid4())
@@ -25,7 +33,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         try:
             response = await call_next(request)
             duration_ms = (time.time() - start_time) * 1000
-            log = logger.error if response.status_code >= 400 else logger.info
+            log = getattr(logger, _log_level_for_status_code(response.status_code))
             log(
                 "output request_id={} status_code={} duration_ms={:.2f}",
                 request_id,

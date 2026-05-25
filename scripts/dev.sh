@@ -16,9 +16,9 @@ require() {
 require uv
 require npm
 
-if [[ ! -f "$BACKEND_DIR/.env.local" ]]; then
-  echo "error: $BACKEND_DIR/.env.local is missing." >&2
-  echo "       cp $BACKEND_DIR/.env.local.example $BACKEND_DIR/.env.local and set your API key." >&2
+if [[ ! -f "$ROOT_DIR/.env.local" ]]; then
+  echo "error: $ROOT_DIR/.env.local is missing." >&2
+  echo "       cp $ROOT_DIR/.env.local.example $ROOT_DIR/.env.local and set your API key." >&2
   exit 1
 fi
 
@@ -29,6 +29,56 @@ if [[ ! -d "$FRONTEND_DIR/node_modules" ]]; then
   echo "==> installing frontend deps"
   (cd "$FRONTEND_DIR" && npm install --silent --no-audit --no-fund)
 fi
+
+find_free_port() {
+  uv run --project "$BACKEND_DIR" python - "$1" <<'PY'
+import socket
+import sys
+
+def can_bind(port: int) -> bool:
+    targets = [(socket.AF_INET, "127.0.0.1")]
+    if socket.has_ipv6:
+        targets.append((socket.AF_INET6, "::1"))
+
+    sockets = []
+    try:
+        for family, host in targets:
+            sock = socket.socket(family, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind((host, port))
+            except OSError:
+                sock.close()
+                return False
+            sockets.append(sock)
+        return True
+    finally:
+        for sock in sockets:
+            sock.close()
+
+start = int(sys.argv[1])
+for port in range(start, start + 50):
+    if not can_bind(port):
+        continue
+    print(port)
+    break
+else:
+    raise SystemExit(f"no available port found from {start} to {start + 49}")
+PY
+}
+
+BACKEND_PORT="$(find_free_port 8000)"
+FRONTEND_PORT="$(find_free_port 5173)"
+
+if [[ "$BACKEND_PORT" != "8000" ]]; then
+  echo "==> backend port 8000 is busy; using http://localhost:$BACKEND_PORT"
+fi
+
+if [[ "$FRONTEND_PORT" != "5173" ]]; then
+  echo "==> frontend port 5173 is busy; using http://localhost:$FRONTEND_PORT"
+fi
+
+DEV_ALLOWED_ORIGINS="http://localhost:$FRONTEND_PORT,http://127.0.0.1:$FRONTEND_PORT,http://localhost:$BACKEND_PORT,http://127.0.0.1:$BACKEND_PORT"
 
 # Recursively find every descendant of the given PID.
 descendants() {
@@ -65,13 +115,48 @@ cleanup() {
 }
 trap cleanup INT TERM EXIT
 
-echo "==> starting backend on http://localhost:8000"
-( cd "$BACKEND_DIR" && exec uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 ) &
+echo "==> starting backend on http://localhost:$BACKEND_PORT"
+(
+  cd "$ROOT_DIR"
+  exec env PYTHONPATH="$BACKEND_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+    ALLOWED_ORIGINS="$DEV_ALLOWED_ORIGINS" \
+    uv run --project "$BACKEND_DIR" uvicorn app.main:app \
+      --host 127.0.0.1 \
+      --port "$BACKEND_PORT" \
+      --env-file "$ROOT_DIR/.env.local"
+) &
 backend_pid=$!
 
-echo "==> starting frontend on http://localhost:5173"
-( cd "$FRONTEND_DIR" && exec npm run dev --silent ) &
+echo "==> starting frontend on http://localhost:$FRONTEND_PORT"
+(
+  cd "$FRONTEND_DIR"
+  exec env VITE_API_BASE="http://localhost:$BACKEND_PORT" \
+    npm run dev --silent -- --host 0.0.0.0 --port "$FRONTEND_PORT" --strictPort
+) &
 frontend_pid=$!
 
 # Surface the first failure: if either child exits, tear the other down too.
-wait -n "$backend_pid" "$frontend_pid"
+is_running_child() {
+  jobs -pr | grep -qx "$1"
+}
+
+while is_running_child "$backend_pid" && is_running_child "$frontend_pid"; do
+  sleep 1
+done
+
+status=0
+if ! is_running_child "$backend_pid"; then
+  set +e
+  wait "$backend_pid"
+  status=$?
+  set -e
+  echo "==> backend exited with status $status" >&2
+elif ! is_running_child "$frontend_pid"; then
+  set +e
+  wait "$frontend_pid"
+  status=$?
+  set -e
+  echo "==> frontend exited with status $status" >&2
+fi
+
+exit "$status"

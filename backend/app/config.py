@@ -1,10 +1,29 @@
 import os
 from pathlib import Path
 
-if Path(".env.local").exists():
-    from dotenv import load_dotenv
+from dotenv import load_dotenv
 
-    load_dotenv(".env.local")
+
+def _load_local_env() -> None:
+    """Load local dotenv files independent of the process working directory."""
+    backend_dir = Path(__file__).resolve().parents[1]
+    repo_root = backend_dir.parent
+    candidates = (
+        Path.cwd() / ".env.local",
+        repo_root / ".env.local",
+        backend_dir / ".env.local",
+    )
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve(strict=False)
+        if resolved in seen or not candidate.exists():
+            continue
+        load_dotenv(candidate, override=False)
+        seen.add(resolved)
+
+
+_load_local_env()
 
 
 class Config:

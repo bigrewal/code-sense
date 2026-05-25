@@ -598,6 +598,8 @@ async def delete_repo(repo_name: str, delete_files: bool = False):
             try:
                 import shutil
                 await asyncio.to_thread(shutil.rmtree, local_repo_path)
+            except HTTPException:
+                raise
             except Exception as exc:
                 logger.exception("Failed to delete repo files", exc_info=exc)
                 raise HTTPException(status_code=500, detail="Failed to delete repo files")
@@ -606,6 +608,8 @@ async def delete_repo(repo_name: str, delete_files: bool = False):
 
     try:
         deletion_result = await _db_call("Delete repo data", db_client.delete_repo_data, repo_name)
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("Failed to delete repo documents", exc_info=exc)
         raise HTTPException(status_code=500, detail="Failed to delete repo data")

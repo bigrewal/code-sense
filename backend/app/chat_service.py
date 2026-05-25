@@ -11,14 +11,21 @@ from typing import Any, AsyncGenerator
 from pydantic import BaseModel, Field
 
 from .db import get_db_client
-from .llm import get_llm_provider
+from .llm import LLMProvider, get_llm_provider
 from .tools.fetch_code_file import fetch_code_file
 
 MESSAGE_TYPE_CHAT = "chat_message"
 MESSAGE_TYPE_PROGRESS = "progress_event"
 logger = logging.getLogger(__name__)
 
-llm = get_llm_provider()
+_llm: LLMProvider | None = None
+
+
+def _get_llm() -> LLMProvider:
+    global _llm
+    if _llm is None:
+        _llm = get_llm_provider()
+    return _llm
 
 _repo_context_cache: dict[str, str] = {}
 _repo_context_cache_lock = asyncio.Lock()
@@ -148,62 +155,77 @@ class ChatEventRecorder:
 async def stream_chat(conversation_id: str, user_message: str):
     db_client = get_db_client()
     recorder = ChatEventRecorder(conversation_id=conversation_id)
-    conv = await asyncio.to_thread(db_client.get_conversation, conversation_id)
-    if not conv:
-        yield recorder.emit_error("Conversation not found.")
-        return
+    try:
+        conv = await asyncio.to_thread(db_client.get_conversation, conversation_id)
+        if not conv:
+            yield recorder.emit_error("Conversation not found.")
+            return
 
-    repo_name = conv["repo_name"]
+        repo_name = conv["repo_name"]
 
-    history_docs = await asyncio.to_thread(db_client.list_chat_history, conversation_id)
-    messages_for_llm: list[dict[str, str]] = [
-        {"role": m["role"], "content": m["content"]}
-        for m in history_docs
-        if m.get("role") in {"user", "assistant"}
-    ]
-    messages_for_llm.append({"role": "user", "content": user_message})
+        history_docs = await asyncio.to_thread(db_client.list_chat_history, conversation_id)
+        messages_for_llm: list[dict[str, str]] = [
+            {"role": m["role"], "content": m["content"]}
+            for m in history_docs
+            if m.get("role") in {"user", "assistant"}
+        ]
+        messages_for_llm.append({"role": "user", "content": user_message})
 
-    await recorder.persist_chat_message(role="user", content=user_message)
+        await recorder.persist_chat_message(role="user", content=user_message)
 
-    yield await recorder.emit_progress(
-        stage="rephrasing_question",
-        status="started",
-        message="Rephrasing question",
-    )
-    rephrased_user_question = await get_rephrased_question(messages=messages_for_llm, repo_name=repo_name)
-    logger.debug("Rephrased question for repo=%s", repo_name)
-    yield await recorder.emit_progress(
-        stage="rephrasing_question",
-        status="completed",
-        message="Question rephrased",
-        metadata={"rephrased_question": rephrased_user_question},
-    )
+        yield await recorder.emit_progress(
+            stage="rephrasing_question",
+            status="started",
+            message="Rephrasing question",
+        )
+        rephrased_user_question = await get_rephrased_question(messages=messages_for_llm, repo_name=repo_name)
+        logger.debug("Rephrased question for repo=%s", repo_name)
+        yield await recorder.emit_progress(
+            stage="rephrasing_question",
+            status="completed",
+            message="Question rephrased",
+            metadata={"rephrased_question": rephrased_user_question},
+        )
 
-    captured: list[str] = []
-    async for event in stream_answer(
-        user_question=rephrased_user_question,
-        repo_name=repo_name,
-    ):
-        if event["type"] == "content":
-            delta = event["delta"]
-            captured.append(delta)
-            yield recorder.emit_content(delta)
-            continue
+        captured: list[str] = []
+        async for event in stream_answer(
+            user_question=rephrased_user_question,
+            repo_name=repo_name,
+        ):
+            if event["type"] == "content":
+                delta = event["delta"]
+                captured.append(delta)
+                yield recorder.emit_content(delta)
+                continue
 
-        if event["type"] == "progress":
+            if event["type"] == "progress":
+                yield await recorder.emit_progress(
+                    stage=event["stage"],
+                    status=event["status"],
+                    message=event["message"],
+                    metadata=event.get("metadata"),
+                )
+                continue
+
+            yield recorder._serialize(event)
+
+        assistant_content = "".join(captured)
+        await recorder.persist_chat_message(role="assistant", content=assistant_content)
+        yield recorder.emit_done()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.exception("Chat stream failed for conversation=%s", conversation_id)
+        try:
             yield await recorder.emit_progress(
-                stage=event["stage"],
-                status=event["status"],
-                message=event["message"],
-                metadata=event.get("metadata"),
+                stage="chat",
+                status="failed",
+                message="Chat failed",
+                metadata={"error": str(exc)},
             )
-            continue
-
-        yield recorder._serialize(event)
-
-    assistant_content = "".join(captured)
-    await recorder.persist_chat_message(role="assistant", content=assistant_content)
-    yield recorder.emit_done()
+        except Exception:
+            logger.exception("Failed to persist chat failure for conversation=%s", conversation_id)
+        yield recorder.emit_error("Chat failed. Please try again.")
 
 
 async def stateless_stream_chat(repo_name: str, user_message: str):
@@ -211,32 +233,38 @@ async def stateless_stream_chat(repo_name: str, user_message: str):
     Stream a reply for a given repo_name and user message, ChatGPT-style.
     """
     recorder = ChatEventRecorder()
-    yield await recorder.emit_progress(
-        stage="rephrasing_question",
-        status="started",
-        message="Rephrasing question",
-    )
-    rephrased_user_question = await get_rephrased_question(
-        messages=[{"role": "user", "content": user_message}],
-        repo_name=repo_name,
-    )
-    yield await recorder.emit_progress(
-        stage="rephrasing_question",
-        status="completed",
-        message="Question rephrased",
-        metadata={"rephrased_question": rephrased_user_question},
-    )
+    try:
+        yield await recorder.emit_progress(
+            stage="rephrasing_question",
+            status="started",
+            message="Rephrasing question",
+        )
+        rephrased_user_question = await get_rephrased_question(
+            messages=[{"role": "user", "content": user_message}],
+            repo_name=repo_name,
+        )
+        yield await recorder.emit_progress(
+            stage="rephrasing_question",
+            status="completed",
+            message="Question rephrased",
+            metadata={"rephrased_question": rephrased_user_question},
+        )
 
-    async for event in stream_answer(
-        user_question=rephrased_user_question,
-        repo_name=repo_name
-    ):
-        if event["type"] == "content":
-            yield recorder.emit_content(event["delta"])
-        else:
-            yield recorder._serialize(event)
+        async for event in stream_answer(
+            user_question=rephrased_user_question,
+            repo_name=repo_name
+        ):
+            if event["type"] == "content":
+                yield recorder.emit_content(event["delta"])
+            else:
+                yield recorder._serialize(event)
 
-    yield recorder.emit_done()
+        yield recorder.emit_done()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.exception("Stateless chat stream failed for repo=%s", repo_name)
+        yield recorder.emit_error("Chat failed. Please try again.")
 
 # ---------------------------
 # Internal helpers
@@ -268,7 +296,7 @@ async def get_rephrased_question(messages: list[dict[str, str]], repo_name: str)
 
     Rephrase the LAST user message as a standalone question. Output ONLY the rephrased question:"""
 
-    return await llm.generate(
+    return await _get_llm().generate(
         prompt=user_prompt,
         system_prompt=system_prompt,
         temperature=0.0,
@@ -276,6 +304,8 @@ async def get_rephrased_question(messages: list[dict[str, str]], repo_name: str)
 
 
 async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[dict[str, Any], None]:
+    llm = _get_llm()
+
     async def _select_files_for_query(
         repo_context: str,
     ) -> tuple[list[FileSelection], str | None]:
@@ -347,7 +377,7 @@ async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[di
         
         response = ""
         try:
-            response = await llm.generate_async(
+            response = await llm.generate(
                 prompt=user_question,
                 system_prompt=system_prompt,
                 temperature=0.0,
@@ -380,7 +410,7 @@ async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[di
 
                 """
 
-            insight = await llm.generate_async(
+            insight = await llm.generate(
                 prompt=user_prompt,
                 system_prompt="Your task is to only fetch the information requested from the provided code",
                 temperature=0.0,

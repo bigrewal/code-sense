@@ -125,19 +125,21 @@ Prerequisites: [`uv`](https://docs.astral.sh/uv/) and Node 18+.
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # 2. Set your API key
-cp backend/.env.local.example backend/.env.local
-# then edit backend/.env.local and set XAI_API_KEY (or another provider — see below)
+cp .env.local.example .env.local
+# then edit .env.local and set XAI_API_KEY (or another provider — see below)
 
 # 3. Spin up CodeSense (backend + frontend)
 ./scripts/dev.sh
 ```
 
-Open http://localhost:5173 and select a local repository to ingest. Press
-Ctrl+C in the dev script to shut both servers down.
+Open the frontend URL printed by the script, usually http://localhost:5173,
+and select a local repository to ingest. Press Ctrl+C in the dev script to
+shut both servers down. If 5173 or 8000 is already busy, the script prints the
+alternate port it selected and wires the frontend to that backend automatically.
 
 ### LLM providers
 
-`grok` is the default. Set `LLM_PROVIDER` in `backend/.env.local` to switch.
+`grok` is the default. Set `LLM_PROVIDER` in `.env.local` to switch.
 
 | Provider    | `LLM_PROVIDER`   | Required env vars                                                    | Install                          |
 |-------------|------------------|----------------------------------------------------------------------|----------------------------------|
@@ -150,15 +152,16 @@ Override the model with `LLM_MODEL` (e.g. `LLM_MODEL=claude-sonnet-4-5`).
 
 ### Other settings
 
-All optional, set in `backend/.env.local`:
+All optional, set in `.env.local`:
 
 - `SQLITE_DB_PATH` (default `.codesense/code_sense.sqlite3`) — where state lives.
 - `REPO_BROWSER_ROOTS` (default `$HOME`) — comma-separated dirs the UI may browse.
 - `ALLOWED_ORIGINS` — comma-separated CORS origins.
 - `VITE_API_BASE` (frontend, default `http://localhost:8000`) — backend origin.
 
-API docs: http://localhost:8000/docs. The API is mounted under `/v1`;
-`/health` is unversioned.
+API docs are at the backend URL printed by the script, usually
+http://localhost:8000/docs. The API is mounted under `/v1`; `/health` is
+unversioned.
 
 ### Running just one side
 
@@ -172,7 +175,7 @@ cd frontend && npm install && npm run dev     # frontend only
 ```bash
 cd backend
 uv sync --extra test
-XAI_API_KEY=test uv run python -m pytest      # any value works for tests
+uv run --extra test python -m pytest
 ```
 
 ---

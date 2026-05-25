@@ -9,16 +9,22 @@ async function readJson(response) {
 
 async function buildApiError(response) {
   let detail = `Request failed with status ${response.status}`;
+  let payload = null;
   try {
-    const payload = await readJson(response);
-    if (payload?.detail) {
+    payload = await readJson(response);
+    if (typeof payload?.detail === 'string' && payload.detail) {
       detail = payload.detail;
+    } else if (typeof payload?.error === 'string' && payload.error) {
+      detail = payload.error;
+    } else if (typeof payload?.message === 'string' && payload.message) {
+      detail = payload.message;
     }
   } catch {
     // Ignore parse errors and keep generic detail.
   }
   const error = new Error(detail);
   error.status = response.status;
+  error.payload = payload;
   return error;
 }
 

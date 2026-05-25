@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
 from fastapi import Request, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from loguru import logger
@@ -10,11 +11,25 @@ from app.config import Config
 
 
 def _error_payload(request: Request, **extra) -> dict:
-    return extra | {
+    if "error" in extra and "detail" not in extra:
+        extra["detail"] = extra["error"]
+
+    return jsonable_encoder(extra | {
         "path": str(request.url.path),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "request_id": getattr(request.state, "request_id", None),
-    }
+    })
+
+
+def _validation_errors(exc: RequestValidationError) -> list[dict]:
+    errors = []
+    for raw_error in exc.errors():
+        error = dict(raw_error)
+        ctx = error.get("ctx")
+        if isinstance(ctx, dict):
+            error["ctx"] = {key: str(value) for key, value in ctx.items()}
+        errors.append(error)
+    return errors
 
 
 async def http_exception_handler(request: Request, exc: StarletteHTTPException):
@@ -34,7 +49,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         content=_error_payload(
             request,
             error="Validation error",
-            details=exc.errors(),
+            details=_validation_errors(exc),
         ),
     )
 
