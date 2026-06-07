@@ -19,6 +19,9 @@ from .openai_provider import _approx_token_count, _load_tiktoken_encoder
 logger = logging.getLogger(__name__)
 
 
+_PROMPT_CACHE_DISABLED_VALUES = {"", "0", "false", "off", "none", "disabled"}
+
+
 def _is_rate_limit_error(exc: Exception) -> bool:
     try:
         from anthropic import RateLimitError  # type: ignore[import-not-found]
@@ -30,16 +33,41 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     return "rate limit" in msg or "429" in msg or "overloaded" in msg
 
 
+def _normalize_prompt_cache_ttl(ttl: str | None) -> str | None:
+    normalized = (ttl or "5m").strip().lower()
+    if normalized in _PROMPT_CACHE_DISABLED_VALUES:
+        return None
+    if normalized not in {"5m", "1h"}:
+        raise LLMProviderError(
+            "ANTHROPIC_PROMPT_CACHE_TTL must be one of: 5m, 1h, false"
+        )
+    return normalized
+
+
+def _cache_control(ttl: str) -> dict[str, str]:
+    control = {"type": "ephemeral"}
+    if ttl == "1h":
+        control["ttl"] = "1h"
+    return control
+
+
 class AnthropicProvider(LLMProvider):
     name = "anthropic"
     DEFAULT_MODEL = "claude-sonnet-4-5"
 
-    def __init__(self, *, api_key: str | None = None, default_model: str | None = None):
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        default_model: str | None = None,
+        prompt_cache_ttl: str | None = "5m",
+    ):
         client_kwargs: dict[str, Any] = {}
         if api_key:
             client_kwargs["api_key"] = api_key
         self._async_client, self._sync_client = self._build_clients(client_kwargs)
         self._default_model = default_model or self.DEFAULT_MODEL
+        self._prompt_cache_ttl = _normalize_prompt_cache_ttl(prompt_cache_ttl)
         self._encoder = _load_tiktoken_encoder()
 
     def _build_clients(self, kwargs: dict[str, Any]):
@@ -75,6 +103,17 @@ class AnthropicProvider(LLMProvider):
     def count_tokens(self, text: str) -> int:
         return _approx_token_count(self._encoder, text)
 
+    def _system_prompt(self, system_prompt: str) -> str | list[dict[str, Any]]:
+        if not self._prompt_cache_ttl:
+            return system_prompt
+        return [
+            {
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": _cache_control(self._prompt_cache_ttl),
+            }
+        ]
+
     def _request_kwargs(
         self,
         *,
@@ -91,7 +130,7 @@ class AnthropicProvider(LLMProvider):
             "messages": [{"role": "user", "content": prompt}] if prompt else [],
         }
         if system_prompt:
-            kwargs["system"] = system_prompt
+            kwargs["system"] = self._system_prompt(system_prompt)
         return kwargs
 
     async def generate(

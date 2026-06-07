@@ -972,6 +972,16 @@ def init_db_client():
     return client
 
 
+def create_sqlite_client(db_path: str) -> SQLiteClient:
+    client = object.__new__(SQLiteClient)
+    client._db_path = db_path
+    client._conn = None
+    client._thread_lock = threading.RLock()
+    client._initialized = True
+    client.connect()
+    return client
+
+
 def get_db_client() -> SQLiteClient:
     if SQLiteClient._instance is None:
         init_db_client()

@@ -23,7 +23,7 @@ if [[ ! -f "$ROOT_DIR/.env.local" ]]; then
 fi
 
 echo "==> syncing backend deps"
-(cd "$BACKEND_DIR" && uv sync --quiet)
+(cd "$BACKEND_DIR" && uv sync --quiet --all-extras)
 
 if [[ ! -d "$FRONTEND_DIR/node_modules" ]]; then
   echo "==> installing frontend deps"

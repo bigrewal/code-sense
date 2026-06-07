@@ -5,7 +5,12 @@ Thumbs.db
 .vscode/
 *.sublime-workspace
 *.sublime-project
-.claude
+.claude/*
+!.claude/agents/
+!.claude/agents/*.md
+.codex/*
+!.codex/agents/
+!.codex/agents/*.toml
 
 # Local secrets (any subtree)
 .env
