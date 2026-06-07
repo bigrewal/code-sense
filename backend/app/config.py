@@ -42,6 +42,7 @@ class Config:
 
     # Anthropic
     ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+    ANTHROPIC_PROMPT_CACHE_TTL = os.getenv("ANTHROPIC_PROMPT_CACHE_TTL", "5m").strip().lower()
 
     # AWS Bedrock (Claude)
     AWS_REGION = os.getenv("AWS_REGION", "")

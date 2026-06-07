@@ -436,6 +436,12 @@ async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[di
 
         Your task is to answer the user's question **solely using the information explicitly present in the provided file summaries and repository overview**.
 
+        REPOSITORY NAME:
+        {repo_name}
+
+        FILE SUMMARIES:
+        {repo_context}
+
         Rules:
         - Never invent, assume, or hallucinate details (e.g., function implementations, variable names, exact code logic, or file contents) that are not directly stated in the summaries.
         - If the question asks for specific code details, line-by-line explanations, or implementation specifics that are not covered in the summaries, clearly state that this information is not available in the provided summaries.
@@ -445,19 +451,9 @@ async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[di
 
         Answer clearly, concisely, and professionally.
         """
-
-        user_prompt = f"""
-            REPOSITORY NAME: {repo_name}
-
-            FILE SUMMARIES:
-            {repo_context}
-
-            User question:
-            {user_question}
-            """
         
         return await llm.generate(
-            prompt=user_prompt,
+            prompt=user_question,
             system_prompt=system_prompt,
             temperature=0.0,
         )

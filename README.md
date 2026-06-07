@@ -170,6 +170,68 @@ cd backend  && uv run uvicorn app.main:app    # backend only
 cd frontend && npm install && npm run dev     # frontend only
 ```
 
+### Agent subagents + local MCP
+
+CodeSense can also run as a Claude Code or Codex subagent without asking for a
+second LLM API key. In this mode, the local MCP server scans and stores repo
+state, while the host agent reads files and creates the mental-model summaries.
+Subagent-created briefs and repo context are stored in the target project:
+
+```text
+/path/to/target-project/.codesense/code_sense.sqlite3
+```
+
+From this repository, register the local MCP server in Claude Code:
+
+```bash
+claude mcp add --transport stdio --scope user code-sense -- \
+  uv --directory /absolute/path/to/code-sense/backend run code-sense-mcp
+```
+
+Or register it in Codex:
+
+```bash
+codex mcp add code-sense -- \
+  uv --directory /absolute/path/to/code-sense/backend run code-sense-mcp
+```
+
+Then install the subagent template in the project where you want to use it.
+For Claude Code:
+
+```bash
+mkdir -p .claude/agents
+cp /absolute/path/to/code-sense/.claude/agents/code-sense.md .claude/agents/code-sense.md
+cp /absolute/path/to/code-sense/CLAUDE.md CLAUDE.md
+```
+
+For Codex:
+
+```bash
+mkdir -p .codex/agents
+cp /absolute/path/to/code-sense/.codex/agents/code-sense.toml .codex/agents/code-sense.toml
+cp /absolute/path/to/code-sense/AGENTS.md AGENTS.md
+```
+
+Restart the agent and invoke the subagent with:
+
+```text
+Use the code-sense subagent to build a mental model for this repo.
+```
+
+For Codex, the custom agent name is `code_sense`.
+
+The MCP tools exposed for the subagent are:
+
+* `start_host_agent_ingestion`
+* `get_next_file_batch`
+* `save_file_briefs`
+* `build_repo_context`
+* `get_repo_context`
+* `get_file_brief`
+
+`start_host_agent_ingestion` returns a `db_path`; subagents should pass it to
+follow-up tools so every call uses the target project's `.codesense` database.
+
 ### Tests
 
 ```bash

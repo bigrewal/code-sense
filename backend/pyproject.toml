@@ -2,18 +2,29 @@
 name = "code-sense"
 version = "0.1.0"
 description = "Add your description here"
-readme = "README.md"
+readme = { text = "CodeSense backend and local MCP server.", content-type = "text/markdown" }
 requires-python = ">=3.11.0"
 dependencies = [
     "fastapi>=0.116.1",
     "grpcio>=1.76.0",
     "loguru>=0.7.3",
+    "mcp>=1.27.1",
     "pydantic>=2.11.7",
     "python-dotenv>=1.1.1",
     "tqdm>=4.67.1",
     "uvicorn>=0.35.0",
     "xai-sdk>=1.4.0",
 ]
+
+[project.scripts]
+code-sense-mcp = "app.mcp_server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
 
 [project.optional-dependencies]
 openai = [

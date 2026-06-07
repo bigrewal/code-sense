@@ -34,6 +34,7 @@ def get_llm_provider() -> LLMProvider:
         return AnthropicProvider(
             api_key=Config.ANTHROPIC_API_KEY,
             default_model=model,
+            prompt_cache_ttl=Config.ANTHROPIC_PROMPT_CACHE_TTL,
         )
 
     if name == "bedrock":
@@ -44,6 +45,7 @@ def get_llm_provider() -> LLMProvider:
             aws_secret_key=Config.AWS_SECRET_ACCESS_KEY or None,
             aws_session_token=Config.AWS_SESSION_TOKEN or None,
             default_model=model,
+            prompt_cache_ttl=Config.ANTHROPIC_PROMPT_CACHE_TTL,
         )
 
     raise LLMProviderError(
