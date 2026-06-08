@@ -14,3 +14,4 @@ def test_codex_code_sense_agent_template_is_valid_toml():
     assert "start_host_agent_ingestion" in data["developer_instructions"]
     assert "db_path" in data["developer_instructions"]
     assert "build_repo_context" in data["developer_instructions"]
+    assert "get_subdir_briefs" in data["developer_instructions"]

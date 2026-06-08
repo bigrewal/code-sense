@@ -205,7 +205,7 @@ cp /absolute/path/to/code-sense/CLAUDE.md CLAUDE.md
 ```
 
 For Codex:
-
+/Users/bimalgrewal/Documents/code-sense/code-sense-workspace/code-sense
 ```bash
 mkdir -p .codex/agents
 cp /absolute/path/to/code-sense/.codex/agents/code-sense.toml .codex/agents/code-sense.toml

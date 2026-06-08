@@ -9,6 +9,7 @@ from .db import create_sqlite_client
 from .models.data_model import IngestionJobStatus, IngestionStage, IngestionStageStatus
 from .repo_ingestion_pipeline.file_state import build_repo_file_changes
 from .repo_ingestion_pipeline.mental_model_gen import MENTAL_MODEL_TYPES
+from .subdir_context import format_subdir_briefs, normalize_subdir_path
 from .validators import derive_repo_name_from_path, validate_repo_name
 
 
@@ -522,5 +523,37 @@ def get_file_brief(
         if not brief:
             raise ValueError(f"No brief found for {file_path} in repo {repo_name}")
         return {"repo_name": repo_name, "file_path": file_path, "db_path": resolved_db_path, "brief": brief}
+    finally:
+        db_client.close()
+
+
+def get_subdir_briefs(
+    repo_name: str,
+    subdir_path: str,
+    *,
+    repo_path: str | None = None,
+    db_path: str | None = None,
+) -> dict[str, Any]:
+    repo_name = validate_repo_name(repo_name)
+    subdir_path = normalize_subdir_path(subdir_path)
+    resolved_db_path = _db_path_for_repo(repo_name, repo_path=repo_path, db_path=db_path)
+    db_client = _connect_db(resolved_db_path)
+
+    try:
+        _remember_db_path(None, repo_name, resolved_db_path)
+        docs = db_client.list_brief_file_overviews_for_subdir(repo_name, subdir_path)
+        docs = [doc for doc in docs if doc.get("file_path") and doc.get("data")]
+        if not docs:
+            raise ValueError(f"No briefs found under {subdir_path} in repo {repo_name}")
+        context = format_subdir_briefs(subdir_path, docs)
+        return {
+            "repo_name": repo_name,
+            "subdir_path": subdir_path,
+            "db_path": resolved_db_path,
+            "file_count": len(docs),
+            "files": [doc["file_path"] for doc in docs],
+            "context": context,
+            "estimated_tokens": _context_token_estimate(context),
+        }
     finally:
         db_client.close()

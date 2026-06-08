@@ -9,6 +9,7 @@ from .host_agent_ingestion import (
     get_file_brief as get_file_brief_service,
     get_next_file_batch as get_next_file_batch_service,
     get_repo_context as get_repo_context_service,
+    get_subdir_briefs as get_subdir_briefs_service,
     save_file_briefs as save_file_briefs_service,
     start_host_agent_ingestion as start_host_agent_ingestion_service,
 )
@@ -88,6 +89,22 @@ def get_file_brief(
 ) -> dict[str, Any]:
     """Return the stored Code-Sense brief for one critical file."""
     return get_file_brief_service(repo_name=repo_name, file_path=file_path, repo_path=repo_path, db_path=db_path)
+
+
+@mcp.tool()
+def get_subdir_briefs(
+    repo_name: str,
+    subdir_path: str,
+    repo_path: str | None = None,
+    db_path: str | None = None,
+) -> dict[str, Any]:
+    """Return stored Code-Sense briefs for every critical file under a repo subdir."""
+    return get_subdir_briefs_service(
+        repo_name=repo_name,
+        subdir_path=subdir_path,
+        repo_path=repo_path,
+        db_path=db_path,
+    )
 
 
 def main() -> None:

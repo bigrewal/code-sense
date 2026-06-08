@@ -78,6 +78,16 @@ export const Api = {
     return data.repos || [];
   },
 
+  async fetchRepoSubdirs(repoName) {
+    const params = new URLSearchParams({ repo_name: repoName });
+    const response = await fetch(`${API_BASE}/repos/subdirs?${params}`);
+    if (!response.ok) {
+      throw await buildApiError(response);
+    }
+    const data = await readJson(response);
+    return data.subdirs || [];
+  },
+
   async createConversation(repoId) {
     const response = await fetch(`${API_BASE}/conversations`, {
       method: 'POST',
@@ -110,13 +120,14 @@ export const Api = {
     return readJson(response);
   },
 
-  async sendChatMessage(conversationId, message, onEvent) {
+  async sendChatMessage(conversationId, message, onEvent, options = {}) {
     const response = await fetch(`${API_BASE}/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         conversation_id: conversationId,
-        message: message
+        message: message,
+        subdir_context_paths: options.subdirContextPaths || [],
       })
     });
     if (!response.ok) {

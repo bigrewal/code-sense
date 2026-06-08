@@ -9,6 +9,8 @@ export default function ChatView({
   onSendMessage,
   isStreaming,
   selectedRepo,
+  subdirOptions = [],
+  isSubdirOptionsLoading = false,
 }) {
   const messagesEndRef = useRef(null);
   const displayItems = useMemo(() => {
@@ -102,7 +104,12 @@ export default function ChatView({
         )}
       </div>
 
-      <ChatInput onSend={onSendMessage} disabled={isStreaming} />
+      <ChatInput
+        onSend={onSendMessage}
+        disabled={isStreaming}
+        subdirOptions={subdirOptions}
+        isSubdirOptionsLoading={isSubdirOptionsLoading}
+      />
     </div>
   );
 }

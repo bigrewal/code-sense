@@ -22,6 +22,7 @@ async def test_mcp_exposes_host_agent_tools():
         "build_repo_context",
         "get_repo_context",
         "get_file_brief",
+        "get_subdir_briefs",
     }
 
 
@@ -75,3 +76,32 @@ async def test_mcp_save_file_briefs_delegates(monkeypatch):
     )
 
     assert _tool_payload(content)["saved"] == 1
+
+
+@pytest.mark.asyncio
+async def test_mcp_get_subdir_briefs_delegates(monkeypatch):
+    def fake_get_subdir_briefs_service(repo_name, subdir_path, repo_path=None, db_path=None):
+        assert repo_name == "repo-a"
+        assert subdir_path == "backend/app"
+        assert repo_path is None
+        assert db_path == "/tmp/repo-a/.codesense/code_sense.sqlite3"
+        return {
+            "repo_name": repo_name,
+            "subdir_path": subdir_path,
+            "file_count": 1,
+            "files": ["backend/app/main.py"],
+            "context": "`backend/app/main.py` defines the API.",
+        }
+
+    monkeypatch.setattr(mcp_server, "get_subdir_briefs_service", fake_get_subdir_briefs_service)
+
+    content = await mcp_server.mcp.call_tool(
+        "get_subdir_briefs",
+        {
+            "repo_name": "repo-a",
+            "subdir_path": "backend/app",
+            "db_path": "/tmp/repo-a/.codesense/code_sense.sqlite3",
+        },
+    )
+
+    assert _tool_payload(content)["file_count"] == 1

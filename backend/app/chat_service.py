@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import logging
@@ -12,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from .db import get_db_client
 from .llm import LLMProvider, get_llm_provider
+from .subdir_context import format_subdir_briefs, merge_subdir_paths
 from .tools.fetch_code_file import fetch_code_file
 
 MESSAGE_TYPE_CHAT = "chat_message"
@@ -29,6 +31,17 @@ def _get_llm() -> LLMProvider:
 
 _repo_context_cache: dict[str, str] = {}
 _repo_context_cache_lock = asyncio.Lock()
+
+
+@dataclass
+class SubdirBriefContext:
+    context: str
+    found: list[dict[str, Any]]
+    missing: list[str]
+
+    @property
+    def file_count(self) -> int:
+        return sum(item["file_count"] for item in self.found)
 
 
 def invalidate_repo_context_cache(repo_name: str | None = None) -> None:
@@ -51,6 +64,51 @@ async def _get_cached_repo_context(repo_name: str) -> str:
         context = await asyncio.to_thread(db_client.get_repo_context, repo_name)
         _repo_context_cache[repo_name] = context
         return context
+
+
+async def _get_subdir_brief_context(repo_name: str, subdir_paths: list[str]) -> SubdirBriefContext:
+    if not subdir_paths:
+        return SubdirBriefContext(context="", found=[], missing=[])
+
+    db_client = get_db_client()
+    found: list[dict[str, Any]] = []
+    missing: list[str] = []
+    context_parts: list[str] = []
+
+    for subdir_path in subdir_paths:
+        docs = await asyncio.to_thread(
+            db_client.list_brief_file_overviews_for_subdir,
+            repo_name,
+            subdir_path,
+        )
+        docs = [doc for doc in docs if doc.get("file_path") and doc.get("data")]
+        if not docs:
+            missing.append(subdir_path)
+            continue
+
+        files = [doc["file_path"] for doc in docs]
+        found.append({
+            "path": subdir_path,
+            "file_count": len(docs),
+            "files": files,
+        })
+        context_parts.append(format_subdir_briefs(subdir_path, docs))
+
+    return SubdirBriefContext(
+        context="\n\n".join(context_parts),
+        found=found,
+        missing=missing,
+    )
+
+
+def _append_subdir_context(repo_context: str, subdir_context: str) -> str:
+    if not subdir_context:
+        return repo_context
+    return "\n\n".join([
+        repo_context,
+        "USER-REQUESTED SUBDIRECTORY CONTEXT",
+        subdir_context,
+    ]).strip()
 
 
 class FileSelection(BaseModel):
@@ -152,7 +210,11 @@ class ChatEventRecorder:
 # Public API
 # ---------------------------
 
-async def stream_chat(conversation_id: str, user_message: str):
+async def stream_chat(
+    conversation_id: str,
+    user_message: str,
+    subdir_context_paths: list[str] | None = None,
+):
     db_client = get_db_client()
     recorder = ChatEventRecorder(conversation_id=conversation_id)
     try:
@@ -163,6 +225,7 @@ async def stream_chat(conversation_id: str, user_message: str):
 
         repo_name = conv["repo_name"]
 
+        requested_subdirs = merge_subdir_paths(user_message, subdir_context_paths)
         history_docs = await asyncio.to_thread(db_client.list_chat_history, conversation_id)
         messages_for_llm: list[dict[str, str]] = [
             {"role": m["role"], "content": m["content"]}
@@ -191,6 +254,7 @@ async def stream_chat(conversation_id: str, user_message: str):
         async for event in stream_answer(
             user_question=rephrased_user_question,
             repo_name=repo_name,
+            subdir_context_paths=requested_subdirs,
         ):
             if event["type"] == "content":
                 delta = event["delta"]
@@ -228,12 +292,18 @@ async def stream_chat(conversation_id: str, user_message: str):
         yield recorder.emit_error("Chat failed. Please try again.")
 
 
-async def stateless_stream_chat(repo_name: str, user_message: str):
+async def stateless_stream_chat(
+    repo_name: str,
+    user_message: str,
+    subdir_context_paths: list[str] | None = None,
+):
     """
     Stream a reply for a given repo_name and user message, ChatGPT-style.
     """
     recorder = ChatEventRecorder()
     try:
+        requested_subdirs = merge_subdir_paths(user_message, subdir_context_paths)
+
         yield await recorder.emit_progress(
             stage="rephrasing_question",
             status="started",
@@ -252,7 +322,8 @@ async def stateless_stream_chat(repo_name: str, user_message: str):
 
         async for event in stream_answer(
             user_question=rephrased_user_question,
-            repo_name=repo_name
+            repo_name=repo_name,
+            subdir_context_paths=requested_subdirs,
         ):
             if event["type"] == "content":
                 yield recorder.emit_content(event["delta"])
@@ -284,6 +355,7 @@ async def get_rephrased_question(messages: list[dict[str, str]], repo_name: str)
         - Do NOT provide information about the codebase
         - Do NOT say whether something exists or not
         - JUST rephrase the message to be self-contained
+        - Preserve any @subdir path mentions exactly as they appear in the last user message
 
         Resolve pronouns and references using conversation context, but do not add any analysis or answers."""
 
@@ -303,8 +375,13 @@ async def get_rephrased_question(messages: list[dict[str, str]], repo_name: str)
     )
 
 
-async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[dict[str, Any], None]:
+async def stream_answer(
+    user_question: str,
+    repo_name: str,
+    subdir_context_paths: list[str] | None = None,
+) -> AsyncGenerator[dict[str, Any], None]:
     llm = _get_llm()
+    requested_subdirs = merge_subdir_paths(user_question, subdir_context_paths)
 
     async def _select_files_for_query(
         repo_context: str,
@@ -538,6 +615,35 @@ async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[di
 
         yield {"type": "content", "delta": "\n"}
 
+    repo_context = await _get_cached_repo_context(repo_name)
+    if requested_subdirs:
+        yield {
+            "type": "progress",
+            "stage": "loading_subdir_context",
+            "status": "started",
+            "message": "Loading subdir briefs",
+            "metadata": {"paths": requested_subdirs},
+        }
+        subdir_brief_context = await _get_subdir_brief_context(repo_name, requested_subdirs)
+        repo_context = _append_subdir_context(repo_context, subdir_brief_context.context)
+        status = "completed" if subdir_brief_context.found else "failed"
+        yield {
+            "type": "progress",
+            "stage": "loading_subdir_context",
+            "status": status,
+            "message": (
+                f"Loaded {subdir_brief_context.file_count} subdir briefs"
+                if subdir_brief_context.found
+                else "No matching subdir briefs found"
+            ),
+            "metadata": {
+                "paths": requested_subdirs,
+                "found": subdir_brief_context.found,
+                "missing": subdir_brief_context.missing,
+                "file_count": subdir_brief_context.file_count,
+            },
+        }
+
     yield {
         "type": "progress",
         "stage": "selecting_files",
@@ -545,7 +651,6 @@ async def stream_answer(user_question: str, repo_name: str) -> AsyncGenerator[di
         "message": "Selecting relevant files",
         "metadata": {},
     }
-    repo_context = await _get_cached_repo_context(repo_name)
 
     additional_info_required_task = asyncio.create_task(
         _select_files_for_query(repo_context=repo_context)

@@ -63,6 +63,10 @@ _ALLOWED_PRECHECK_METRICS = {
 }
 
 
+def _escape_like_pattern(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _serialize_job(job_doc: dict[str, Any]) -> dict[str, Any]:
     return {field: job_doc.get(field, {} if field == "stages" else None) for field in _JOB_FIELDS}
 
@@ -318,6 +322,48 @@ class SQLiteClient:
             (repo_name,),
         )
         return [row["file_path"] for row in rows if row["file_path"]]
+
+    def list_brief_file_overviews_for_subdir(self, repo_name: str, subdir_path: str) -> list[dict[str, Any]]:
+        prefix = subdir_path.strip("/")
+        if not prefix:
+            return []
+
+        rows = self._query(
+            """
+            SELECT repo_name, file_path, document_type, data, context, sha1
+            FROM mental_model
+            WHERE repo_name = ?
+              AND document_type = 'BRIEF_FILE_OVERVIEW'
+              AND (file_path = ? OR file_path LIKE ? ESCAPE '\\')
+            ORDER BY file_path
+            """,
+            (repo_name, prefix, f"{_escape_like_pattern(prefix)}/%"),
+        )
+        return [
+            {
+                "repo_name": row["repo_name"],
+                "file_path": row["file_path"],
+                "document_type": row["document_type"],
+                "data": row["data"],
+                "context": row["context"],
+                "sha1": row["sha1"],
+            }
+            for row in rows
+        ]
+
+    def list_brief_subdir_options(self, repo_name: str) -> list[dict[str, Any]]:
+        file_paths = self.get_critical_file_paths(repo_name)
+        counts: dict[str, int] = {}
+        for file_path in file_paths:
+            parts = [part for part in file_path.split("/") if part]
+            for index in range(1, len(parts)):
+                subdir_path = "/".join(parts[:index])
+                counts[subdir_path] = counts.get(subdir_path, 0) + 1
+
+        return [
+            {"path": path, "file_count": counts[path]}
+            for path in sorted(counts)
+        ]
 
     def get_repo_file_states(self, repo_name: str) -> dict[str, dict[str, Any]]:
         rows = self._query(

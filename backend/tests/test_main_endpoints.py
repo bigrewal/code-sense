@@ -72,6 +72,13 @@ class FakeDB:
     def list_ingested_repos(self):
         return ["repo-a", "repo-b"]
 
+    def list_brief_subdir_options(self, repo_name):
+        assert repo_name == "repo-a"
+        return [
+            {"path": "backend", "file_count": 3},
+            {"path": "backend/app", "file_count": 2},
+        ]
+
     def get_repo_local_path(self, repo_name):
         return self.repo_paths.get(repo_name)
 
@@ -392,6 +399,17 @@ async def test_list_jobs(fake_db):
 async def test_list_repos(fake_db):
     resp = await main.list_repos()
     assert resp["repos"] == ["repo-a", "repo-b"]
+
+
+@pytest.mark.asyncio
+async def test_list_repo_subdirs(fake_db):
+    resp = await main.list_repo_subdirs("repo-a")
+
+    assert resp["repo_name"] == "repo-a"
+    assert resp["subdirs"] == [
+        {"path": "backend", "file_count": 3},
+        {"path": "backend/app", "file_count": 2},
+    ]
 
 
 @pytest.mark.asyncio

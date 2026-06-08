@@ -101,15 +101,27 @@ app.add_middleware(
 class ChatRequest(BaseModel):
     conversation_id: str = Field(min_length=1)
     message: str = Field(min_length=1)
+    subdir_context_paths: list[str] = Field(default_factory=list)
 
 
 class StatelessChatRequest(BaseModel):
     repo_name: str = Field(min_length=1)
     message: str = Field(min_length=1)
+    subdir_context_paths: list[str] = Field(default_factory=list)
 
 
 class ErrorResponse(BaseModel):
     detail: str
+
+
+class RepoSubdirOption(BaseModel):
+    path: str
+    file_count: int
+
+
+class RepoSubdirOptionsResponse(BaseModel):
+    repo_name: str
+    subdirs: list[RepoSubdirOption]
 
 
 class ConversationCreateRequest(BaseModel):
@@ -467,7 +479,11 @@ async def chat(req: ChatRequest):
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     return StreamingResponse(
-        stream_chat(conversation_id=conversation_id, user_message=req.message),
+        stream_chat(
+            conversation_id=conversation_id,
+            user_message=req.message,
+            subdir_context_paths=req.subdir_context_paths,
+        ),
         media_type="application/x-ndjson",
     )
 
@@ -479,7 +495,11 @@ async def chat(req: ChatRequest):
 async def stateless_chat(req: StatelessChatRequest):
     repo_name = validate_repo_name(req.repo_name)
     return StreamingResponse(
-        stateless_stream_chat(repo_name=repo_name, user_message=req.message),
+        stateless_stream_chat(
+            repo_name=repo_name,
+            user_message=req.message,
+            subdir_context_paths=req.subdir_context_paths,
+        ),
         media_type="application/x-ndjson",
     )
 
@@ -569,6 +589,26 @@ async def ingest_repo(
 async def list_repos():
     ingested_repos = await _db_call("List repos", get_db_client().list_ingested_repos)
     return {"repos": ingested_repos}
+
+
+async def _list_repo_subdirs_response(repo_name: str):
+    repo_name = validate_repo_name(repo_name)
+    subdirs = await _db_call(
+        "List repo subdirs",
+        get_db_client().list_brief_subdir_options,
+        repo_name,
+    )
+    return {"repo_name": repo_name, "subdirs": subdirs}
+
+
+@repos_router.get("/subdirs", response_model=RepoSubdirOptionsResponse)
+async def list_repo_subdirs_by_query(repo_name: str = Query(..., min_length=1)):
+    return await _list_repo_subdirs_response(repo_name)
+
+
+@repos_router.get("/{repo_name}/subdirs", response_model=RepoSubdirOptionsResponse)
+async def list_repo_subdirs(repo_name: str):
+    return await _list_repo_subdirs_response(repo_name)
 
 
 @repos_router.delete(

@@ -5,6 +5,7 @@ import {
   CheckCircle2,
   ChevronDown,
   FileText,
+  FolderTree,
   Loader2,
   Search,
   Sparkles,
@@ -14,6 +15,7 @@ import remarkGfm from 'remark-gfm';
 
 const STAGE_ORDER = [
   'rephrasing_question',
+  'loading_subdir_context',
   'selecting_files',
   'reading_file',
   'synthesizing_response',
@@ -21,6 +23,7 @@ const STAGE_ORDER = [
 
 const stageIcons = {
   rephrasing_question: Sparkles,
+  loading_subdir_context: FolderTree,
   selecting_files: Search,
   reading_file: FileText,
   synthesizing_response: Bot,
@@ -110,11 +113,15 @@ function buildStageItems(messages) {
   );
 
   return STAGE_ORDER.flatMap((stage, index) => {
+    const stageMessages = byStage.get(stage) || [];
+    if (stage === 'loading_subdir_context' && stageMessages.length === 0) {
+      return [];
+    }
+
     if (stage === 'reading_file' && noFilesSelected) {
       return [];
     }
 
-    const stageMessages = byStage.get(stage) || [];
     const latestMessage = stageMessages[stageMessages.length - 1] || null;
     const status = latestMessage?.status || (latestStageIndex !== -1 && index > latestStageIndex ? 'pending' : null);
 

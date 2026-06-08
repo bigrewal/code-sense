@@ -133,6 +133,8 @@ export function useRepoChat() {
   const [selectedConversationId, setSelectedConversationId] = useState(null);
   const [chatMessages, setChatMessages] = useState([]);
   const [isChatStreaming, setIsChatStreaming] = useState(false);
+  const [repoSubdirOptions, setRepoSubdirOptions] = useState([]);
+  const [isRepoSubdirOptionsLoading, setIsRepoSubdirOptionsLoading] = useState(false);
 
   const [ingestModalOpen, setIngestModalOpen] = useState(false);
   const [ingestionJobs, setIngestionJobs] = useState([]);
@@ -255,6 +257,42 @@ export function useRepoChat() {
   }, [selectedRepo]);
 
   useEffect(() => {
+    let cancelled = false;
+
+    if (!selectedRepo) {
+      setRepoSubdirOptions([]);
+      setIsRepoSubdirOptionsLoading(false);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    setRepoSubdirOptions([]);
+    setIsRepoSubdirOptionsLoading(true);
+    Api.fetchRepoSubdirs(selectedRepo)
+      .then(options => {
+        if (!cancelled) {
+          setRepoSubdirOptions(options);
+        }
+      })
+      .catch(err => {
+        if (!cancelled) {
+          console.error('Failed to fetch repo subdirs:', err);
+          setRepoSubdirOptions([]);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setIsRepoSubdirOptionsLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedRepo]);
+
+  useEffect(() => {
     return () => {
       Object.values(pollingIntervals.current).forEach(interval => {
         if (interval) clearInterval(interval);
@@ -286,7 +324,7 @@ export function useRepoChat() {
     }
   };
 
-  const handleSendMessage = async (message) => {
+  const handleSendMessage = async (message, options = {}) => {
     if (!selectedConversationId || isChatStreaming) return;
 
     const userMessage = createChatMessage('user', message);
@@ -359,6 +397,9 @@ export function useRepoChat() {
               })
             ));
           }
+        },
+        {
+          subdirContextPaths: options.subdirContextPaths || [],
         }
       );
     } catch (err) {
@@ -554,6 +595,8 @@ export function useRepoChat() {
     selectedConversationId,
     chatMessages,
     isChatStreaming,
+    repoSubdirOptions,
+    isRepoSubdirOptionsLoading,
     contentRef,
     ingestModalOpen,
     ingestionJobs,

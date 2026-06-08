@@ -14,6 +14,8 @@ export default function App() {
     selectedConversationId,
     chatMessages,
     isChatStreaming,
+    repoSubdirOptions,
+    isRepoSubdirOptionsLoading,
     ingestModalOpen,
     ingestionJobs,
     toggleRepo,
@@ -91,6 +93,8 @@ export default function App() {
               onSendMessage={handleSendMessage}
               isStreaming={isChatStreaming}
               selectedRepo={selectedRepo}
+              subdirOptions={repoSubdirOptions}
+              isSubdirOptionsLoading={isRepoSubdirOptionsLoading}
             />
           ) : (
             <div className="flex-1 flex items-center justify-center px-4">

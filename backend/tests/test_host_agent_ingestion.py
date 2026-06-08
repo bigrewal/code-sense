@@ -95,3 +95,31 @@ def test_build_repo_context_requires_no_pending_files(tmp_path: Path):
 
     with pytest.raises(ValueError, match="still pending"):
         host_agent_ingestion.build_repo_context(started["job_id"], db_path=started["db_path"])
+
+
+def test_get_subdir_briefs_returns_combined_context(tmp_path: Path):
+    db_path = tmp_path / ".codesense" / "code_sense.sqlite3"
+    client = db.create_sqlite_client(str(db_path))
+    try:
+        for file_path, data in [
+            ("backend/app/main.py", "`backend/app/main.py` defines API routes."),
+            ("backend/app/chat_service.py", "`backend/app/chat_service.py` handles chat streams."),
+            ("frontend/src/App.jsx", "`frontend/src/App.jsx` renders the shell."),
+        ]:
+            client.upsert_mental_model_document(
+                repo_name="repo-a",
+                file_path=file_path,
+                document_type=MENTAL_MODEL_TYPES["BRIEF"],
+                data=data,
+                sha1=file_path,
+            )
+    finally:
+        client.close()
+
+    result = host_agent_ingestion.get_subdir_briefs("repo-a", "@backend/app", db_path=str(db_path))
+
+    assert result["repo_name"] == "repo-a"
+    assert result["subdir_path"] == "backend/app"
+    assert result["file_count"] == 2
+    assert result["files"] == ["backend/app/chat_service.py", "backend/app/main.py"]
+    assert "SUBDIRECTORY @backend/app FILE BRIEFS (2 files):" in result["context"]

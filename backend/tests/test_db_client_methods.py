@@ -198,6 +198,52 @@ def test_mental_model_helpers(tmp_path):
     assert client.get_brief_file_overview("repo-a", "a.py") == ""
 
 
+def test_list_brief_file_overviews_for_subdir_matches_repo_relative_prefix(tmp_path):
+    client = _client(tmp_path)
+    for file_path, data in [
+        ("src/app.py", "app brief"),
+        ("src/utils/helpers.py", "helpers brief"),
+        ("src_extra/app.py", "wrong prefix brief"),
+    ]:
+        client.upsert_mental_model_document(
+            repo_name="repo-a",
+            file_path=file_path,
+            document_type="BRIEF_FILE_OVERVIEW",
+            data=data,
+            sha1=file_path,
+        )
+
+    docs = client.list_brief_file_overviews_for_subdir("repo-a", "src")
+
+    assert [doc["file_path"] for doc in docs] == ["src/app.py", "src/utils/helpers.py"]
+
+
+def test_list_brief_subdir_options_counts_critical_files_under_each_prefix(tmp_path):
+    client = _client(tmp_path)
+    for file_path in [
+        "backend/app/main.py",
+        "backend/app/db.py",
+        "backend/tests/test_main.py",
+        "frontend/src/App.jsx",
+        "root.py",
+    ]:
+        client.upsert_mental_model_document(
+            repo_name="repo-a",
+            file_path=file_path,
+            document_type="BRIEF_FILE_OVERVIEW",
+            data=f"{file_path} brief",
+            sha1=file_path,
+        )
+
+    assert client.list_brief_subdir_options("repo-a") == [
+        {"path": "backend", "file_count": 3},
+        {"path": "backend/app", "file_count": 2},
+        {"path": "backend/tests", "file_count": 1},
+        {"path": "frontend", "file_count": 1},
+        {"path": "frontend/src", "file_count": 1},
+    ]
+
+
 def test_job_delete_health_and_close_paths(tmp_path):
     client = _client(tmp_path)
     client.upsert_ingestion_job(
