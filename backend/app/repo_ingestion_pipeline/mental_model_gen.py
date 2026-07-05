@@ -26,7 +26,7 @@ PROMPT_SYSTEM = (
     "If NOT critical, output exactly: IGNORE\n\n"
     "If the file is critical, output exactly a concise summary using the required sentence template.\n"
     "Be factual and concise. Use evidence from the code and surrounding repository structure.\n"
-    "Infer the most likely upstream/downstream relationships with the other source files from imports, exports, call sites, framework conventions, and surrounding code structure rather than assuming there are none.\n"
+    "Infer only the most likely downstream relationships with other source files and services from imports, calls, framework conventions, and surrounding code structure rather than assuming there are none. Do not infer or describe upstream callers or dependents.\n"
     "No bullets, no markdown, no extra commentary."
 )
 
@@ -41,13 +41,14 @@ PROMPT_USER_TEMPLATE = """
     - If NOT critical, output exactly: IGNORE
     - If CRITICAL, output one concise paragraph in this exact format:
 
-    "`{file_path}` <what this file does and why it exists>. It does this by <how it works end-to-end, explicitly naming every major component/function/class defined in this file and each component's role>. It interacts upstream with <key files/modules that call or depend on this file> and downstream with <key files/modules/services this file calls or depends on>."
+    "`{file_path}` <what this file does and why it exists>. It does this by <how it works end-to-end, explicitly naming every major component/function/class defined in this file and each component's role>. It interacts downstream with <key files/modules/services this file calls or depends on>."
 
     Rules:
     - Keep it very concise: 100-200 words total.
     - Mention concrete identifiers when available.
     - The second sentence must mention every major component in this file.
-    - Do not claim there are no upstream/downstream interactions unless the code itself clearly supports that conclusion.
+    - Describe downstream dependencies only; do not infer or mention upstream callers or dependents.
+    - Do not claim there are no downstream interactions unless the code itself clearly supports that conclusion.
     - No bullets, no markdown, no extra text.
     """.strip()
 
@@ -140,7 +141,7 @@ class MentalModelStage:
                     prompt=user_prompt,
                     system_prompt=PROMPT_SYSTEM,
                     temperature=0.0,
-                    max_tokens=150,
+                    max_tokens=250,
                 )
             return file_path, response.strip(), sha1
 

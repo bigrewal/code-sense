@@ -7,6 +7,13 @@ from loguru import logger
 from starlette.middleware.base import BaseHTTPMiddleware
 
 
+def _is_job_status_poll(method: str, path: str) -> bool:
+    if method.upper() != "GET":
+        return False
+    parts = path.strip("/").split("/")
+    return len(parts) == 3 and parts[:2] == ["v1", "jobs"] and bool(parts[2])
+
+
 def _log_level_for_status_code(status_code: int) -> str:
     if status_code >= 500:
         return "error"
@@ -20,26 +27,29 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         request_id = str(uuid.uuid4())
         request.state.request_id = request_id
         start_time = time.time()
+        is_job_status_poll = _is_job_status_poll(request.method, request.url.path)
 
-        logger.info(
-            "input request_id={} method={} path={} query={} client={}",
-            request_id,
-            request.method,
-            request.url.path,
-            str(request.url.query),
-            request.client.host if request.client else "unknown",
-        )
+        if not is_job_status_poll:
+            logger.info(
+                "input request_id={} method={} path={} query={} client={}",
+                request_id,
+                request.method,
+                request.url.path,
+                str(request.url.query),
+                request.client.host if request.client else "unknown",
+            )
 
         try:
             response = await call_next(request)
             duration_ms = (time.time() - start_time) * 1000
-            log = getattr(logger, _log_level_for_status_code(response.status_code))
-            log(
-                "output request_id={} status_code={} duration_ms={:.2f}",
-                request_id,
-                response.status_code,
-                duration_ms,
-            )
+            if not is_job_status_poll or response.status_code >= 400:
+                log = getattr(logger, _log_level_for_status_code(response.status_code))
+                log(
+                    "output request_id={} status_code={} duration_ms={:.2f}",
+                    request_id,
+                    response.status_code,
+                    duration_ms,
+                )
 
             response.headers["X-Request-ID"] = request_id
             return response

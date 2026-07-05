@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Any, AsyncIterator
 
 from ..config import Config
@@ -20,6 +21,10 @@ logger = logging.getLogger(__name__)
 
 
 _PROMPT_CACHE_DISABLED_VALUES = {"", "0", "false", "off", "none", "disabled"}
+_MODELS_WITHOUT_TEMPERATURE = re.compile(
+    r"(?:^|[.:/])claude-(?:sonnet-5|opus-4-(?:7|8))(?:$|[-.:/])",
+    re.IGNORECASE,
+)
 
 
 def _is_rate_limit_error(exc: Exception) -> bool:
@@ -49,6 +54,51 @@ def _cache_control(ttl: str) -> dict[str, str]:
     if ttl == "1h":
         control["ttl"] = "1h"
     return control
+
+
+def _supports_temperature(model: str) -> bool:
+    """Return whether the model accepts the legacy temperature parameter."""
+    return _MODELS_WITHOUT_TEMPERATURE.search(model) is None
+
+
+def _normalize_structured_output(value: Any, response_format: ResponseFormat) -> str:
+    """Return schema-valid JSON, repairing bounded JSON-string wrapping if needed."""
+    if response_format is None:
+        raise LLMProviderError("Anthropic structured output requires a response format")
+
+    candidates = [value]
+    if isinstance(value, str):
+        try:
+            candidates.append(json.loads(value))
+        except (TypeError, ValueError):
+            pass
+    elif isinstance(value, dict):
+        repaired = dict(value)
+        repaired_any = False
+        for key, field_value in value.items():
+            if not isinstance(field_value, str):
+                continue
+            try:
+                decoded = json.loads(field_value)
+            except (TypeError, ValueError):
+                continue
+            repaired[key] = decoded
+            repaired_any = True
+            if isinstance(decoded, dict):
+                candidates.append(decoded)
+        if repaired_any:
+            candidates.append(repaired)
+
+    last_error: Exception | None = None
+    for candidate in candidates:
+        try:
+            return response_format.model_validate(candidate).model_dump_json()
+        except Exception as exc:
+            last_error = exc
+
+    raise LLMProviderError(
+        f"Anthropic structured output did not match {response_format.__name__}"
+    ) from last_error
 
 
 class AnthropicProvider(LLMProvider):
@@ -126,9 +176,10 @@ class AnthropicProvider(LLMProvider):
         kwargs: dict[str, Any] = {
             "model": model,
             "max_tokens": self._resolve_max_tokens(max_tokens),
-            "temperature": self._resolve_temperature(temperature),
             "messages": [{"role": "user", "content": prompt}] if prompt else [],
         }
+        if _supports_temperature(model):
+            kwargs["temperature"] = self._resolve_temperature(temperature)
         if system_prompt:
             kwargs["system"] = self._system_prompt(system_prompt)
         return kwargs
@@ -201,9 +252,14 @@ class AnthropicProvider(LLMProvider):
                 response = await self._async_client.messages.create(**kwargs)
                 for block in response.content:
                     if getattr(block, "type", None) == "tool_use":
-                        return json.dumps(block.input)
+                        return _normalize_structured_output(block.input, response_format)
                 # Fallback: model returned text instead of using the tool.
-                return _extract_text(response).strip()
+                return _normalize_structured_output(
+                    _extract_text(response).strip(),
+                    response_format,
+                )
+            except LLMProviderError:
+                raise
             except Exception as exc:
                 await asyncio.sleep(self._handle_failure(exc, attempt))
         raise LLMRateLimitError("Anthropic rate limit exceeded after retries")

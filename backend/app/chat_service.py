@@ -101,14 +101,11 @@ async def _get_subdir_brief_context(repo_name: str, subdir_paths: list[str]) -> 
     )
 
 
-def _append_subdir_context(repo_context: str, subdir_context: str) -> str:
+def _scope_repo_context(repo_context: str, subdir_context: str) -> str:
+    """Use requested subdirectory briefs when available, otherwise the full context."""
     if not subdir_context:
         return repo_context
-    return "\n\n".join([
-        repo_context,
-        "USER-REQUESTED SUBDIRECTORY CONTEXT",
-        subdir_context,
-    ]).strip()
+    return subdir_context.strip()
 
 
 class FileSelection(BaseModel):
@@ -507,7 +504,10 @@ async def stream_answer(
                 "error": str(exc),
             }
 
-    async def _answer_query_using_repo_context(repo_context: str) -> str:
+    async def _answer_query_using_repo_context(
+        repo_context: str,
+        delta_queue: asyncio.Queue[str | None],
+    ) -> str:
         system_prompt = f"""
         You are an expert code repository analyst with access only to the provided brief summaries of the repository's files. You do **not** have access to the full file contents unless explicitly instructed otherwise in later guidelines.
 
@@ -529,11 +529,19 @@ async def stream_answer(
         Answer clearly, concisely, and professionally.
         """
         
-        return await llm.generate(
-            prompt=user_question,
-            system_prompt=system_prompt,
-            temperature=0.0,
-        )
+        deltas: list[str] = []
+        try:
+            async for delta in llm.generate_stream(
+                prompt=user_question,
+                system_prompt=system_prompt,
+                temperature=0.0,
+            ):
+                if delta:
+                    deltas.append(delta)
+                    delta_queue.put_nowait(delta)
+        finally:
+            delta_queue.put_nowait(None)
+        return "".join(deltas).strip()
 
     async def _synth_final_answer(
         user_question: str,
@@ -625,7 +633,7 @@ async def stream_answer(
             "metadata": {"paths": requested_subdirs},
         }
         subdir_brief_context = await _get_subdir_brief_context(repo_name, requested_subdirs)
-        repo_context = _append_subdir_context(repo_context, subdir_brief_context.context)
+        repo_context = _scope_repo_context(repo_context, subdir_brief_context.context)
         status = "completed" if subdir_brief_context.found else "failed"
         yield {
             "type": "progress",
@@ -656,9 +664,11 @@ async def stream_answer(
         _select_files_for_query(repo_context=repo_context)
     )
 
+    summary_delta_queue: asyncio.Queue[str | None] = asyncio.Queue()
     summary_task = asyncio.create_task(
         _answer_query_using_repo_context(
             repo_context=repo_context,
+            delta_queue=summary_delta_queue,
         )
     )
 
@@ -741,14 +751,22 @@ async def stream_answer(
         },
     }
 
-    summary_insight = await summary_task
-
-    async for chunk in _synth_final_answer(
-        user_question=user_question,
-        file_insights=file_insights,
-        summary_insight=summary_insight
-    ):
-        yield chunk
+    if file_insights:
+        summary_insight = await summary_task
+        async for chunk in _synth_final_answer(
+            user_question=user_question,
+            file_insights=file_insights,
+            summary_insight=summary_insight,
+        ):
+            yield chunk
+    else:
+        while True:
+            delta = await summary_delta_queue.get()
+            if delta is None:
+                break
+            yield {"type": "content", "delta": delta}
+        await summary_task
+        yield {"type": "content", "delta": "\n"}
     yield {
         "type": "progress",
         "stage": "synthesizing_response",
