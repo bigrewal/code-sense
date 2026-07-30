@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import CopyMessageButton from './CopyMessageButton';
 
 const STAGE_ORDER = [
   'rephrasing_question',
@@ -292,8 +293,11 @@ export default function ProgressTimelineMessage({ messages, message = null }) {
             <div className="prose prose-sm max-w-none prose-headings:text-slate-900 prose-p:text-slate-700 prose-code:text-cyan-700">
               <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
             </div>
-            <div className="mt-2 text-[11px] text-slate-500">
-              {new Date(message.created_at).toLocaleTimeString()}
+            <div className="mt-2 flex items-center justify-between gap-3 text-slate-500">
+              <span className="text-[11px]">
+                {new Date(message.created_at).toLocaleTimeString()}
+              </span>
+              <CopyMessageButton content={message.content} />
             </div>
           </div>
         ) : null}

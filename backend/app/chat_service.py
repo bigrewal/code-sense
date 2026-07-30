@@ -398,7 +398,7 @@ async def stream_answer(
         ────────────────────────────────────────────
 
         Each file summary uses this exact structure:
-        "`{{file_path}}` <what this file does and why it exists>. It does this by <how it works end-to-end, explicitly naming every major component/function/class defined in this file and each component's role>. It interacts upstream with <key files/modules that call or depend on this file> and downstream with <key files/modules/services this file calls or depends on>."
+        "`{{file_path}}` <what this file does and why it exists>. It does this by <how it works end-to-end, explicitly naming every major component/function/class defined in this file and each component's role>. It interacts downstream with <key files/modules/services this file calls or depends on>."
 
         The canonical file path for a summary is the exact backticked `file_path` at the start of that summary.
 

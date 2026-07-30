@@ -1,6 +1,7 @@
 import React from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import CopyMessageButton from './CopyMessageButton';
 import {
   AlertTriangle,
   Bot,
@@ -140,8 +141,11 @@ export default function ChatMessage({ message, isLatestProgress = false }) {
             <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
           </div>
         )}
-        <div className={`mt-2 text-[11px] ${isUser ? 'text-cyan-100' : 'text-slate-500'}`}>
-          {new Date(message.created_at).toLocaleTimeString()}
+        <div className={`mt-2 flex items-center justify-between gap-3 ${isUser ? 'text-cyan-100' : 'text-slate-500'}`}>
+          <span className="text-[11px]">
+            {new Date(message.created_at).toLocaleTimeString()}
+          </span>
+          <CopyMessageButton content={message.content} inverted={isUser} />
         </div>
       </div>
 

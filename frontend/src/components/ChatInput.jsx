@@ -229,7 +229,6 @@ const SUBDIR_MENTION_PATTERN = /(^|[^A-Za-z0-9_./-])@((?:\.\/)?[A-Za-z0-9][A-Za-
 const TRAILING_MENTION_PUNCTUATION = new Set(['.', ',', ';', ':', '!', '?', ')', ']', '}', '"', "'"]);
 const MENTION_BOUNDARY_PATTERN = /[A-Za-z0-9_./-]/;
 const MENTION_QUERY_PATTERN = /^[A-Za-z0-9._/-]*$/;
-const MAX_SUGGESTIONS = 8;
 
 function normalizeSubdirPath(path) {
   let cleaned = path.trim();
@@ -393,5 +392,5 @@ function buildMentionSuggestions(query, optionIndex) {
       };
     });
 
-  return [...suggestions, ...children].slice(0, MAX_SUGGESTIONS);
+  return [...suggestions, ...children];
 }
