@@ -106,7 +106,7 @@ export default function ChatView({
 
       <ChatInput
         onSend={onSendMessage}
-        disabled={isStreaming}
+        sendDisabled={isStreaming}
         subdirOptions={subdirOptions}
         isSubdirOptionsLoading={isSubdirOptionsLoading}
       />

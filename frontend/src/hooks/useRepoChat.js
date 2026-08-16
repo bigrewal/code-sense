@@ -138,6 +138,7 @@ export function useRepoChat() {
 
   const [ingestModalOpen, setIngestModalOpen] = useState(false);
   const [ingestionJobs, setIngestionJobs] = useState([]);
+  const [refreshingRepos, setRefreshingRepos] = useState([]);
 
   const contentRef = useRef(null);
   const pollingIntervals = useRef({});
@@ -507,6 +508,24 @@ export function useRepoChat() {
     }
   };
 
+  const handleRefreshRepo = async (repoName) => {
+    if (refreshingRepos.includes(repoName)) {
+      return;
+    }
+
+    setRefreshingRepos(prev => [...prev, repoName]);
+
+    try {
+      const result = await Api.ingestRepo({ repo_name: repoName });
+      registerNewJob(result);
+    } catch (err) {
+      console.error('Failed to refresh repo:', err);
+      alert(err.message || 'Failed to refresh repository');
+    } finally {
+      setRefreshingRepos(prev => prev.filter(repo => repo !== repoName));
+    }
+  };
+
   const handleIngestRepos = async (repoRequests) => {
     try {
       const results = await Api.ingestRepos(repoRequests);
@@ -600,6 +619,7 @@ export function useRepoChat() {
     contentRef,
     ingestModalOpen,
     ingestionJobs,
+    refreshingRepos,
     toggleRepo,
     selectRepo,
     handleNewConversation,
@@ -610,6 +630,7 @@ export function useRepoChat() {
     handleOpenIngestModal,
     handleCloseIngestModal,
     handleIngestRepo,
+    handleRefreshRepo,
     handleIngestRepos,
     handleRemoveJob,
     handleDeleteJob,

@@ -34,7 +34,7 @@ class Config:
 
     # xAI / Grok
     XAI_API_KEY = os.getenv("XAI_API_KEY")
-    GROK_4_NON_REASONING_MODEL = "grok-4.3"
+    GROK_4_NON_REASONING_MODEL = "grok-4.6"
 
     # OpenAI (also used for OpenAI-compatible endpoints via OPENAI_BASE_URL)
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")

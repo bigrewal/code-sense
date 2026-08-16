@@ -254,6 +254,30 @@ async def test_ingest_repo_success(fake_db, monkeypatch, tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_ingest_repo_refresh_uses_registered_local_path(fake_db, monkeypatch, tmp_path: Path):
+    repo_dir = tmp_path / "external" / "repo-a"
+    repo_dir.mkdir(parents=True)
+    fake_db.repo_paths["repo-a"] = str(repo_dir)
+    monkeypatch.setattr(main, "get_repo_path", lambda _repo_name: tmp_path / "missing")
+
+    scheduled = {}
+
+    def _fake_add_task(func, **kwargs):
+        scheduled["func"] = func
+        scheduled["kwargs"] = kwargs
+
+    background = BackgroundTasks()
+    monkeypatch.setattr(background, "add_task", _fake_add_task)
+
+    resp = await main.ingest_repo(background, main.IngestRequest(repo_name="repo-a"))
+
+    assert resp.status == "queued"
+    assert scheduled["func"] is main._run_ingestion_job
+    assert scheduled["kwargs"]["repo_name"] == "repo-a"
+    assert scheduled["kwargs"]["local_repo_path"] == repo_dir.resolve()
+
+
+@pytest.mark.asyncio
 async def test_ingest_repo_path_success_derives_repo_name(fake_db, monkeypatch, tmp_path: Path):
     repo_dir = tmp_path / "repo a"
     repo_dir.mkdir()

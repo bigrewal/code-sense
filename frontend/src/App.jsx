@@ -18,6 +18,7 @@ export default function App() {
     isRepoSubdirOptionsLoading,
     ingestModalOpen,
     ingestionJobs,
+    refreshingRepos,
     toggleRepo,
     selectRepo,
     handleNewConversation,
@@ -28,6 +29,7 @@ export default function App() {
     handleOpenIngestModal,
     handleCloseIngestModal,
     handleIngestRepo,
+    handleRefreshRepo,
     handleRemoveJob,
     handleDeleteJob,
   } = useRepoChat();
@@ -83,6 +85,8 @@ export default function App() {
           onDeleteRepo={handleDeleteRepo}
           onOpenIngestModal={handleOpenIngestModal}
           ingestionJobs={ingestionJobs}
+          refreshingRepos={refreshingRepos}
+          onRefreshRepo={handleRefreshRepo}
           onOpenRepoJobs={setJobsModalRepo}
         />
 

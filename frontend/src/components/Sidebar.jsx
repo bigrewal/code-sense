@@ -12,6 +12,7 @@ import {
   CheckCircle2,
   Loader2,
   ListChecks,
+  RefreshCw,
 } from 'lucide-react';
 import ConversationList from './ConversationList';
 
@@ -33,12 +34,17 @@ export default function Sidebar({
   onDeleteRepo,
   onOpenIngestModal,
   ingestionJobs,
+  refreshingRepos,
+  onRefreshRepo,
   onOpenRepoJobs,
 }) {
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
   const [repoToDelete, setRepoToDelete] = useState(null);
   const [deleteFiles, setDeleteFiles] = useState(false);
   const availableRepoSet = new Set(availableRepos);
+  const hasActiveIngestionJob = ingestionJobs.some(job => (
+    job.status === 'running' || job.status === 'queued' || job.status === 'pending'
+  ));
 
   const handleDeleteClick = (e, repo) => {
     e.stopPropagation();
@@ -156,6 +162,7 @@ export default function Sidebar({
               const StatusIcon = status.icon || CircleDashed;
               const repoJobCount = ingestionJobs.filter(job => job.repo_name === repo).length;
               const isAvailable = availableRepoSet.has(repo);
+              const isRefreshing = refreshingRepos.includes(repo);
               return (
                 <div key={repo} className="rounded-xl border border-slate-200 bg-white p-2">
                   <div
@@ -186,6 +193,17 @@ export default function Sidebar({
                       <StatusIcon size={12} className={status.tone === 'ingesting' ? 'animate-spin' : ''} />
                       {status.label}
                     </span>
+                    {isAvailable && (
+                      <button
+                        onClick={() => onRefreshRepo(repo)}
+                        disabled={hasActiveIngestionJob || refreshingRepos.length > 0}
+                        className="rounded p-1 text-slate-500 transition hover:bg-cyan-50 hover:text-cyan-700 disabled:cursor-not-allowed disabled:opacity-40"
+                        title={hasActiveIngestionJob ? 'An ingestion job is already in progress' : 'Refresh repository ingestion'}
+                        aria-label={`Refresh ${repo.split('/').pop()} ingestion`}
+                      >
+                        <RefreshCw size={14} className={isRefreshing ? 'animate-spin' : ''} />
+                      </button>
+                    )}
                     <button
                       onClick={(e) => handleDeleteClick(e, repo)}
                       disabled={!isAvailable}

@@ -535,7 +535,8 @@ async def ingest_repo(
         repo_name = _repo_name_for_ingest_path(db_client, local_repo_path, ingest_request.repo_name)
     else:
         repo_name = validate_repo_name(ingest_request.repo_name)
-        local_repo_path = get_repo_path(repo_name)
+        stored_repo_path = await _db_call("Get repo path", db_client.get_repo_local_path, repo_name)
+        local_repo_path = Path(stored_repo_path).expanduser() if stored_repo_path else get_repo_path(repo_name)
         if not local_repo_path.exists():
             raise HTTPException(status_code=404, detail=f"Repository not found: {local_repo_path}")
         if not local_repo_path.is_dir():

@@ -3,7 +3,7 @@ import { AlertTriangle, Check, ChevronRight, FolderTree, Loader2, Send } from 'l
 
 export default function ChatInput({
   onSend,
-  disabled,
+  sendDisabled = false,
   subdirOptions = [],
   isSubdirOptionsLoading = false,
 }) {
@@ -28,11 +28,10 @@ export default function ChatInput({
   );
   const showSuggestions = Boolean(
     activeMention &&
-    !disabled &&
     (isSubdirOptionsLoading || suggestions.length > 0 || activeMention.query)
   );
   const hasMentionWhileLoading = isSubdirOptionsLoading && subdirMentions.length > 0;
-  const canSubmit = Boolean(message.trim()) && !disabled && invalidMentions.length === 0 && !hasMentionWhileLoading;
+  const canSubmit = Boolean(message.trim()) && !sendDisabled && invalidMentions.length === 0 && !hasMentionWhileLoading;
 
   useEffect(() => {
     setActiveSuggestionIndex(0);
@@ -204,8 +203,7 @@ export default function ChatInput({
           }}
           onBlur={() => setIsFocused(false)}
           placeholder="Ask about architecture, files, or implementation details..."
-          disabled={disabled}
-          className={`flex-1 resize-none rounded-xl border bg-white px-3 py-2.5 text-sm text-slate-700 outline-none transition focus:ring-2 disabled:bg-slate-100 ${
+          className={`flex-1 resize-none rounded-xl border bg-white px-3 py-2.5 text-sm text-slate-700 outline-none transition focus:ring-2 ${
             invalidMentions.length > 0
               ? 'border-amber-300 focus:border-amber-500 focus:ring-amber-200'
               : 'border-slate-300 focus:border-cyan-500 focus:ring-cyan-200'
@@ -217,6 +215,7 @@ export default function ChatInput({
           disabled={!canSubmit}
           className="flex items-center justify-center rounded-xl bg-cyan-600 px-4 text-white transition hover:bg-cyan-700 disabled:cursor-not-allowed disabled:bg-slate-300"
           aria-label="Send message"
+          title={sendDisabled ? 'Wait for the current response to finish' : 'Send message'}
         >
           <Send size={18} />
         </button>
